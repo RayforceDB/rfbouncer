@@ -166,7 +166,7 @@ fn the_pages_want_the_admin_password() {
 #[test]
 fn without_an_admin_password_there_are_no_pages() {
     let replica = Rayforce::start(&[]);
-    let bouncer = Bouncer::start(&pool(&[&replica], "require_restricted = false"));
+    let bouncer = Bouncer::start_as_is(&pool(&[&replica], "require_restricted = false"));
     assert_eq!(http_get(bouncer.port, "/", Some("root")).0, 403);
     assert_eq!(Client::connect(bouncer.port).query("(+ 1 2)"), int(3));
 }

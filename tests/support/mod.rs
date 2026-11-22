@@ -9,6 +9,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use rfbouncer::wire::frame::{self, HEADER_LEN, Header, MSG_SYNC, PAYLOAD_MAX};
@@ -21,14 +22,43 @@ pub fn slow(n: u32) -> String {
     format!("(count (map (fn [i] (sum (til 1000000))) (til {n})))")
 }
 
+/// Held while a socket is made and while a process is started.
+///
+/// On macOS a new socket is marked close-on-exec in a second step, so a
+/// process started by another thread in between inherits it. A Rayforce
+/// started at that instant kept another test's listener open, and with it
+/// that test's port. One at a time, nothing is ever inherited.
+fn exclusive() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+pub fn connect(port: u16) -> std::io::Result<TcpStream> {
+    let _one_at_a_time = exclusive();
+    TcpStream::connect(("127.0.0.1", port))
+}
+
+pub fn listen(port: u16) -> std::io::Result<TcpListener> {
+    let _one_at_a_time = exclusive();
+    TcpListener::bind(("127.0.0.1", port))
+}
+
+fn spawn(command: &mut Command) -> Child {
+    let _one_at_a_time = exclusive();
+    command.spawn().unwrap()
+}
+
+/// A port no other test is given: from a range the system does not hand
+/// out, a different stretch of it for each test process, each used once.
 pub fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    static NEXT_PORT: AtomicUsize = AtomicUsize::new(0);
+    let stretch = (std::process::id() as usize % 100) * 120;
+    (20_000 + stretch + NEXT_PORT.fetch_add(1, Ordering::Relaxed) % 120) as u16
 }
 
 fn wait_for_port(port: u16, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while connect(port).is_err() {
         assert!(Instant::now() < deadline, "{what} did not open port {port}");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -62,17 +92,20 @@ impl Rayforce {
             "no Rayforce binary at {}: set RAYFORCE_BIN",
             bin.display()
         );
-        let child = Command::new(bin)
-            .arg("-p")
-            .arg(port.to_string())
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let child = spawn(
+            Command::new(bin)
+                .arg("-p")
+                .arg(port.to_string())
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        );
+        // Owned before the wait, so a server that never opens its port is
+        // still killed when the wait gives up.
+        let server = Self { child, port };
         wait_for_port(port, "rayforce");
-        Self { child, port }
+        server
     }
 
     pub fn addr(&self) -> String {
@@ -101,14 +134,14 @@ pub fn rayforce_eval(script: &str) -> String {
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("rfbouncer-test-{}-{n}.rfl", std::process::id()));
     std::fs::write(&path, script).unwrap();
-    let mut child = Command::new(rayforce_bin())
-        .arg("-f")
-        .arg(&path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = spawn(
+        Command::new(rayforce_bin())
+            .arg("-f")
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() > deadline {
@@ -141,27 +174,50 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 impl Bouncer {
     /// Starts the bouncer on a free port with `body` as the rest of its
-    /// configuration, which is everything but `listen`.
+    /// configuration, and waits for it to have reached its replicas, so the
+    /// first request goes to the first replica listed. An admin password,
+    /// `root`, is added for that unless `body` sets one.
     pub fn start(body: &str) -> Self {
+        let body = if body.contains("admin_password") {
+            body.to_owned()
+        } else {
+            format!("admin_password = \"root\"\n{body}")
+        };
+        let bouncer = Self::start_as_is(&body);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let (status, live) = http_get(bouncer.port, "/api/live", Some("root"));
+            if status == 200 && !live.contains("\"state\":\"down\"") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        bouncer
+    }
+
+    /// Starts the bouncer with exactly `body` after its `listen` line, and
+    /// returns as soon as its port is open.
+    pub fn start_as_is(body: &str) -> Self {
         let port = free_port();
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("rfbouncer-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("rfbouncer.toml");
-        let bouncer = Self {
-            child: Command::new(env!("CARGO_BIN_EXE_rfbouncer"))
+        std::fs::write(&config, format!("listen = \"127.0.0.1:{port}\"\n{body}")).unwrap();
+        let log = if std::env::var_os("RFBOUNCER_TEST_LOG").is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
+        let child = spawn(
+            Command::new(env!("CARGO_BIN_EXE_rfbouncer"))
                 .arg("--config")
                 .arg(&config)
                 .stdin(Stdio::null())
-                .stderr(if std::env::var_os("RFBOUNCER_TEST_LOG").is_some() {
-                    Stdio::inherit()
-                } else {
-                    Stdio::null()
-                })
-                .spawn_after(|| {
-                    std::fs::write(&config, format!("listen = \"127.0.0.1:{port}\"\n{body}"))
-                        .unwrap()
-                }),
+                .stderr(log),
+        );
+        let bouncer = Self {
+            child,
             port,
             config,
         };
@@ -190,17 +246,6 @@ impl Bouncer {
     /// Whether the process has ended, and how.
     pub fn exited(&mut self) -> Option<std::process::ExitStatus> {
         self.child.try_wait().unwrap()
-    }
-}
-
-trait SpawnAfter {
-    fn spawn_after(&mut self, before: impl FnOnce()) -> Child;
-}
-
-impl SpawnAfter for Command {
-    fn spawn_after(&mut self, before: impl FnOnce()) -> Child {
-        before();
-        self.spawn().unwrap()
     }
 }
 
@@ -248,7 +293,7 @@ impl Client {
         version: u8,
         credentials: Option<(&str, &str)>,
     ) -> Result<Self, Refused> {
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut stream = connect(port).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
@@ -333,7 +378,7 @@ pub fn http_get(port: u16, path: &str, password: Option<&str>) -> (u16, String) 
         let token = base64::engine::general_purpose::STANDARD.encode(format!("admin:{p}"));
         format!("Authorization: Basic {token}\r\n")
     });
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut stream = connect(port).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();

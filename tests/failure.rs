@@ -13,18 +13,11 @@ use support::{Bouncer, Client, Rayforce, eventually, int, pool, signal, slow};
 
 const OPEN: &str = "require_restricted = false";
 
-/// Lets every replica of a fresh bouncer finish its greeting, so the first
-/// request goes to the first replica listed.
-fn settle() {
-    std::thread::sleep(Duration::from_millis(300));
-}
-
 #[test]
 fn a_request_whose_replica_dies_is_run_again_on_another() {
     let mut doomed = Rayforce::start(&[]);
     let other = Rayforce::start(&[]);
     let bouncer = Bouncer::start(&pool(&[&doomed, &other], OPEN));
-    settle();
     let mut c = Client::connect(bouncer.port);
     c.send(&slow(8000));
     std::thread::sleep(Duration::from_millis(200));
@@ -44,7 +37,6 @@ fn without_retry_the_client_is_told() {
     let mut doomed = Rayforce::start(&[]);
     let other = Rayforce::start(&[]);
     let bouncer = Bouncer::start(&pool(&[&doomed, &other], &format!("{OPEN}\nretry = false")));
-    settle();
     let mut c = Client::connect(bouncer.port);
     c.send(&slow(8000));
     std::thread::sleep(Duration::from_millis(200));
@@ -82,7 +74,6 @@ fn a_frozen_replica_costs_its_request_and_nothing_else() {
     let other = Rayforce::start(&[]);
     let extra = format!("{OPEN}\nquery_timeout = \"300ms\"\ncancel_grace = \"300ms\"");
     let bouncer = Bouncer::start(&pool(&[&frozen, &other], &extra));
-    settle();
     signal(frozen.pid(), "STOP");
     let started = Instant::now();
     let mut c = Client::connect(bouncer.port);
@@ -111,7 +102,6 @@ fn an_answer_cut_short_closes_the_client() {
         fake.addr(),
         good.addr()
     ));
-    settle();
     let mut c = Client::connect(bouncer.port);
     c.send("(+ 1 1)");
     // Half an answer is on its way to the client, so it cannot be run again.
@@ -132,7 +122,6 @@ fn a_replica_that_answers_nonsense_is_not_believed() {
         fake.addr(),
         good.addr()
     ));
-    settle();
     // Nothing reached the client, so the request runs on the good replica.
     assert_eq!(Client::connect(bouncer.port).query("(+ 1 1)"), int(2));
 }

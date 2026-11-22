@@ -2,7 +2,7 @@
 //! reads one request, then does whatever the test tells it to.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -17,8 +17,8 @@ pub struct Fake {
 impl Fake {
     /// `behave` gets each greeted connection and its number, counted from 0.
     pub fn start(behave: impl Fn(TcpStream, usize) + Send + Sync + 'static) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let port = super::free_port();
+        let listener = super::listen(port).unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
         let (count, behave) = (accepted.clone(), Arc::new(behave));
         std::thread::spawn(move || {
@@ -27,8 +27,14 @@ impl Fake {
                 let (n, behave) = (count.fetch_add(1, Ordering::SeqCst), behave.clone());
                 std::thread::spawn(move || {
                     let mut hello = [0u8; 2];
+                    // Closed for certain when `behave` is done, even if a
+                    // process started meanwhile inherited the descriptor.
+                    let closer = stream.try_clone();
                     if stream.read_exact(&mut hello).is_ok() && stream.write_all(&[4, 0]).is_ok() {
                         behave(stream, n);
+                    }
+                    if let Ok(closer) = closer {
+                        let _ = closer.shutdown(std::net::Shutdown::Both);
                     }
                 });
             }
