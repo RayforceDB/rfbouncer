@@ -24,7 +24,7 @@ use crate::core::Core;
 pub async fn run(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(&config_path)?;
     let listener = TcpListener::bind(config.listen).await?;
-    let stats = Arc::new(stats::Stats::default());
+    let stats = Arc::new(stats::Stats::start(&config.stats)?);
     let core = Core::new(config_path, config, stats);
     tracing::info!(listen = %listener.local_addr()?, "rfbouncer started");
 
@@ -53,6 +53,8 @@ pub async fn run(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>>
     while core.client_count() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    let stats = core.stats.clone();
+    let _ = tokio::task::spawn_blocking(move || stats.flush()).await;
     tracing::info!(clients_left = core.client_count(), "rfbouncer stopped");
     Ok(())
 }

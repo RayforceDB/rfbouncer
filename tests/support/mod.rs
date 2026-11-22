@@ -326,6 +326,38 @@ impl Client {
     }
 }
 
+/// A GET over a connection of its own; the status and the body.
+pub fn http_get(port: u16, path: &str, password: Option<&str>) -> (u16, String) {
+    use base64::Engine;
+    let auth = password.map_or_else(String::new, |p| {
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("admin:{p}"));
+        format!("Authorization: Basic {token}\r\n")
+    });
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: rfbouncer\r\n{auth}Connection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let status = response.split(' ').nth(1).unwrap().parse().unwrap();
+    let body = response
+        .split_once("\r\n\r\n")
+        .map_or("", |(_, body)| body)
+        .to_owned();
+    (status, body)
+}
+
+pub fn http_json(port: u16, path: &str, password: &str) -> serde_json::Value {
+    let (status, body) = http_get(port, path, Some(password));
+    assert_eq!(status, 200, "{path}: {body}");
+    serde_json::from_str(&body).unwrap()
+}
+
 /// The payload of an i64 atom, which is what most test queries answer.
 pub fn int(n: i64) -> Vec<u8> {
     let mut out = vec![0xfb, 0];
