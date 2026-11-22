@@ -1,0 +1,30 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # The integration tests run against a real server, built from source.
+      - uses: actions/checkout@v4
+        with:
+          repository: RayforceDB/rayforce
+          path: rayforce-src
+      - name: Build Rayforce
+        run: make -C rayforce-src release -j4
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+        env:
+          RAYFORCE_BIN: ${{ github.workspace }}/rayforce-src/rayforce

@@ -1,0 +1,68 @@
+# rfbouncer: one port in front of a pool of read-only Rayforce replicas.
+# Durations are written 500ms, 10s, 5m, 2h, 30d; sizes 4096, 64KiB, 16MiB.
+
+# Clients, the admin console and the report pages all use this one port.
+listen = "0.0.0.0:5000"
+
+# Opens the admin console (user "rfbouncer") and the report pages (HTTP Basic,
+# any user name). Without it there is neither.
+admin_password = "change-me"
+
+max_client_conn = 10000
+max_request_bytes = "16MiB"
+# How long requests in flight are given to end when the bouncer is stopped.
+shutdown_timeout = "30s"
+# How long a client may sit between two requests; 0 is forever.
+client_idle_timeout = "0"
+
+[stats]
+# Where request statistics are kept. Without a path nothing is recorded and
+# the report pages show only the live state. Changing this needs a restart.
+path = "/var/lib/rfbouncer/stats.db"
+# Keep the full text of the slowest and the failed requests. The text holds
+# whatever values the client sent; turn this off if those must not be stored.
+store_samples = true
+retention_aggregates = "30d"
+retention_samples = "7d"
+# Distinct query shapes counted per minute; the rest are counted together.
+max_fingerprints_per_minute = 2000
+
+[[pool]]
+name = "main"
+# The user names, from a client's credentials, that select this pool. With
+# one pool every client lands in it and this may be left out.
+users = ["app"]
+# What clients must present. Without it, and with one pool, clients are not
+# asked for credentials at all.
+password = "client-secret"
+# Takes the clients whose user names no pool.
+default = true
+# The wire version the replicas speak: 3 (Rayforce up to 2.x) or 4.
+wire_version = 4
+# The password the replicas were started with (-U).
+backend_password = "replica-secret"
+backends = ["10.0.0.1:5001", "10.0.0.1:5002", "10.0.0.1:5003"]
+# Requests a replica runs at once. A Rayforce process evaluates one message
+# at a time, so more than 1 only moves the queue into the replica.
+slots = 1
+# Keep out a replica that would let a write through, i.e. one not started
+# with -U. Turn off only where the replicas are read-only by construction.
+require_restricted = true
+# Run a request again on another replica when its replica fails before any
+# of the answer reached the client. Turn off if a replica exposes functions
+# marked with .sys.trust that write.
+retry = true
+# Prefer the replica a client's address was served by last, so one client
+# does not see replicas that lag each other by turns.
+affinity = false
+# Requests that may wait for a free replica, and for how long. Past either,
+# the client is answered with the error "busy".
+queue_max = 1000
+query_wait_timeout = "10s"
+# A request running longer is cancelled and answered with "timeout"; 0 is no
+# limit.
+query_timeout = "30s"
+# How long a replica has to answer a cancel before its connection is dropped
+# and opened again.
+cancel_grace = "5s"
+connect_timeout = "5s"

@@ -1,0 +1,18 @@
+[Unit]
+Description=rfbouncer: one port in front of read-only Rayforce replicas
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/rfbouncer --config /etc/rfbouncer/rfbouncer.toml
+ExecReload=/bin/kill -HUP $MAINPID
+User=rfbouncer
+StateDirectory=rfbouncer
+Restart=on-failure
+# One descriptor per client and per replica connection.
+LimitNOFILE=65536
+# Longer than shutdown_timeout, so requests in flight are let finish.
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
