@@ -8,7 +8,6 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::OwnedReadHalf;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -156,8 +155,8 @@ async fn proxy(
 
 /// One whole frame, header included, or `None` when the client closed the
 /// connection between two frames.
-pub async fn read_frame(
-    rd: &mut OwnedReadHalf,
+pub async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
+    rd: &mut R,
     buf: &mut BytesMut,
     version: u8,
     max: usize,

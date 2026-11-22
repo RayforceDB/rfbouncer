@@ -5,6 +5,7 @@ pub mod client;
 pub mod config;
 pub mod core;
 pub mod listener;
+pub mod metrics;
 pub mod pool;
 pub mod stats;
 pub mod web;

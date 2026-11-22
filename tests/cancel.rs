@@ -1,6 +1,8 @@
 //! Cancels, budgets and a full queue: a request that is not wanted any more
 //! gives its replica back.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 mod support;
 
 use std::time::{Duration, Instant};

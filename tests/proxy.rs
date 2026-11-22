@@ -1,5 +1,7 @@
 //! A client behind the bouncer gets what it would get from a replica.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 mod support;
 
 use std::time::{Duration, Instant};

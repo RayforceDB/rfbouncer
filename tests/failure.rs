@@ -1,5 +1,7 @@
 //! Replicas that die, hang, lie or speak out of turn.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 mod support;
 
 use std::io::Write;

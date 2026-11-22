@@ -95,6 +95,33 @@ impl Drop for Rayforce {
     }
 }
 
+/// Runs `script` in a fresh Rayforce process and returns what it printed.
+/// This is the real client: what it can read, any Rayforce client can.
+pub fn rayforce_eval(script: &str) -> String {
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("rfbouncer-test-{}-{n}.rfl", std::process::id()));
+    std::fs::write(&path, script).unwrap();
+    let mut child = Command::new(rayforce_bin())
+        .arg("-f")
+        .arg(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the script did not end: {script}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::fs::remove_file(&path);
+    let output = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr)
+}
+
 pub fn signal(pid: u32, name: &str) {
     let status = Command::new("kill")
         .arg(format!("-{name}"))
