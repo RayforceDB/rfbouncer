@@ -131,6 +131,7 @@ function drawLines(W, times, series, format) {
   if (series.length > 1) {
     ends.sort((a, b) => a.at - b.at);
     for (let i = 1; i < ends.length; i++) ends[i].at = Math.max(ends[i].at, ends[i - 1].at + 12);
+    for (let i = ends.length - 1, low = H - B; i >= 0; i--, low -= 12) ends[i].at = Math.min(ends[i].at, low);
     for (const e of ends) svg.append(s('text', { class: 'end', x: W - R + 6, y: e.at + 4 }, e.name));
   }
   const hide = () => {
