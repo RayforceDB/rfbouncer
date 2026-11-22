@@ -16,9 +16,22 @@ shutdown_timeout = "30s"
 client_idle_timeout = "0"
 
 [stats]
-# Where request statistics are kept. Without a path nothing is recorded and
-# the report pages show only the live state. Changing this needs a restart.
-path = "/var/lib/rfbouncer/stats.db"
+# The Rayforce process that keeps the request statistics. Without it nothing
+# is recorded and the report pages show only the live state. Changing this
+# section needs a restart.
+#
+# It is a process of its own, not one of a pool's replicas, and it takes
+# writes: start it with -u, not -U, and with a journal so that what it holds
+# survives a restart:
+#
+#     rayforce -p 5100 -u stats-secret -L /var/lib/rfbouncer/stats
+#
+# The bouncer makes its tables there (rfb_agg, rfb_backend, rfb_client,
+# rfb_status, rfb_fp, rfb_sample) and they are ordinary tables: query them
+# with any Rayforce client.
+rayforce = "127.0.0.1:5100"
+password = "stats-secret"
+wire_version = 4
 # Keep the full text of the slowest and the failed requests. The text holds
 # whatever values the client sent; turn this off if those must not be stored.
 store_samples = true

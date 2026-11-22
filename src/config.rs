@@ -36,8 +36,13 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatsConfig {
-    /// Where the statistics database lives. Without it nothing is recorded.
-    pub path: Option<PathBuf>,
+    /// The address of the Rayforce process that keeps the statistics.
+    /// Without it nothing is recorded.
+    pub rayforce: Option<String>,
+    /// What that process was started with (-u).
+    pub password: Option<String>,
+    #[serde(default = "default_wire")]
+    pub wire_version: u8,
     #[serde(default = "yes")]
     pub store_samples: bool,
     #[serde(default = "days_30", deserialize_with = "duration")]
@@ -51,7 +56,9 @@ pub struct StatsConfig {
 impl Default for StatsConfig {
     fn default() -> Self {
         Self {
-            path: None,
+            rayforce: None,
+            password: None,
+            wire_version: default_wire(),
             store_samples: true,
             retention_aggregates: days_30(),
             retention_samples: days_7(),

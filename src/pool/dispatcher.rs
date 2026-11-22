@@ -66,6 +66,7 @@ pub fn spawn(cfg: Arc<PoolConfig>, stats: Arc<Stats>) -> PoolHandle {
         name: cfg.name.as_str().into(),
         counters: Counters::default(),
         stats,
+        queue_max: (cfg.queue_max as u64).into(),
     });
     let (cfg_tx, _) = watch::channel(cfg.clone());
     let mut d = Dispatcher {
@@ -417,6 +418,9 @@ impl Dispatcher {
                 self.add(addr, cfg.slots - have);
             }
         }
+        self.shared
+            .queue_max
+            .store(cfg.queue_max as u64, std::sync::atomic::Ordering::Relaxed);
         self.cfg = cfg.clone();
         self.cfg_tx.send_replace(cfg);
         if reconnect {

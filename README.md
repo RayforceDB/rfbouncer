@@ -1,7 +1,8 @@
 # rfbouncer
 
 One port in front of a pool of read-only [Rayforce](https://github.com/RayforceDB/rayforce)
-replicas, with request statistics and a report page on the same port.
+replicas, with request statistics kept in Rayforce and a report page on the
+same port.
 
 A Rayforce process evaluates one message at a time, so one slow query holds
 every other client of that process, and replicas cannot share a port.
@@ -13,7 +14,7 @@ free.
 clients ──► :5000 rfbouncer ──► replica :5001
 browser ──►   │   queue      ──► replica :5002
               │              ──► replica :5003
-              └─ statistics (SQLite)
+              └─ statistics ──► a Rayforce of their own :5100
 ```
 
 ## What it does
@@ -40,7 +41,8 @@ browser ──►   │   queue      ──► replica :5002
   credentials picks the pool.
 - **Admin console**, read with any Rayforce client.
 - **Statistics and reports**: requests grouped by the shape of their query,
-  kept in SQLite, shown on the bouncer's port over HTTP.
+  kept in a Rayforce process of their own, shown on the bouncer's port over
+  HTTP.
 
 ## What it does not do
 
@@ -85,7 +87,7 @@ backends = ["127.0.0.1:5001", "127.0.0.1:5002"]
 `SIGHUP` reads the configuration again: limits, timeouts and passwords apply
 at once, replicas added are connected, replicas removed finish their request
 and go. A file that does not parse leaves the running configuration alone.
-`listen` and `[stats] path` need a restart. `SIGTERM` stops taking
+`listen` and `[stats]` need a restart. `SIGTERM` stops taking
 connections, lets the requests in flight end (for `shutdown_timeout` at
 most), and exits.
 
@@ -129,7 +131,7 @@ be asked for them: with one pool, give the pool a `password`.
 ## Reports
 
 Open `http://host:5000/` in a browser and give `admin_password` (any user
-name). With `[stats] path` set, the pages show:
+name). With `[stats] rayforce` set, the pages show:
 
 - **Overview**: requests, time in the replica (p50, p95, p99), requests that
   did not succeed, and the wait for a free replica, over time.
@@ -148,6 +150,39 @@ The slowest and the failed requests are stored with their full text, values
 included. Set `store_samples = false` if those must not be kept.
 
 `/metrics` serves counters in the Prometheus format, behind the same password.
+
+### Where the statistics live
+
+In a Rayforce process of their own, named under `[stats]`:
+
+```sh
+rayforce -p 5100 -u stats-secret -L /var/lib/rfbouncer/stats
+```
+
+It is not one of a pool's replicas and it takes writes, so it runs with `-u`
+rather than `-U`. The journal (`-L`) is what makes it survive a restart;
+without one it starts empty. The bouncer makes its tables there and upserts
+the minute being filled every ten seconds. They are ordinary tables:
+
+```lisp
+(set h (.ipc.open "127.0.0.1:5100:me:stats-secret"))
+(.ipc.send h "(select {from: rfb_agg by: pool n: (sum count)})")
+```
+
+| Table | A row is |
+|---|---|
+| `rfb_agg` | a minute, a pool and a query shape: counts by outcome, time and wait sums and maxima, bytes, and a histogram of time in `h0`..`h31` (`h<i>` counts requests under 2^i µs) |
+| `rfb_status` | a minute, a pool and an outcome (`ok`, `cancel`, `timeout`, `busy`, `io`, or a replica's error code) |
+| `rfb_backend`, `rfb_client` | a minute, a pool and a replica or a client address |
+| `rfb_fp` | a query shape's text |
+| `rfb_sample` | a request kept whole: the slowest of each hour and up to 20 failed a minute |
+
+While the store is away, requests are served as before, the reports answer
+`502`, and the minute being filled waits in memory; a store that stays away
+past the end of a minute costs that minute. Everything it holds is in memory:
+give it room for the rows you keep (a row of `rfb_agg` is about 400 bytes),
+and lower `retention_aggregates` or `max_fingerprints_per_minute` if that is
+too much.
 
 ## Development
 

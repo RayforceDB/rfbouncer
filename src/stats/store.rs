@@ -1,19 +1,23 @@
-//! The statistics thread and its database. One thread owns the write
-//! connection; it holds the minute being filled in memory and writes it out
-//! whole every few seconds, so a row is always replaced, never merged in SQL.
+//! The task that writes the statistics, and the tables it writes them to.
+//!
+//! The statistics live in a Rayforce process of their own. This task holds
+//! the minute being filled in memory and, every few seconds, upserts its
+//! rows whole: a row is keyed by its leading columns, so writing it again
+//! replaces it. Nothing is ever merged on the server.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use tokio::sync::mpsc::Receiver;
+use tokio::time::Instant;
 
 use super::Msg;
 use super::event::{Event, Outcome};
 use super::normalize::normalize;
+use super::rf::Conn;
 use crate::config::StatsConfig;
 use crate::pool::request_text;
+use crate::wire::value::{self, Column, Value};
 
 const FLUSH_EVERY: Duration = Duration::from_secs(10);
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
@@ -28,31 +32,96 @@ const ERRORS_PER_MINUTE: usize = 20;
 /// Where requests past `max_fingerprints_per_minute` are counted.
 const OTHER: (u64, &str) = (0, "<other queries>");
 
-const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS fingerprints(
-        fp INTEGER PRIMARY KEY, text TEXT NOT NULL, first_seen INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS agg(
-        minute INTEGER NOT NULL, pool TEXT NOT NULL, fp INTEGER NOT NULL,
-        count INTEGER NOT NULL, errors INTEGER NOT NULL, cancels INTEGER NOT NULL,
-        timeouts INTEGER NOT NULL, refused INTEGER NOT NULL, failed INTEGER NOT NULL,
-        retries INTEGER NOT NULL, dur_sum INTEGER NOT NULL, dur_max INTEGER NOT NULL,
-        wait_sum INTEGER NOT NULL, wait_max INTEGER NOT NULL,
-        bytes_in INTEGER NOT NULL, bytes_out INTEGER NOT NULL, hist BLOB NOT NULL,
-        PRIMARY KEY(minute, pool, fp)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS agg_backend(
-        minute INTEGER NOT NULL, pool TEXT NOT NULL, backend TEXT NOT NULL,
-        count INTEGER NOT NULL, errors INTEGER NOT NULL, dur_sum INTEGER NOT NULL,
-        PRIMARY KEY(minute, pool, backend)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS agg_client(
-        minute INTEGER NOT NULL, pool TEXT NOT NULL, client TEXT NOT NULL,
-        count INTEGER NOT NULL, errors INTEGER NOT NULL, dur_sum INTEGER NOT NULL,
-        PRIMARY KEY(minute, pool, client)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS samples(
-        id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, pool TEXT NOT NULL, fp INTEGER NOT NULL,
-        kind TEXT NOT NULL, dur INTEGER NOT NULL, wait INTEGER NOT NULL,
-        backend TEXT NOT NULL, client TEXT NOT NULL, status TEXT NOT NULL, text TEXT NOT NULL);
-    CREATE INDEX IF NOT EXISTS samples_by ON samples(pool, kind, ts);
-";
+/// The counters of a row of `rfb_agg`, in column order, after its key
+/// (minute, pool, fp) and before its histogram (h0..h31).
+pub const COUNTERS: [&str; 13] = [
+    "count",
+    "errors",
+    "cancels",
+    "timeouts",
+    "refused",
+    "failed",
+    "retries",
+    "dur_sum",
+    "dur_max",
+    "wait_sum",
+    "wait_max",
+    "bytes_in",
+    "bytes_out",
+];
+
+// Where each counter sits in `Agg::counters`, as `COUNTERS` orders them.
+const COUNT: usize = 0;
+const ERRORS: usize = 1;
+const CANCELS: usize = 2;
+const TIMEOUTS: usize = 3;
+const REFUSED: usize = 4;
+const FAILED: usize = 5;
+const RETRIES: usize = 6;
+const DUR_SUM: usize = 7;
+const DUR_MAX: usize = 8;
+const WAIT_SUM: usize = 9;
+const WAIT_MAX: usize = 10;
+const BYTES_IN: usize = 11;
+const BYTES_OUT: usize = 12;
+
+/// Every table, with the source that makes it empty. A table's key is its
+/// leading columns, which is what `upsert` matches on.
+fn schema() -> Vec<(&'static str, String)> {
+    let int = "(as 'I64 [])";
+    let sym = "(as 'SYMBOL [])";
+    let make = |names: &[String], types: &[&str]| {
+        format!("(table [{}] (list {}))", names.join(" "), types.join(" "))
+    };
+    let own = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+
+    let mut agg = own(&["minute", "pool", "fp"]);
+    agg.extend(COUNTERS.iter().map(|c| (*c).to_owned()));
+    agg.extend((0..BUCKETS).map(|i| format!("h{i}")));
+    let mut agg_types = vec![int, sym, int];
+    agg_types.resize(agg.len(), int);
+
+    let small = own(&["minute", "pool", "who", "count", "errors", "dur_sum"]);
+    let sample = own(&[
+        "kind", "pool", "bucket", "slot", "ts", "fp", "dur", "wait", "backend", "client", "status",
+        "text",
+    ]);
+    vec![
+        ("rfb_agg", make(&agg, &agg_types)),
+        ("rfb_backend", make(&small, &[int, sym, sym, int, int, int])),
+        ("rfb_client", make(&small, &[int, sym, sym, int, int, int])),
+        (
+            "rfb_status",
+            make(
+                &own(&["minute", "pool", "status", "count"]),
+                &[int, sym, sym, int],
+            ),
+        ),
+        (
+            "rfb_fp",
+            make(&own(&["fp", "first_seen", "text"]), &[int, int, "(list)"]),
+        ),
+        (
+            "rfb_sample",
+            make(
+                &sample,
+                &[
+                    sym, sym, int, int, int, int, int, int, sym, sym, sym, "(list)",
+                ],
+            ),
+        ),
+    ]
+}
+
+/// Makes the tables that are not there yet.
+pub async fn ensure_schema(conn: &mut Conn) -> Result<(), String> {
+    for (name, empty) in schema() {
+        if conn.eval(&format!("(count {name})")).await.is_err() {
+            conn.eval(&format!("(set {name} {empty})")).await?;
+        }
+    }
+    Ok(())
+}
 
 /// Durations fall into buckets by powers of two of a microsecond: bucket `i`
 /// holds those below `2^i` µs, and the last one everything longer.
@@ -78,35 +147,9 @@ pub fn quantile(hist: &[u64; BUCKETS], q: f64) -> u64 {
     1 << (BUCKETS - 1)
 }
 
-pub fn hist_from_blob(blob: &[u8]) -> [u64; BUCKETS] {
-    let mut hist = [0u64; BUCKETS];
-    for (slot, raw) in hist.iter_mut().zip(blob.as_chunks::<4>().0) {
-        *slot = u64::from(u32::from_le_bytes(*raw));
-    }
-    hist
-}
-
-fn hist_to_blob(hist: &[u64; BUCKETS]) -> Vec<u8> {
-    hist.iter()
-        .flat_map(|n| u32::try_from(*n).unwrap_or(u32::MAX).to_le_bytes())
-        .collect()
-}
-
 #[derive(Default, Clone)]
 struct Agg {
-    count: u64,
-    errors: u64,
-    cancels: u64,
-    timeouts: u64,
-    refused: u64,
-    failed: u64,
-    retries: u64,
-    dur_sum: u64,
-    dur_max: u64,
-    wait_sum: u64,
-    wait_max: u64,
-    bytes_in: u64,
-    bytes_out: u64,
+    counters: [u64; COUNTERS.len()],
     hist: [u64; BUCKETS],
 }
 
@@ -117,40 +160,44 @@ struct Small {
     dur_sum: u64,
 }
 
-struct Writer {
-    db: Connection,
-    store_samples: bool,
-    max_fingerprints: usize,
-    retention_aggregates: Duration,
-    retention_samples: Duration,
-    /// The minute held in memory. Everything below is of this minute.
-    minute: i64,
-    agg: HashMap<(String, u64), Agg>,
-    backends: HashMap<(String, String), Small>,
-    clients: HashMap<(String, String), Small>,
-    /// Fingerprints already in the database, so each text is written once.
-    known: HashSet<u64>,
-    new_texts: Vec<(u64, String, i64)>,
-    samples: Vec<Sample>,
-    errors_this_minute: HashMap<String, usize>,
-    /// The hour the slowest requests are being collected for, and the
-    /// durations kept so far per pool.
-    hour: i64,
-    slowest: HashMap<String, Vec<u64>>,
-    dirty: bool,
-}
-
+#[derive(Clone)]
 struct Sample {
-    ts_ms: i64,
-    pool: String,
-    fp: u64,
     kind: &'static str,
+    pool: String,
+    /// The hour of a slow sample, the minute of a failed one.
+    bucket: i64,
+    slot: usize,
+    ts_ms: i64,
+    fp: u64,
     dur: u64,
     wait: u64,
     backend: String,
     client: String,
     status: String,
     text: String,
+}
+
+struct Writer {
+    cfg: StatsConfig,
+    conn: Option<Conn>,
+    /// The minute held in memory. The maps below are of this minute.
+    minute: i64,
+    agg: HashMap<(String, u64), Agg>,
+    backends: HashMap<(String, String), Small>,
+    clients: HashMap<(String, String), Small>,
+    statuses: HashMap<(String, String), u64>,
+    /// The normalized text of every fingerprint of this minute.
+    texts: HashMap<u64, String>,
+    /// Fingerprints whose text the store already has.
+    known: HashSet<u64>,
+    /// The hour the slowest requests are being collected for, and per pool
+    /// the duration kept in each slot.
+    hour: i64,
+    slowest: HashMap<String, Vec<u64>>,
+    errors_this_minute: HashMap<String, usize>,
+    /// Samples not written yet.
+    samples: Vec<Sample>,
+    dirty: bool,
 }
 
 fn unix(at: SystemTime) -> Duration {
@@ -169,182 +216,253 @@ fn clip(mut text: String) -> String {
     text
 }
 
-pub fn open(path: &Path) -> rusqlite::Result<Connection> {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let db = Connection::open(path)?;
-    db.pragma_update(None, "journal_mode", "WAL")?;
-    db.pragma_update(None, "synchronous", "NORMAL")?;
-    db.execute_batch(SCHEMA)?;
-    Ok(db)
+fn ints(values: impl Iterator<Item = u64>) -> Column {
+    Column::I64(values.map(|v| v as i64).collect())
 }
 
-/// The statistics thread's body: runs until every sender is gone.
-pub fn run(db: Connection, cfg: &StatsConfig, rx: &Receiver<Msg>) {
+/// The cells of a table read back, by column name.
+pub struct Rows(Vec<(String, Column)>);
+
+impl Rows {
+    pub fn of(value: Value) -> Result<Self, String> {
+        match value {
+            Value::Table(columns) => Ok(Self(columns)),
+            _ => Err("the statistics store answered with something that is not a table".into()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.first().map_or(0, |(_, column)| match column {
+            Column::I64(v) => v.len(),
+            Column::F64(v) => v.len(),
+            Column::Sym(v) | Column::Str(v) => v.len(),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn column(&self, name: &str) -> Option<&Column> {
+        self.0.iter().find(|(n, _)| n == name).map(|(_, c)| c)
+    }
+
+    /// An integer cell; zero where the column is missing or of another type.
+    pub fn int(&self, name: &str, row: usize) -> u64 {
+        match self.column(name) {
+            Some(Column::I64(v)) => v.get(row).copied().unwrap_or(0) as u64,
+            Some(Column::F64(v)) => v.get(row).copied().unwrap_or(0.0) as u64,
+            _ => 0,
+        }
+    }
+
+    pub fn text(&self, name: &str, row: usize) -> String {
+        match self.column(name) {
+            Some(Column::Sym(v) | Column::Str(v)) => v.get(row).cloned().unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+}
+
+/// The statistics task's body: runs until every sender is gone.
+pub async fn run(cfg: StatsConfig, mut rx: Receiver<Msg>) {
     let mut w = Writer {
-        db,
-        store_samples: cfg.store_samples,
-        max_fingerprints: cfg.max_fingerprints_per_minute,
-        retention_aggregates: cfg.retention_aggregates,
-        retention_samples: cfg.retention_samples,
+        cfg,
+        conn: None,
         minute: -1,
         agg: HashMap::new(),
         backends: HashMap::new(),
         clients: HashMap::new(),
+        statuses: HashMap::new(),
+        texts: HashMap::new(),
         known: HashSet::new(),
-        new_texts: Vec::new(),
-        samples: Vec::new(),
-        errors_this_minute: HashMap::new(),
         hour: -1,
         slowest: HashMap::new(),
+        errors_this_minute: HashMap::new(),
+        samples: Vec::new(),
         dirty: false,
     };
-    if let Err(e) = w.load_known() {
-        tracing::error!(error = %e, "statistics: cannot read the database");
-    }
     let mut next_flush = Instant::now() + FLUSH_EVERY;
     let mut next_prune = Instant::now();
     loop {
-        match rx.recv_timeout(next_flush.saturating_duration_since(Instant::now())) {
-            Ok(Msg::Event(event)) => w.add(*event),
-            Ok(Msg::Flush(done)) => {
-                w.flush();
-                let _ = done.send(());
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                w.flush();
-                return;
-            }
-        }
-        if Instant::now() >= next_flush {
-            w.flush();
-            next_flush = Instant::now() + FLUSH_EVERY;
-            if Instant::now() >= next_prune {
-                w.prune();
-                next_prune = Instant::now() + PRUNE_EVERY;
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(Msg::Event(event)) => w.add(*event).await,
+                Some(Msg::Flush(done)) => {
+                    w.flush().await;
+                    let _ = done.send(());
+                }
+                None => {
+                    w.flush().await;
+                    return;
+                }
+            },
+            () = tokio::time::sleep_until(next_flush) => {
+                w.flush().await;
+                next_flush = Instant::now() + FLUSH_EVERY;
+                if Instant::now() >= next_prune {
+                    w.prune().await;
+                    next_prune = Instant::now() + PRUNE_EVERY;
+                }
             }
         }
     }
 }
 
 impl Writer {
-    fn load_known(&mut self) -> rusqlite::Result<()> {
-        let mut query = self.db.prepare("SELECT fp FROM fingerprints")?;
-        let rows = query.query_map([], |row| row.get::<_, i64>(0))?;
-        self.known = rows.filter_map(Result::ok).map(|fp| fp as u64).collect();
-        Ok(())
+    /// The connection, opened if it is not: the tables are made, and what the
+    /// store knows is asked again, since it may be another process than
+    /// before.
+    async fn conn(&mut self) -> Result<&mut Conn, String> {
+        if self.conn.is_none() {
+            let mut conn = Conn::open(&self.cfg).await?;
+            ensure_schema(&mut conn).await?;
+            let known = Rows::of(conn.eval("(select {from: rfb_fp fp: fp})").await?)?;
+            self.known = (0..known.len()).map(|row| known.int("fp", row)).collect();
+            self.conn = Some(conn);
+        }
+        self.conn.as_mut().ok_or_else(|| "no connection".to_owned())
     }
 
     /// Moves on to `minute`: what is held is written out, and whatever the
-    /// database already has of the new minute, from a process before this
-    /// one, is taken up so it is added to and not replaced.
-    fn roll(&mut self, minute: i64) {
-        self.flush();
+    /// store already has of the new minute, from a process before this one,
+    /// is taken up so it is added to and not replaced.
+    async fn roll(&mut self, minute: i64) {
+        self.flush().await;
+        if self.dirty {
+            tracing::error!(
+                minute = self.minute,
+                "statistics: a minute could not be written and is lost"
+            );
+            self.dirty = false;
+            self.samples.clear();
+        }
         self.agg.clear();
         self.backends.clear();
         self.clients.clear();
+        self.statuses.clear();
+        self.texts.clear();
         self.errors_this_minute.clear();
         self.minute = minute;
-        if let Err(e) = self.load_minute() {
-            tracing::error!(error = %e, "statistics: cannot read the database");
-        }
         if minute / 60 != self.hour {
             self.hour = minute / 60;
             self.slowest.clear();
         }
+        if let Err(e) = self.take_up().await {
+            self.conn = None;
+            tracing::error!(error = %e, "statistics: cannot read the store");
+        }
     }
 
-    fn load_minute(&mut self) -> rusqlite::Result<()> {
-        let mut query = self.db.prepare(
-            "SELECT pool, fp, count, errors, cancels, timeouts, refused, failed, retries, dur_sum, dur_max,
-                    wait_sum, wait_max, bytes_in, bytes_out, hist FROM agg WHERE minute = ?",
-        )?;
-        let u = |row: &rusqlite::Row<'_>, i: usize| row.get::<_, i64>(i).map(|n| n as u64);
-        let rows = query.query_map([self.minute], |row| {
-            let agg = Agg {
-                count: u(row, 2)?,
-                errors: u(row, 3)?,
-                cancels: u(row, 4)?,
-                timeouts: u(row, 5)?,
-                refused: u(row, 6)?,
-                failed: u(row, 7)?,
-                retries: u(row, 8)?,
-                dur_sum: u(row, 9)?,
-                dur_max: u(row, 10)?,
-                wait_sum: u(row, 11)?,
-                wait_max: u(row, 12)?,
-                bytes_in: u(row, 13)?,
-                bytes_out: u(row, 14)?,
-                hist: hist_from_blob(&row.get::<_, Vec<u8>>(15)?),
-            };
-            Ok(((row.get::<_, String>(0)?, u(row, 1)?), agg))
-        })?;
-        self.agg = rows.filter_map(Result::ok).collect();
-        for (table, column, into) in [
-            ("agg_backend", "backend", &mut self.backends),
-            ("agg_client", "client", &mut self.clients),
+    async fn take_up(&mut self) -> Result<(), String> {
+        let (minute, hour) = (self.minute, self.hour);
+        let conn = self.conn().await?;
+        let of_minute =
+            |table: &str| format!("(select {{from: {table} where: (== minute {minute})}})");
+        let of_kind = |kind: &str, bucket: i64| {
+            format!(
+                "(select {{from: rfb_sample where: (and (== kind '{kind}) (== bucket {bucket}))}})"
+            )
+        };
+        let agg = Rows::of(conn.eval(&of_minute("rfb_agg")).await?)?;
+        let backends = Rows::of(conn.eval(&of_minute("rfb_backend")).await?)?;
+        let clients = Rows::of(conn.eval(&of_minute("rfb_client")).await?)?;
+        let statuses = Rows::of(conn.eval(&of_minute("rfb_status")).await?)?;
+        let slow = Rows::of(conn.eval(&of_kind("slow", hour)).await?)?;
+        let errors = Rows::of(conn.eval(&of_kind("error", minute)).await?)?;
+
+        for row in 0..agg.len() {
+            let mut a = Agg::default();
+            for (slot, name) in a.counters.iter_mut().zip(COUNTERS) {
+                *slot = agg.int(name, row);
+            }
+            for (i, slot) in a.hist.iter_mut().enumerate() {
+                *slot = agg.int(&format!("h{i}"), row);
+            }
+            self.agg
+                .insert((agg.text("pool", row), agg.int("fp", row)), a);
+        }
+        for (rows, into) in [
+            (&backends, &mut self.backends),
+            (&clients, &mut self.clients),
         ] {
-            let sql = format!(
-                "SELECT pool, {column}, count, errors, dur_sum FROM {table} WHERE minute = ?"
-            );
-            let mut query = self.db.prepare(&sql)?;
-            let rows = query.query_map([self.minute], |row| {
-                let small = Small {
-                    count: u(row, 2)?,
-                    errors: u(row, 3)?,
-                    dur_sum: u(row, 4)?,
+            for row in 0..rows.len() {
+                let s = Small {
+                    count: rows.int("count", row),
+                    errors: rows.int("errors", row),
+                    dur_sum: rows.int("dur_sum", row),
                 };
-                Ok(((row.get::<_, String>(0)?, row.get::<_, String>(1)?), small))
-            })?;
-            *into = rows.filter_map(Result::ok).collect();
+                into.insert((rows.text("pool", row), rows.text("who", row)), s);
+            }
+        }
+        for row in 0..statuses.len() {
+            let key = (statuses.text("pool", row), statuses.text("status", row));
+            self.statuses.insert(key, statuses.int("count", row));
+        }
+        // A slot keeps what it held: the next slow request takes the place
+        // of the least slow one, as if this process had seen them all.
+        if self.slowest.is_empty() {
+            for row in 0..slow.len() {
+                let kept = self.slowest.entry(slow.text("pool", row)).or_default();
+                let slot = slow.int("slot", row) as usize;
+                if slot < SLOW_PER_HOUR {
+                    kept.resize(kept.len().max(slot + 1), 0);
+                    kept[slot] = slow.int("dur", row);
+                }
+            }
+        }
+        for row in 0..errors.len() {
+            *self
+                .errors_this_minute
+                .entry(errors.text("pool", row))
+                .or_default() += 1;
         }
         Ok(())
     }
 
-    fn add(&mut self, e: Event) {
+    async fn add(&mut self, e: Event) {
         // A request is counted in the minute it ended, which is now.
         let now = unix(SystemTime::now());
         let minute = (now.as_secs() / 60) as i64;
         if minute != self.minute {
-            self.roll(minute);
+            self.roll(minute).await;
         }
         let pool = e.pool.to_string();
         let text = request_text(&e.frame);
         let (normal, mut fp) = normalize(&text);
-        let key = (pool.clone(), fp);
-        if !self.agg.contains_key(&key) && self.agg.len() >= self.max_fingerprints {
+        if !self.agg.contains_key(&(pool.clone(), fp))
+            && self.agg.len() >= self.cfg.max_fingerprints_per_minute
+        {
             fp = OTHER.0;
         }
-        if self.known.insert(fp) {
-            let stored = if fp == OTHER.0 {
+        self.texts.entry(fp).or_insert_with(|| {
+            if fp == OTHER.0 {
                 OTHER.1.to_owned()
             } else {
                 clip(normal)
-            };
-            self.new_texts.push((fp, stored, now.as_secs() as i64));
-        }
+            }
+        });
         let (dur, wait) = (e.exec.as_micros() as u64, e.wait.as_micros() as u64);
         let failed = !matches!(e.outcome, Outcome::Ok);
 
         let a = self.agg.entry((pool.clone(), fp)).or_default();
-        a.count += 1;
+        let c = &mut a.counters;
+        c[COUNT] += 1;
         match e.outcome {
             Outcome::Ok => {}
-            Outcome::ServerError(_) => a.errors += 1,
-            Outcome::Cancelled => a.cancels += 1,
-            Outcome::Timeout => a.timeouts += 1,
-            Outcome::Busy => a.refused += 1,
-            Outcome::Failed => a.failed += 1,
+            Outcome::ServerError(_) => c[ERRORS] += 1,
+            Outcome::Cancelled => c[CANCELS] += 1,
+            Outcome::Timeout => c[TIMEOUTS] += 1,
+            Outcome::Busy => c[REFUSED] += 1,
+            Outcome::Failed => c[FAILED] += 1,
         }
-        a.retries += u64::from(e.retries);
-        a.dur_sum += dur;
-        a.dur_max = a.dur_max.max(dur);
-        a.wait_sum += wait;
-        a.wait_max = a.wait_max.max(wait);
-        a.bytes_in += e.bytes_in;
-        a.bytes_out += e.bytes_out;
+        c[RETRIES] += u64::from(e.retries);
+        c[DUR_SUM] += dur;
+        c[DUR_MAX] = c[DUR_MAX].max(dur);
+        c[WAIT_SUM] += wait;
+        c[WAIT_MAX] = c[WAIT_MAX].max(wait);
+        c[BYTES_IN] += e.bytes_in;
+        c[BYTES_OUT] += e.bytes_out;
         a.hist[bucket(dur)] += 1;
 
         let backend = e.backend.as_deref().unwrap_or_default().to_owned();
@@ -366,40 +484,46 @@ impl Writer {
             small.errors += u64::from(failed);
             small.dur_sum += dur;
         }
+        *self
+            .statuses
+            .entry((pool.clone(), e.outcome.label().to_owned()))
+            .or_default() += 1;
         self.dirty = true;
 
-        if !self.store_samples {
+        if !self.cfg.store_samples {
             return;
         }
-        let kind = if failed {
+        let place = if failed {
             let seen = self.errors_this_minute.entry(pool.clone()).or_default();
             *seen += 1;
-            (*seen <= ERRORS_PER_MINUTE).then_some("error")
+            (*seen <= ERRORS_PER_MINUTE).then(|| ("error", minute, *seen - 1))
         } else {
-            // Kept when it is among the slowest of its hour so far.
+            // Kept when it is among the slowest of its hour so far, in the
+            // place of the least slow one once every place is taken.
             let kept = self.slowest.entry(pool.clone()).or_default();
-            let slowest_kept =
-                kept.len() < SLOW_PER_HOUR || kept.iter().min().is_some_and(|least| dur > *least);
-            if slowest_kept {
-                if kept.len() >= SLOW_PER_HOUR
-                    && let Some(least) = kept
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, d)| **d)
-                        .map(|(i, _)| i)
-                {
-                    kept.swap_remove(least);
-                }
-                kept.push(dur);
-            }
-            slowest_kept.then_some("slow")
+            let slot = if kept.len() < SLOW_PER_HOUR {
+                kept.push(0);
+                Some(kept.len() - 1)
+            } else {
+                kept.iter()
+                    .enumerate()
+                    .min_by_key(|(_, d)| **d)
+                    .filter(|(_, least)| dur > **least)
+                    .map(|(i, _)| i)
+            };
+            slot.map(|slot| {
+                kept[slot] = dur;
+                ("slow", self.hour, slot)
+            })
         };
-        if let Some(kind) = kind {
+        if let Some((kind, bucket, slot)) = place {
             self.samples.push(Sample {
-                ts_ms: unix(e.at).as_millis() as i64,
-                pool,
-                fp,
                 kind,
+                pool,
+                bucket,
+                slot,
+                ts_ms: unix(e.at).as_millis() as i64,
+                fp,
                 dur,
                 wait,
                 backend,
@@ -410,114 +534,181 @@ impl Writer {
         }
     }
 
-    fn flush(&mut self) {
-        if !self.dirty && self.new_texts.is_empty() && self.samples.is_empty() {
+    async fn flush(&mut self) {
+        if !self.dirty && self.samples.is_empty() {
             return;
         }
-        if let Err(e) = self.write() {
-            tracing::error!(error = %e, "statistics: cannot write to the database");
+        match self.write().await {
+            Ok(()) => {
+                self.dirty = false;
+                self.samples.clear();
+            }
+            Err(e) => {
+                // Kept in memory and tried again at the next flush.
+                self.conn = None;
+                tracing::error!(error = %e, "statistics: cannot write to the store");
+            }
         }
     }
 
-    fn write(&mut self) -> rusqlite::Result<()> {
-        let tx = self.db.transaction()?;
-        {
-            let mut text = tx.prepare_cached(
-                "INSERT OR IGNORE INTO fingerprints(fp, text, first_seen) VALUES (?, ?, ?)",
-            )?;
-            for (fp, normal, at) in &self.new_texts {
-                text.execute(params![*fp as i64, normal, at])?;
-            }
-            let mut agg = tx.prepare_cached(
-                "INSERT OR REPLACE INTO agg VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )?;
-            for ((pool, fp), a) in &self.agg {
-                agg.execute(params![
-                    self.minute,
-                    pool,
-                    *fp as i64,
-                    a.count as i64,
-                    a.errors as i64,
-                    a.cancels as i64,
-                    a.timeouts as i64,
-                    a.refused as i64,
-                    a.failed as i64,
-                    a.retries as i64,
-                    a.dur_sum as i64,
-                    a.dur_max as i64,
-                    a.wait_sum as i64,
-                    a.wait_max as i64,
-                    a.bytes_in as i64,
-                    a.bytes_out as i64,
-                    hist_to_blob(&a.hist),
-                ])?;
-            }
-            for (table, rows) in [
-                ("agg_backend", &self.backends),
-                ("agg_client", &self.clients),
-            ] {
-                let mut small = tx.prepare_cached(&format!(
-                    "INSERT OR REPLACE INTO {table} VALUES (?, ?, ?, ?, ?, ?)"
-                ))?;
-                for ((pool, who), s) in rows {
-                    small.execute(params![
-                        self.minute,
-                        pool,
-                        who,
-                        s.count as i64,
-                        s.errors as i64,
-                        s.dur_sum as i64
-                    ])?;
-                }
-            }
-            let mut sample = tx.prepare_cached(
-                "INSERT INTO samples(ts, pool, fp, kind, dur, wait, backend, client, status, text)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )?;
-            for s in &self.samples {
-                sample.execute(params![
-                    s.ts_ms,
-                    s.pool,
-                    s.fp as i64,
-                    s.kind,
-                    s.dur as i64,
-                    s.wait as i64,
-                    s.backend,
-                    s.client,
-                    s.status,
-                    s.text
-                ])?;
+    async fn write(&mut self) -> Result<(), String> {
+        let minute = self.minute as u64;
+        self.conn().await?;
+        let now = unix(SystemTime::now()).as_secs();
+
+        let new: Vec<(u64, String)> = self
+            .texts
+            .iter()
+            .filter(|(fp, _)| !self.known.contains(fp))
+            .map(|(fp, text)| (*fp, text.clone()))
+            .collect();
+        let fps = (!new.is_empty()).then(|| {
+            value::table(&[
+                ("fp", ints(new.iter().map(|(fp, _)| *fp))),
+                ("first_seen", ints(new.iter().map(|_| now))),
+                (
+                    "text",
+                    Column::Str(new.iter().map(|(_, text)| text.clone()).collect()),
+                ),
+            ])
+        });
+
+        let rows: Vec<(&(String, u64), &Agg)> = self.agg.iter().collect();
+        let mut agg: Vec<(String, Column)> = vec![
+            ("minute".into(), ints(rows.iter().map(|_| minute))),
+            (
+                "pool".into(),
+                Column::Sym(rows.iter().map(|(k, _)| k.0.clone()).collect()),
+            ),
+            ("fp".into(), ints(rows.iter().map(|(k, _)| k.1))),
+        ];
+        for (i, name) in COUNTERS.iter().enumerate() {
+            agg.push((
+                (*name).into(),
+                ints(rows.iter().map(|(_, a)| a.counters[i])),
+            ));
+        }
+        for i in 0..BUCKETS {
+            agg.push((format!("h{i}"), ints(rows.iter().map(|(_, a)| a.hist[i]))));
+        }
+        let agg = value::table(&agg);
+
+        let small = |rows: &HashMap<(String, String), Small>| {
+            let rows: Vec<_> = rows.iter().collect();
+            value::table(&[
+                ("minute", ints(rows.iter().map(|_| minute))),
+                (
+                    "pool",
+                    Column::Sym(rows.iter().map(|(k, _)| k.0.clone()).collect()),
+                ),
+                (
+                    "who",
+                    Column::Sym(rows.iter().map(|(k, _)| k.1.clone()).collect()),
+                ),
+                ("count", ints(rows.iter().map(|(_, s)| s.count))),
+                ("errors", ints(rows.iter().map(|(_, s)| s.errors))),
+                ("dur_sum", ints(rows.iter().map(|(_, s)| s.dur_sum))),
+            ])
+        };
+        let (backends, clients) = (small(&self.backends), small(&self.clients));
+        let statuses: Vec<_> = self.statuses.iter().collect();
+        let statuses = value::table(&[
+            ("minute", ints(statuses.iter().map(|_| minute))),
+            (
+                "pool",
+                Column::Sym(statuses.iter().map(|(k, _)| k.0.clone()).collect()),
+            ),
+            (
+                "status",
+                Column::Sym(statuses.iter().map(|(k, _)| k.1.clone()).collect()),
+            ),
+            ("count", ints(statuses.iter().map(|(_, n)| **n))),
+        ]);
+        let s = &self.samples;
+        let sym = |f: fn(&Sample) -> String| Column::Sym(s.iter().map(f).collect());
+        let samples = (!s.is_empty()).then(|| {
+            value::table(&[
+                ("kind", sym(|x| x.kind.to_owned())),
+                ("pool", sym(|x| x.pool.clone())),
+                ("bucket", Column::I64(s.iter().map(|x| x.bucket).collect())),
+                ("slot", ints(s.iter().map(|x| x.slot as u64))),
+                ("ts", Column::I64(s.iter().map(|x| x.ts_ms).collect())),
+                ("fp", ints(s.iter().map(|x| x.fp))),
+                ("dur", ints(s.iter().map(|x| x.dur))),
+                ("wait", ints(s.iter().map(|x| x.wait))),
+                ("backend", sym(|x| x.backend.clone())),
+                ("client", sym(|x| x.client.clone())),
+                ("status", sym(|x| x.status.clone())),
+                (
+                    "text",
+                    Column::Str(s.iter().map(|x| x.text.clone()).collect()),
+                ),
+            ])
+        });
+
+        let writes = [
+            ("rfb_fp", 1, fps),
+            ("rfb_agg", 3, (!self.agg.is_empty()).then_some(agg)),
+            (
+                "rfb_backend",
+                3,
+                (!self.backends.is_empty()).then_some(backends),
+            ),
+            (
+                "rfb_client",
+                3,
+                (!self.clients.is_empty()).then_some(clients),
+            ),
+            (
+                "rfb_status",
+                3,
+                (!self.statuses.is_empty()).then_some(statuses),
+            ),
+            ("rfb_sample", 4, samples),
+        ];
+        let conn = self.conn().await?;
+        for (table, keys, rows) in writes {
+            if let Some(rows) = rows {
+                conn.call(&value::call_with_table("upsert", table, keys, &rows))
+                    .await
+                    .map_err(|e| format!("{table}: {e}"))?;
             }
         }
-        tx.commit()?;
-        self.new_texts.clear();
-        self.samples.clear();
-        self.dirty = false;
+        self.known.extend(new.into_iter().map(|(fp, _)| fp));
         Ok(())
     }
 
-    /// Drops what is past its retention, and of each past hour's slow
-    /// samples all but the slowest: a request was kept when it was among the
-    /// slowest so far, and later ones may have pushed it out.
-    fn prune(&mut self) {
+    /// Drops what is past its retention, and the text of every query that
+    /// no row refers to any more.
+    async fn prune(&mut self) {
         let now = unix(SystemTime::now());
-        let aggregates = (now.saturating_sub(self.retention_aggregates).as_secs() / 60) as i64;
-        let samples = now.saturating_sub(self.retention_samples).as_millis() as i64;
-        let result = self.db.execute_batch(&format!(
-            "DELETE FROM agg WHERE minute < {aggregates};
-             DELETE FROM agg_backend WHERE minute < {aggregates};
-             DELETE FROM agg_client WHERE minute < {aggregates};
-             DELETE FROM samples WHERE ts < {samples};
-             DELETE FROM samples WHERE kind = 'slow' AND id IN (
-                 SELECT id FROM (
-                     SELECT id, row_number() OVER (PARTITION BY pool, ts / 3600000 ORDER BY dur DESC) AS place
-                     FROM samples WHERE kind = 'slow')
-                 WHERE place > {SLOW_PER_HOUR});
-             DELETE FROM fingerprints WHERE fp NOT IN (SELECT fp FROM agg) AND fp NOT IN (SELECT fp FROM samples);"
-        ));
-        match result.and_then(|()| self.load_known()) {
-            Ok(()) => {}
-            Err(e) => tracing::error!(error = %e, "statistics: cannot prune the database"),
+        let aggregates = now.saturating_sub(self.cfg.retention_aggregates).as_secs() / 60;
+        let samples = now.saturating_sub(self.cfg.retention_samples).as_millis();
+        let statements = [
+            format!("(delete {{from: 'rfb_agg where: (< minute {aggregates})}})"),
+            format!("(delete {{from: 'rfb_backend where: (< minute {aggregates})}})"),
+            format!("(delete {{from: 'rfb_client where: (< minute {aggregates})}})"),
+            format!("(delete {{from: 'rfb_status where: (< minute {aggregates})}})"),
+            format!("(delete {{from: 'rfb_sample where: (< ts {samples})}})"),
+            "(set rfb_live_agg (at rfb_agg 'fp))".to_owned(),
+            "(set rfb_live_sample (at rfb_sample 'fp))".to_owned(),
+            "(delete {from: 'rfb_fp where: (and (not (in fp rfb_live_agg)) (not (in fp rfb_live_sample)))})".to_owned(),
+            "(select {from: rfb_fp fp: fp})".to_owned(),
+        ];
+        let result: Result<(), String> = async {
+            let conn = self.conn().await?;
+            let mut last = Value::Other;
+            for statement in &statements {
+                last = conn.eval(statement).await?;
+            }
+            let known = Rows::of(last)?;
+            self.known = (0..known.len()).map(|row| known.int("fp", row)).collect();
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            self.conn = None;
+            tracing::error!(error = %e, "statistics: cannot prune the store");
         }
     }
 }
@@ -539,6 +730,18 @@ mod tests {
         assert_eq!(quantile(&hist, 0.5), 512);
         assert_eq!(quantile(&hist, 0.99), 65_536);
         assert_eq!(quantile(&[0; BUCKETS], 0.5), 0);
-        assert_eq!(hist_from_blob(&hist_to_blob(&hist)), hist);
+    }
+
+    #[test]
+    fn every_table_has_as_many_types_as_columns() {
+        for (name, source) in schema() {
+            let names = source
+                .split('[')
+                .nth(1)
+                .and_then(|s| s.split(']').next())
+                .unwrap_or_default();
+            let types = source.matches("(as '").count() + source.matches("(list)").count();
+            assert_eq!(names.split(' ').count(), types, "{name}: {source}");
+        }
     }
 }

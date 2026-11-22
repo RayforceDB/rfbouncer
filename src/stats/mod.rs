@@ -1,57 +1,62 @@
 //! Statistics of the requests that passed through: collected off the request
-//! path, kept in SQLite, read back by the report pages.
+//! path, kept in a Rayforce process of their own, read back by the report
+//! pages.
 
 pub mod event;
 pub mod normalize;
+pub mod rf;
 pub mod store;
 
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
+use tokio::sync::{Mutex, mpsc, oneshot};
+
 use event::Event;
+use rf::Conn;
 
 use crate::config::StatsConfig;
+use crate::wire::value::Value;
 
-/// Events waiting for the statistics thread. Past this they are dropped and
+/// Events waiting for the statistics task. Past this they are dropped and
 /// counted: statistics never hold a request back.
 pub const BACKLOG: usize = 16_384;
 
 pub enum Msg {
     Event(Box<Event>),
     /// Write what is held in memory, then answer.
-    Flush(SyncSender<()>),
+    Flush(oneshot::Sender<()>),
 }
 
-/// Where a finished request is reported. Without a database it counts
-/// nothing and costs nothing.
+/// Where a finished request is reported, and where the reports are read
+/// from. Without a store it counts nothing and costs nothing.
 #[derive(Default)]
 pub struct Stats {
-    tx: Option<SyncSender<Msg>>,
-    path: Option<PathBuf>,
+    tx: Option<mpsc::Sender<Msg>>,
+    cfg: Option<StatsConfig>,
+    /// The connection the reports are read over, opened when first needed.
+    reader: Mutex<Option<Conn>>,
     pub dropped: AtomicU64,
 }
 
 impl Stats {
-    /// Opens the database and starts the thread that writes to it. With no
-    /// path configured, statistics are off.
-    pub fn start(cfg: &StatsConfig) -> Result<Self, String> {
-        let Some(path) = cfg.path.clone() else {
-            return Ok(Self::default());
-        };
-        let db = store::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let (tx, rx) = sync_channel(BACKLOG);
-        let cfg = cfg.clone();
-        std::thread::Builder::new()
-            .name("stats".into())
-            .spawn(move || store::run(db, &cfg, &rx))
-            .map_err(|e| format!("cannot start the statistics thread: {e}"))?;
-        Ok(Self {
+    /// Starts the task that writes to the store. With no store configured,
+    /// statistics are off. Must be called inside the runtime.
+    pub fn start(cfg: &StatsConfig) -> Self {
+        if cfg.rayforce.is_none() {
+            return Self::default();
+        }
+        let (tx, rx) = mpsc::channel(BACKLOG);
+        tokio::spawn(store::run(cfg.clone(), rx));
+        Self {
             tx: Some(tx),
-            path: Some(path),
-            dropped: AtomicU64::new(0),
-        })
+            cfg: Some(cfg.clone()),
+            ..Self::default()
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.tx.is_some()
     }
 
     pub fn record(&self, event: Event) {
@@ -62,19 +67,36 @@ impl Stats {
         }
     }
 
-    /// Has everything reported so far written to the database. Blocks, for
-    /// five seconds at most.
-    pub fn flush(&self) {
+    /// Has everything reported so far written to the store, waiting five
+    /// seconds at most.
+    pub async fn flush(&self) {
         if let Some(tx) = &self.tx {
-            let (done, wait) = sync_channel(1);
-            if tx.send(Msg::Flush(done)).is_ok() {
-                let _ = wait.recv_timeout(Duration::from_secs(5));
+            let (done, wait) = oneshot::channel();
+            if tx.send(Msg::Flush(done)).await.is_ok() {
+                let _ = tokio::time::timeout(Duration::from_secs(5), wait).await;
             }
         }
     }
 
-    /// The database, for whoever reads the reports.
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+    /// Evaluates `source` in the store, for a report. One at a time: the
+    /// store evaluates one message at a time anyway.
+    pub async fn query(&self, source: &str) -> Result<Value, String> {
+        let cfg = self.cfg.as_ref().ok_or("statistics are off")?;
+        let mut reader = self.reader.lock().await;
+        if reader.is_none() {
+            let mut conn = Conn::open(cfg).await?;
+            // A report asked for before any request has ended finds its tables.
+            store::ensure_schema(&mut conn).await?;
+            *reader = Some(conn);
+        }
+        let Some(conn) = reader.as_mut() else {
+            return Err("no connection to the statistics store".into());
+        };
+        let answer = conn.eval(source).await;
+        if answer.is_err() {
+            // Whatever went wrong, the next report starts on a fresh connection.
+            *reader = None;
+        }
+        answer
     }
 }

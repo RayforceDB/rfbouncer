@@ -1,14 +1,16 @@
-//! What the report pages ask for, read out of the statistics database.
-//! Everything here blocks, so it is called through `spawn_blocking`.
+//! What the report pages ask for, each a query to the statistics store.
+//!
+//! The store is a Rayforce process that also takes writes, and part of a
+//! filter comes from a URL. Only numbers, and names held to letters, digits,
+//! `-` and `_`, ever reach the source of a query.
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
 
-use crate::stats::store::{BUCKETS, hist_from_blob, quantile};
+use crate::stats::Stats;
+use crate::stats::store::{BUCKETS, COUNTERS, Rows, quantile};
 
 /// Points a time series is thinned to, whatever the range.
 const POINTS: i64 = 120;
@@ -28,7 +30,8 @@ pub struct Filter {
 
 impl Filter {
     /// Reads `pool`, `from`, `to`, `fp`, `sort` and `limit` off a query
-    /// string. Without a range it is the last hour.
+    /// string. Without a range it is the last hour. A pool name that could
+    /// not be a pool's is dropped.
     pub fn parse(query: &str) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -42,7 +45,13 @@ impl Filter {
         for pair in query.split('&') {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
             match key {
-                "pool" => f.pool = value.to_owned(),
+                "pool"
+                    if value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
+                {
+                    f.pool = value.to_owned();
+                }
                 "from" => f.from = value.parse().unwrap_or(f.from),
                 "to" => f.to = value.parse().unwrap_or(f.to),
                 "fp" => f.fp = u64::from_str_radix(value, 16).ok(),
@@ -53,74 +62,89 @@ impl Filter {
         }
         f
     }
+
+    /// The condition every query of this filter shares: `column` between
+    /// `lo` and `hi`, the pool, and the fingerprint where one is asked for.
+    fn condition(&self, column: &str, lo: i64, hi: i64, with_fp: bool, more: &str) -> String {
+        let mut out = format!("(and (>= {column} {lo}) (<= {column} {hi})");
+        if !self.pool.is_empty() {
+            out.push_str(&format!(" (== pool (as 'SYMBOL \"{}\"))", self.pool));
+        }
+        if let (true, Some(fp)) = (with_fp, self.fp) {
+            out.push_str(&format!(" (== fp {})", fp as i64));
+        }
+        out.push_str(more);
+        out.push(')');
+        out
+    }
+
+    fn minutes(&self, with_fp: bool) -> String {
+        self.condition("minute", self.from / 60, self.to / 60, with_fp, "")
+    }
 }
 
 #[derive(Default, Clone)]
 struct Acc {
-    count: u64,
-    errors: u64,
-    cancels: u64,
-    timeouts: u64,
-    refused: u64,
-    failed: u64,
-    retries: u64,
-    dur_sum: u64,
-    dur_max: u64,
-    wait_sum: u64,
-    bytes_in: u64,
-    bytes_out: u64,
+    counters: [u64; COUNTERS.len()],
     hist: [u64; BUCKETS],
 }
 
 impl Acc {
+    fn get(&self, name: &str) -> u64 {
+        COUNTERS
+            .iter()
+            .position(|c| *c == name)
+            .map_or(0, |i| self.counters[i])
+    }
+
     fn add(&mut self, o: &Self) {
-        self.count += o.count;
-        self.errors += o.errors;
-        self.cancels += o.cancels;
-        self.timeouts += o.timeouts;
-        self.refused += o.refused;
-        self.failed += o.failed;
-        self.retries += o.retries;
-        self.dur_sum += o.dur_sum;
-        self.dur_max = self.dur_max.max(o.dur_max);
-        self.wait_sum += o.wait_sum;
-        self.bytes_in += o.bytes_in;
-        self.bytes_out += o.bytes_out;
+        for (i, name) in COUNTERS.iter().enumerate() {
+            self.counters[i] = if name.ends_with("_max") {
+                self.counters[i].max(o.counters[i])
+            } else {
+                self.counters[i] + o.counters[i]
+            };
+        }
         for (mine, theirs) in self.hist.iter_mut().zip(o.hist) {
             *mine += theirs;
         }
     }
 
     fn not_ok(&self) -> u64 {
-        self.errors + self.cancels + self.timeouts + self.refused + self.failed
+        ["errors", "cancels", "timeouts", "refused", "failed"]
+            .iter()
+            .map(|c| self.get(c))
+            .sum()
     }
 
     fn json(&self) -> Value {
+        let count = self.get("count");
         let per = |sum: u64| {
-            if self.count == 0 {
+            if count == 0 {
                 0.0
             } else {
-                ms(sum) / self.count as f64
+                ms(sum) / count as f64
             }
         };
         json!({
-            "count": self.count,
+            "count": count,
             "not_ok": self.not_ok(),
-            "errors": self.errors,
-            "cancels": self.cancels,
-            "timeouts": self.timeouts,
-            "refused": self.refused,
-            "failed": self.failed,
-            "retries": self.retries,
-            "total_ms": ms(self.dur_sum),
-            "avg_ms": per(self.dur_sum),
-            "max_ms": ms(self.dur_max),
-            "wait_avg_ms": per(self.wait_sum),
+            "errors": self.get("errors"),
+            "cancels": self.get("cancels"),
+            "timeouts": self.get("timeouts"),
+            "refused": self.get("refused"),
+            "failed": self.get("failed"),
+            "retries": self.get("retries"),
+            "total_ms": ms(self.get("dur_sum")),
+            "avg_ms": per(self.get("dur_sum")),
+            "max_ms": ms(self.get("dur_max")),
+            "wait_avg_ms": per(self.get("wait_sum")),
+            "wait_max_ms": ms(self.get("wait_max")),
             "p50_ms": ms(quantile(&self.hist, 0.50)),
             "p95_ms": ms(quantile(&self.hist, 0.95)),
             "p99_ms": ms(quantile(&self.hist, 0.99)),
-            "bytes_in": self.bytes_in,
-            "bytes_out": self.bytes_out,
+            "bytes_in": self.get("bytes_in"),
+            "bytes_out": self.get("bytes_out"),
         })
     }
 }
@@ -129,53 +153,45 @@ fn ms(micros: u64) -> f64 {
     micros as f64 / 1000.0
 }
 
-pub fn open(path: &Path) -> rusqlite::Result<Connection> {
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-}
-
-/// Every aggregate row the filter covers, as `(minute, fingerprint, row)`.
-fn scan(db: &Connection, f: &Filter) -> rusqlite::Result<Vec<(i64, u64, Acc)>> {
-    let mut query = db.prepare_cached(
-        "SELECT minute, fp, count, errors, cancels, timeouts, refused, failed, retries, dur_sum, dur_max,
-                wait_sum, bytes_in, bytes_out, hist
-         FROM agg WHERE minute BETWEEN ?1 AND ?2 AND (?3 = '' OR pool = ?3) AND (?4 IS NULL OR fp = ?4)",
-    )?;
-    let u = |row: &rusqlite::Row<'_>, i: usize| row.get::<_, i64>(i).map(|n| n as u64);
-    let rows = query.query_map(
-        params![f.from / 60, f.to / 60, f.pool, f.fp.map(|fp| fp as i64)],
-        |row| {
-            let acc = Acc {
-                count: u(row, 2)?,
-                errors: u(row, 3)?,
-                cancels: u(row, 4)?,
-                timeouts: u(row, 5)?,
-                refused: u(row, 6)?,
-                failed: u(row, 7)?,
-                retries: u(row, 8)?,
-                dur_sum: u(row, 9)?,
-                dur_max: u(row, 10)?,
-                wait_sum: u(row, 11)?,
-                bytes_in: u(row, 12)?,
-                bytes_out: u(row, 13)?,
-                hist: hist_from_blob(&row.get::<_, Vec<u8>>(14)?),
-            };
-            Ok((row.get(0)?, u(row, 1)?, acc))
-        },
-    )?;
-    rows.collect()
+/// The aggregate rows the filter covers, summed per `key`: a time step or a
+/// fingerprint. The summing is the store's.
+async fn summed(stats: &Stats, f: &Filter, key: &str) -> Result<Vec<(i64, Acc)>, String> {
+    let mut columns = String::new();
+    for name in COUNTERS {
+        let how = if name.ends_with("_max") { "max" } else { "sum" };
+        columns.push_str(&format!(" s_{name}: ({how} {name})"));
+    }
+    for i in 0..BUCKETS {
+        columns.push_str(&format!(" s_h{i}: (sum h{i})"));
+    }
+    let source = format!(
+        "(select {{from: rfb_agg where: {} by: {{k: {key}}}{columns}}})",
+        f.minutes(true)
+    );
+    let rows = Rows::of(stats.query(&source).await?)?;
+    Ok((0..rows.len())
+        .map(|row| {
+            let mut acc = Acc::default();
+            for (slot, name) in acc.counters.iter_mut().zip(COUNTERS) {
+                *slot = rows.int(&format!("s_{name}"), row);
+            }
+            for (i, slot) in acc.hist.iter_mut().enumerate() {
+                *slot = rows.int(&format!("s_h{i}"), row);
+            }
+            (rows.int("k", row) as i64, acc)
+        })
+        .collect())
 }
 
 /// The whole range as one row, and as a series of at most `POINTS` steps.
-fn series(rows: &[(i64, u64, Acc)], f: &Filter) -> Value {
+async fn series(stats: &Stats, f: &Filter) -> Result<Value, String> {
     let step = (((f.to - f.from) / 60 + POINTS) / POINTS).max(1);
+    let rows = summed(stats, f, &format!("(xbar minute {step})")).await?;
     let mut total = Acc::default();
-    let mut points: BTreeMap<i64, Acc> = BTreeMap::new();
-    for (minute, _, acc) in rows {
-        total.add(acc);
-        points
-            .entry(minute - minute.rem_euclid(step))
-            .or_default()
-            .add(acc);
+    let mut points = BTreeMap::new();
+    for (minute, acc) in rows {
+        total.add(&acc);
+        points.insert(minute, acc);
     }
     let points: Vec<Value> = points
         .iter()
@@ -185,141 +201,175 @@ fn series(rows: &[(i64, u64, Acc)], f: &Filter) -> Value {
             point
         })
         .collect();
-    json!({ "from": f.from, "to": f.to, "step_s": step * 60, "total": total.json(), "points": points, "hist": total.hist.to_vec() })
-}
-
-pub fn overview(db: &Connection, f: &Filter) -> rusqlite::Result<Value> {
-    Ok(series(&scan(db, f)?, f))
-}
-
-fn text_of(db: &Connection, fp: u64) -> String {
-    db.query_row(
-        "SELECT text FROM fingerprints WHERE fp = ?",
-        [fp as i64],
-        |row| row.get(0),
+    Ok(
+        json!({ "from": f.from, "to": f.to, "step_s": step * 60, "total": total.json(), "points": points }),
     )
-    .unwrap_or_default()
+}
+
+/// How the requests of the range ended, by outcome: `ok`, the bouncer's own
+/// `cancel`, `timeout`, `busy` and `io`, and every error code a replica
+/// raised.
+async fn outcomes(stats: &Stats, f: &Filter) -> Result<Value, String> {
+    let source = format!(
+        "(select {{from: rfb_status where: {} by: status n: (sum count)}})",
+        f.minutes(false)
+    );
+    let rows = Rows::of(stats.query(&source).await?)?;
+    let mut list: Vec<(String, u64)> = (0..rows.len())
+        .map(|row| (rows.text("status", row), rows.int("n", row)))
+        .collect();
+    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok(list
+        .into_iter()
+        .map(|(status, count)| json!({ "status": status, "count": count }))
+        .collect())
+}
+
+pub async fn overview(stats: &Stats, f: &Filter) -> Result<Value, String> {
+    let mut out = series(stats, f).await?;
+    out["outcomes"] = outcomes(stats, f).await?;
+    Ok(out)
+}
+
+/// The text of each of these fingerprints.
+async fn texts(stats: &Stats, fps: &[u64]) -> Result<BTreeMap<u64, String>, String> {
+    if fps.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let list: Vec<String> = fps.iter().map(|fp| (*fp as i64).to_string()).collect();
+    let source = format!(
+        "(select {{from: rfb_fp where: (in fp [{}])}})",
+        list.join(" ")
+    );
+    let rows = Rows::of(stats.query(&source).await?)?;
+    Ok((0..rows.len())
+        .map(|row| (rows.int("fp", row), rows.text("text", row)))
+        .collect())
 }
 
 /// The queries of the range, the heaviest first by `sort`.
-pub fn top(db: &Connection, f: &Filter) -> rusqlite::Result<Value> {
-    let mut by_fp: HashMap<u64, Acc> = HashMap::new();
+pub async fn top(stats: &Stats, f: &Filter) -> Result<Value, String> {
+    let mut rows = summed(stats, f, "fp").await?;
     let mut all = Acc::default();
-    for (_, fp, acc) in scan(db, f)? {
-        all.add(&acc);
-        by_fp.entry(fp).or_default().add(&acc);
-    }
-    let mut rows: Vec<(u64, Acc)> = by_fp.into_iter().collect();
+    rows.iter().for_each(|(_, acc)| all.add(acc));
     let key = |a: &Acc| match f.sort.as_str() {
-        "count" => a.count,
-        "avg" => a.dur_sum / a.count.max(1),
-        "max" => a.dur_max,
+        "count" => a.get("count"),
+        "avg" => a.get("dur_sum") / a.get("count").max(1),
+        "max" => a.get("dur_max"),
         "errors" => a.not_ok(),
-        "bytes" => a.bytes_out,
-        _ => a.dur_sum,
+        "bytes" => a.get("bytes_out"),
+        _ => a.get("dur_sum"),
     };
     rows.sort_by_key(|(fp, acc)| (std::cmp::Reverse(key(acc)), *fp));
-    let queries = rows.len();
-    let rows: Vec<Value> = rows
+    rows.truncate(f.limit);
+    let fps: Vec<u64> = rows.iter().map(|(fp, _)| *fp as u64).collect();
+    let texts = texts(stats, &fps).await?;
+    let total = all.get("dur_sum");
+    let listed: Vec<Value> = rows
         .iter()
-        .take(f.limit)
         .map(|(fp, acc)| {
+            let fp = *fp as u64;
             let mut row = acc.json();
             row["fp"] = json!(format!("{fp:016x}"));
-            row["text"] = json!(text_of(db, *fp));
-            row["share"] = json!(if all.dur_sum == 0 {
+            row["text"] = json!(texts.get(&fp).cloned().unwrap_or_default());
+            row["share"] = json!(if total == 0 {
                 0.0
             } else {
-                acc.dur_sum as f64 / all.dur_sum as f64
+                acc.get("dur_sum") as f64 / total as f64
             });
             row
         })
         .collect();
-    Ok(json!({ "queries": queries, "rows": rows }))
+    Ok(json!({ "rows": listed, "total": all.json() }))
 }
 
-fn samples(db: &Connection, f: &Filter, kind: &str, order: &str) -> rusqlite::Result<Vec<Value>> {
-    let sql = format!(
-        "SELECT ts, pool, fp, dur, wait, backend, client, status, text FROM samples
-         WHERE kind = ?1 AND ts BETWEEN ?2 AND ?3 AND (?4 = '' OR pool = ?4) AND (?5 IS NULL OR fp = ?5)
-         ORDER BY {order} DESC LIMIT ?6"
+async fn samples(stats: &Stats, f: &Filter, kind: &str, order: &str) -> Result<Value, String> {
+    let condition = f.condition(
+        "ts",
+        f.from * 1000,
+        f.to * 1000 + 999,
+        true,
+        &format!(" (== kind '{kind})"),
     );
-    let mut query = db.prepare_cached(&sql)?;
-    let rows = query.query_map(
-        params![
-            kind,
-            f.from * 1000,
-            f.to * 1000 + 999,
-            f.pool,
-            f.fp.map(|fp| fp as i64),
-            f.limit as i64
-        ],
-        |row| {
-            Ok(json!({
-                "ts": row.get::<_, i64>(0)?,
-                "pool": row.get::<_, String>(1)?,
-                "fp": format!("{:016x}", row.get::<_, i64>(2)? as u64),
-                "ms": ms(row.get::<_, i64>(3)? as u64),
-                "wait_ms": ms(row.get::<_, i64>(4)? as u64),
-                "backend": row.get::<_, String>(5)?,
-                "client": row.get::<_, String>(6)?,
-                "status": row.get::<_, String>(7)?,
-                "text": row.get::<_, String>(8)?,
-            }))
-        },
-    )?;
-    rows.collect()
+    let source = format!(
+        "(select {{from: rfb_sample where: {condition} desc: {order} take: {}}})",
+        f.limit
+    );
+    let rows = Rows::of(stats.query(&source).await?)?;
+    Ok((0..rows.len())
+        .map(|row| {
+            json!({
+                "ts": rows.int("ts", row),
+                "pool": rows.text("pool", row),
+                "fp": format!("{:016x}", rows.int("fp", row)),
+                "ms": ms(rows.int("dur", row)),
+                "wait_ms": ms(rows.int("wait", row)),
+                "backend": rows.text("backend", row),
+                "client": rows.text("client", row),
+                "status": rows.text("status", row),
+                "text": rows.text("text", row),
+            })
+        })
+        .collect())
 }
 
 /// One query: its series, and the requests kept of it.
-pub fn query(db: &Connection, f: &Filter) -> rusqlite::Result<Value> {
-    let mut out = series(&scan(db, f)?, f);
-    out["text"] = json!(f.fp.map(|fp| text_of(db, fp)).unwrap_or_default());
-    out["slow"] = json!(samples(db, f, "slow", "dur")?);
-    out["failed"] = json!(samples(db, f, "error", "ts")?);
+pub async fn query(stats: &Stats, f: &Filter) -> Result<Value, String> {
+    let mut out = series(stats, f).await?;
+    let fps: Vec<u64> = f.fp.into_iter().collect();
+    out["text"] = json!(
+        texts(stats, &fps)
+            .await?
+            .into_values()
+            .next()
+            .unwrap_or_default()
+    );
+    out["slow"] = samples(stats, f, "slow", "dur").await?;
+    out["failed"] = samples(stats, f, "error", "ts").await?;
     Ok(out)
 }
 
-pub fn slow(db: &Connection, f: &Filter) -> rusqlite::Result<Value> {
-    Ok(json!({ "rows": samples(db, f, "slow", "dur")? }))
+pub async fn slow(stats: &Stats, f: &Filter) -> Result<Value, String> {
+    Ok(json!({ "rows": samples(stats, f, "slow", "dur").await? }))
 }
 
-/// The failures kept of the range, newest first, and how many of each kind
-/// were kept. The exact counts per kind are in the overview's total.
-pub fn errors(db: &Connection, f: &Filter) -> rusqlite::Result<Value> {
-    let mut query = db.prepare_cached(
-        "SELECT status, count(*) FROM samples
-         WHERE kind = 'error' AND ts BETWEEN ?1 AND ?2 AND (?3 = '' OR pool = ?3) GROUP BY status ORDER BY 2 DESC",
-    )?;
-    let kinds = query.query_map(params![f.from * 1000, f.to * 1000 + 999, f.pool], |row| {
-        Ok(json!({ "status": row.get::<_, String>(0)?, "sampled": row.get::<_, i64>(1)? }))
-    })?;
-    let kinds: Vec<Value> = kinds.collect::<rusqlite::Result<_>>()?;
-    Ok(json!({ "kinds": kinds, "rows": samples(db, f, "error", "ts")? }))
+/// The failed requests kept of the range, newest first, with the exact
+/// count of every outcome.
+pub async fn errors(stats: &Stats, f: &Filter) -> Result<Value, String> {
+    Ok(
+        json!({ "outcomes": outcomes(stats, f).await?, "rows": samples(stats, f, "error", "ts").await? }),
+    )
 }
 
-/// Requests per client address or per replica, the busiest first.
-pub fn grouped(db: &Connection, f: &Filter, table: &str, column: &str) -> rusqlite::Result<Value> {
-    let sql = format!(
-        "SELECT pool, {column}, sum(count), sum(errors), sum(dur_sum) FROM {table}
-         WHERE minute BETWEEN ?1 AND ?2 AND (?3 = '' OR pool = ?3)
-         GROUP BY pool, {column} ORDER BY 3 DESC LIMIT ?4"
+/// Requests per client address (`rfb_client`) or per replica
+/// (`rfb_backend`), the busiest first.
+pub async fn grouped(stats: &Stats, f: &Filter, table: &str) -> Result<Value, String> {
+    let source = format!(
+        "(select {{from: {table} where: {} by: [pool who] n: (sum count) e: (sum errors) d: (sum dur_sum)}})",
+        f.minutes(false)
     );
-    let mut query = db.prepare_cached(&sql)?;
-    let rows = query.query_map(
-        params![f.from / 60, f.to / 60, f.pool, f.limit as i64],
-        |row| {
-            let (count, dur) = (row.get::<_, i64>(2)? as u64, row.get::<_, i64>(4)? as u64);
-            Ok(json!({
-                "pool": row.get::<_, String>(0)?,
-                "name": row.get::<_, String>(1)?,
+    let rows = Rows::of(stats.query(&source).await?)?;
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by_key(|row| {
+        (
+            std::cmp::Reverse(rows.int("n", *row)),
+            rows.text("who", *row),
+        )
+    });
+    let listed: Vec<Value> = order
+        .into_iter()
+        .take(f.limit)
+        .map(|row| {
+            let (count, dur) = (rows.int("n", row), rows.int("d", row));
+            json!({
+                "pool": rows.text("pool", row),
+                "name": rows.text("who", row),
                 "count": count,
-                "not_ok": row.get::<_, i64>(3)?,
+                "not_ok": rows.int("e", row),
                 "total_ms": ms(dur),
                 "avg_ms": if count == 0 { 0.0 } else { ms(dur) / count as f64 },
-            }))
-        },
-    )?;
-    let rows: Vec<Value> = rows.collect::<rusqlite::Result<_>>()?;
-    Ok(json!({ "rows": rows }))
+            })
+        })
+        .collect();
+    Ok(json!({ "rows": listed }))
 }

@@ -93,6 +93,8 @@ pub struct Shared {
     pub name: Arc<str>,
     pub counters: Counters,
     pub stats: Arc<Stats>,
+    /// The most requests that may wait, as the configuration in force says.
+    pub queue_max: AtomicU64,
 }
 
 /// How one request ended, as whoever ended it saw it.

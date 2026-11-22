@@ -274,11 +274,8 @@ fn show_config(core: &Core) -> Vec<u8> {
             format!("{:?}", c.client_idle_timeout),
         ),
         (
-            "stats.path",
-            c.stats
-                .path
-                .as_ref()
-                .map_or_else(String::new, |p| p.display().to_string()),
+            "stats.rayforce",
+            c.stats.rayforce.clone().unwrap_or_default(),
         ),
         ("stats.store_samples", c.stats.store_samples.to_string()),
     ];

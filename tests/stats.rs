@@ -7,10 +7,12 @@ mod support;
 use serde_json::Value;
 use support::{Bouncer, Client, Rayforce, http_get, http_json, int, pool, slow};
 
-fn config(replica: &Rayforce, db: &std::path::Path) -> String {
+/// A bouncer configuration over `replica` that keeps its statistics in
+/// `store`.
+fn config(replica: &Rayforce, store: &Rayforce) -> String {
     format!(
-        "admin_password = \"root\"\n[stats]\npath = \"{}\"\n{}",
-        db.display(),
+        "admin_password = \"root\"\n[stats]\nrayforce = \"{}\"\npassword = \"s\"\n{}",
+        store.addr(),
         pool(&[replica], "require_restricted = false")
     )
 }
@@ -27,9 +29,8 @@ fn row<'a>(top: &'a Value, text: &str) -> &'a Value {
 #[test]
 fn requests_are_counted_by_the_shape_of_their_query() {
     let replica = Rayforce::start(&[]);
-    let db = std::env::temp_dir().join(format!("rfbouncer-stats-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&db);
-    let bouncer = Bouncer::start(&config(&replica, &db));
+    let store = Rayforce::start(&["-u", "s"]);
+    let bouncer = Bouncer::start(&config(&replica, &store));
     let mut c = Client::connect(bouncer.port);
     for i in 0..30 {
         assert_eq!(c.query(&format!("(+ {i} 1)")), int(i + 1));
@@ -52,7 +53,8 @@ fn requests_are_counted_by_the_shape_of_their_query() {
     c.recv();
 
     let top = http_json(bouncer.port, "/api/top?sort=count", "root");
-    assert_eq!(top["queries"], 3);
+    assert_eq!(top["rows"].as_array().unwrap().len(), 3);
+    assert_eq!(top["total"]["count"], 34);
     let plus = row(&top, "(+ ? ?)");
     assert_eq!(
         (plus["count"].as_u64(), plus["not_ok"].as_u64()),
@@ -97,13 +99,18 @@ fn requests_are_counted_by_the_shape_of_their_query() {
 
     let errors = http_json(bouncer.port, "/api/errors", "root");
     assert_eq!(errors["rows"].as_array().unwrap().len(), 4);
-    assert!(
-        errors["kinds"]
+    let count_of = |outcomes: &Value, status: &str| {
+        let found = outcomes
             .as_array()
             .unwrap()
             .iter()
-            .any(|k| k["status"] == "name" && k["sampled"] == 3)
-    );
+            .find(|o| o["status"] == status);
+        found.map_or(0, |o| o["count"].as_u64().unwrap())
+    };
+    assert_eq!(count_of(&errors["outcomes"], "name"), 3);
+    assert_eq!(count_of(&errors["outcomes"], "cancel"), 1);
+    assert_eq!(count_of(&errors["outcomes"], "ok"), 30);
+    assert_eq!(count_of(&overview["outcomes"], "ok"), 30);
     assert!(
         !http_json(bouncer.port, "/api/slow", "root")["rows"]
             .as_array()
@@ -130,16 +137,53 @@ fn requests_are_counted_by_the_shape_of_their_query() {
         "{metrics}"
     );
 
-    // What was counted outlives the process.
+    // What was counted is the store's, not the bouncer's: another bouncer
+    // on the same store goes on from it.
     drop(bouncer);
-    let again = Bouncer::start(&config(&replica, &db));
+    let again = Bouncer::start(&config(&replica, &store));
     assert_eq!(Client::connect(again.port).query("(+ 5 5)"), int(10));
     let top = http_json(again.port, "/api/top", "root");
     assert_eq!(row(&top, "(+ ? ?)")["count"], 31);
-    drop(again);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
+
+    // The store holds ordinary tables, there for anyone to query.
+    let mut direct = Client::connect_as(store.port, 4, Some(("me", "s"))).unwrap();
+    assert_eq!(direct.query("(sum (at rfb_agg 'count))"), int(35));
+}
+
+#[test]
+fn a_store_that_comes_back_empty_is_set_up_again() {
+    let replica = Rayforce::start(&[]);
+    let mut store = Rayforce::start(&[]);
+    let port = store.port;
+    let body = format!(
+        "admin_password = \"root\"\n[stats]\nrayforce = \"{}\"\n{}",
+        store.addr(),
+        pool(&[&replica], "require_restricted = false")
+    );
+    let bouncer = Bouncer::start(&body);
+    assert_eq!(Client::connect(bouncer.port).query("(+ 1 1)"), int(2));
+    assert_eq!(
+        http_json(bouncer.port, "/api/overview", "root")["total"]["count"],
+        1
+    );
+
+    store.kill();
+    // Requests go on while there is nowhere to count them.
+    assert_eq!(Client::connect(bouncer.port).query("(+ 2 2)"), int(4));
+    assert_eq!(http_get(bouncer.port, "/api/overview", Some("root")).0, 502);
+
+    let _back = Rayforce::start_on(port, &[]);
+    assert_eq!(Client::connect(bouncer.port).query("(+ 3 3)"), int(6));
+    // The minute was held in memory while the store was away, so nothing of
+    // it is missing from the new one.
+    support::eventually("the new store has the whole minute", || {
+        let (status, body) = http_get(bouncer.port, "/api/overview", Some("root"));
+        status == 200 && serde_json::from_str::<Value>(&body).unwrap()["total"]["count"] == 3
+    });
+    assert_eq!(
+        row(&http_json(bouncer.port, "/api/top", "root"), "(+ ? ?)")["count"],
+        3
+    );
 }
 
 #[test]
@@ -156,7 +200,7 @@ fn the_pages_want_the_admin_password() {
     assert!(page.contains("rfbouncer"));
     assert_eq!(http_get(bouncer.port, "/app.js", Some("root")).0, 200);
     assert_eq!(http_get(bouncer.port, "/nowhere", Some("root")).0, 404);
-    // Without a database the reports say so, and the rest still works.
+    // Without a store the reports say so, and the rest still works.
     assert_eq!(http_get(bouncer.port, "/api/top", Some("root")).0, 404);
     assert_eq!(http_json(bouncer.port, "/api/live", "root")["stats"], false);
     // Clients are served on the same port all the while.

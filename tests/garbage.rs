@@ -6,7 +6,7 @@
 use rfbouncer::stats::normalize::normalize;
 use rfbouncer::wire::compress::decompress;
 use rfbouncer::wire::frame::{HEADER_LEN, Header, PAYLOAD_MAX};
-use rfbouncer::wire::value::{error_code, request_text};
+use rfbouncer::wire::value::{decode, error_code, request_text};
 
 /// xorshift: the same bytes on every run, so a failure can be found again.
 struct Random(u64);
@@ -52,6 +52,7 @@ fn no_input_makes_a_parser_panic() {
             assert!(!plain.is_empty() && plain.len() <= 4096);
         }
         let _ = error_code(&bytes);
+        let _ = decode(&bytes);
         let _ = request_text(0, &bytes);
         let _ = request_text(1, &bytes);
         let text = String::from_utf8_lossy(&bytes);

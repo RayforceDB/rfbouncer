@@ -73,6 +73,7 @@ pub fn error_code(payload: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(code).into_owned())
 }
 
+#[derive(Debug, PartialEq)]
 pub enum Column {
     I64(Vec<i64>),
     F64(Vec<f64>),
@@ -92,11 +93,11 @@ impl Column {
 
 /// A table: the schema names as a symbol vector, then a list of columns.
 /// Columns must be the same length; names must be free of NUL.
-pub fn table(columns: &[(&str, Column)]) -> Vec<u8> {
+pub fn table<S: AsRef<str>>(columns: &[(S, Column)]) -> Vec<u8> {
     let mut out = vec![TYPE_TABLE, 0];
     vec_head(&mut out, TYPE_SYM, SCHEMA_ATTRS, columns.len());
     for (name, _) in columns {
-        sym_cell(&mut out, name);
+        sym_cell(&mut out, name.as_ref());
     }
     vec_head(&mut out, TYPE_LIST, 0, columns.len());
     for (_, column) in columns {
@@ -138,6 +139,170 @@ fn vec_head(out: &mut Vec<u8>, ty: u8, attrs: u8, len: usize) {
 fn sym_cell(out: &mut Vec<u8>, text: &str) {
     out.extend(text.bytes().filter(|b| *b != 0));
     out.push(0);
+}
+
+/// A call with a table as its last argument, as the server would parse it
+/// from source: `(function 'target keys table)`. Sent as a value and not as
+/// text, so nothing in the table's cells can be read as code.
+pub fn call_with_table(function: &str, target: &str, keys: i64, table: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(table.len() + 64);
+    vec_head(&mut out, TYPE_LIST, 0, 4);
+    for (attrs, name) in [(0, function), (ATTR_QUOTED, target)] {
+        out.push(TYPE_SYM_ATOM);
+        out.push(attrs);
+        sym_cell(&mut out, name);
+    }
+    out.push(TYPE_I64_ATOM);
+    out.push(0);
+    out.extend_from_slice(&keys.to_le_bytes());
+    out.extend_from_slice(table);
+    out
+}
+
+const TYPE_SYM_ATOM: u8 = 0xF4;
+const TYPE_I64_ATOM: u8 = 0xFB;
+const TYPE_F64_ATOM: u8 = 0xF9;
+/// On a symbol atom: a literal symbol (`'name`), not a name to look up.
+const ATTR_QUOTED: u8 = 0x20;
+
+/// A value read back from a server, as far as the statistics need one.
+#[derive(Debug, PartialEq)]
+pub enum Value {
+    I64(i64),
+    F64(f64),
+    Text(String),
+    Table(Vec<(String, Column)>),
+    Error(String, String),
+    /// Anything else. It was read without complaint and is not looked at.
+    Other,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("cannot read the server's answer: {0}")]
+pub struct DecodeError(&'static str);
+
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+        if self.0.len() < n {
+            return Err(DecodeError("it ends early"));
+        }
+        let (head, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(head)
+    }
+
+    fn u8(&mut self) -> Result<u8, DecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn i64(&mut self) -> Result<i64, DecodeError> {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(self.take(8)?);
+        Ok(i64::from_le_bytes(raw))
+    }
+
+    /// A length that the bytes left could actually hold, at `each` bytes an
+    /// element, so a wild number never becomes an allocation.
+    fn len(&mut self, each: usize) -> Result<usize, DecodeError> {
+        let n = usize::try_from(self.i64()?).map_err(|_| DecodeError("a negative length"))?;
+        if n.checked_mul(each).is_none_or(|bytes| bytes > self.0.len()) {
+            return Err(DecodeError("a length past the end"));
+        }
+        Ok(n)
+    }
+
+    fn cstr(&mut self) -> Result<String, DecodeError> {
+        let end = self
+            .0
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or(DecodeError("an unterminated symbol"))?;
+        let text = String::from_utf8_lossy(self.take(end)?).into_owned();
+        self.take(1)?;
+        Ok(text)
+    }
+
+    fn column(&mut self) -> Result<Column, DecodeError> {
+        let ty = self.u8()?;
+        self.u8()?;
+        Ok(match ty {
+            TYPE_I64 => {
+                let n = self.len(8)?;
+                Column::I64((0..n).map(|_| self.i64()).collect::<Result<_, _>>()?)
+            }
+            TYPE_F64 => {
+                let n = self.len(8)?;
+                Column::F64(
+                    (0..n)
+                        .map(|_| self.i64().map(|bits| f64::from_bits(bits as u64)))
+                        .collect::<Result<_, _>>()?,
+                )
+            }
+            TYPE_SYM => {
+                let n = self.len(1)?;
+                Column::Sym((0..n).map(|_| self.cstr()).collect::<Result<_, _>>()?)
+            }
+            TYPE_STR => {
+                let n = self.len(8)?;
+                let cell = |r: &mut Self| {
+                    let len = r.len(1)?;
+                    Ok(String::from_utf8_lossy(r.take(len)?).into_owned())
+                };
+                Column::Str((0..n).map(|_| cell(self)).collect::<Result<_, _>>()?)
+            }
+            // A column nothing was ever put in has no type yet.
+            TYPE_LIST if self.len(0)? == 0 => Column::Str(Vec::new()),
+            _ => return Err(DecodeError("a column of a type the statistics do not use")),
+        })
+    }
+}
+
+pub fn decode(payload: &[u8]) -> Result<Value, DecodeError> {
+    let mut r = Reader(payload);
+    Ok(match r.u8()? {
+        TYPE_ERROR => {
+            let code = error_code(payload).unwrap_or_default();
+            let msg = payload
+                .get(10..)
+                .map(|m| String::from_utf8_lossy(m).into_owned())
+                .unwrap_or_default();
+            Value::Error(code, msg)
+        }
+        TYPE_I64_ATOM => {
+            r.u8()?;
+            Value::I64(r.i64()?)
+        }
+        TYPE_F64_ATOM => {
+            r.u8()?;
+            Value::F64(f64::from_bits(r.i64()? as u64))
+        }
+        TYPE_STR_ATOM => {
+            r.u8()?;
+            let len = r.len(1)?;
+            Value::Text(String::from_utf8_lossy(r.take(len)?).into_owned())
+        }
+        TYPE_SYM_ATOM => {
+            r.u8()?;
+            Value::Text(r.cstr()?)
+        }
+        TYPE_TABLE => {
+            r.u8()?;
+            let Column::Sym(names) = r.column()? else {
+                return Err(DecodeError("a table without column names"));
+            };
+            if (r.u8()?, r.u8()?).0 != TYPE_LIST || r.len(2)? != names.len() {
+                return Err(DecodeError("a table whose columns do not match its names"));
+            }
+            let columns = names
+                .iter()
+                .map(|_| r.column())
+                .collect::<Result<Vec<_>, _>>()?;
+            Value::Table(names.into_iter().zip(columns).collect())
+        }
+        _ => Value::Other,
+    })
 }
 
 #[cfg(test)]
@@ -205,5 +370,76 @@ mod tests {
                 "6162010000000000000063"
             ))
         );
+    }
+
+    #[test]
+    fn what_is_written_is_read_back() {
+        let columns = vec![
+            ("minute".to_owned(), Column::I64(vec![1, -2])),
+            (
+                "pool".to_owned(),
+                Column::Sym(vec!["127.0.0.1:5".into(), "b c".into()]),
+            ),
+            (
+                "text".to_owned(),
+                Column::Str(vec!["(+ \"x\" 1)".into(), String::new()]),
+            ),
+            ("avg".to_owned(), Column::F64(vec![15.5, 0.0])),
+        ];
+        assert_eq!(decode(&table(&columns)), Ok(Value::Table(columns)));
+    }
+
+    #[test]
+    fn a_servers_answers_are_read() {
+        // `(select {from: t a: (avg n) m: (max n)})` off a rayforce 3.0.2.
+        let answer = hex(concat!(
+            "62000c03020000000000000061006d0000000200000000000000070001000000000000000000000000002f40",
+            "050001000000000000001500000000000000"
+        ));
+        let expected = vec![
+            ("a".to_owned(), Column::F64(vec![15.5])),
+            ("m".to_owned(), Column::I64(vec![21])),
+        ];
+        assert_eq!(decode(&answer), Ok(Value::Table(expected)));
+        // An empty grouped result: the symbol column carries attrs.
+        let empty = hex(
+            "62000c030200000000000000706f6f6c006e00000002000000000000000c40000000000000000005000000000000000000",
+        );
+        let expected = vec![
+            ("pool".to_owned(), Column::Sym(vec![])),
+            ("n".to_owned(), Column::I64(vec![])),
+        ];
+        assert_eq!(decode(&empty), Ok(Value::Table(expected)));
+        assert_eq!(decode(&hex("fb000200000000000000")), Ok(Value::I64(2)));
+        assert_eq!(decode(&hex("f4007400")), Ok(Value::Text("t".into())));
+        assert_eq!(
+            decode(&hex(
+                "7f6e616d650000000012276e6f737563682720756e646566696e6564"
+            )),
+            Ok(Value::Error("name".into(), "'nosuch' undefined".into()))
+        );
+    }
+
+    #[test]
+    fn a_broken_answer_is_refused() {
+        let good = table(&[
+            ("a", Column::I64(vec![1, 2])),
+            ("s", Column::Str(vec!["ab".into(), "c".into()])),
+        ]);
+        for cut in 1..good.len() {
+            assert!(decode(&good[..cut]).is_err(), "cut at {cut}");
+        }
+        let mut wild = good.clone();
+        wild[4..12].copy_from_slice(&i64::MAX.to_le_bytes());
+        assert!(decode(&wild).is_err());
+    }
+
+    #[test]
+    fn a_call_is_what_the_server_parses_from_source() {
+        let t = table(&[("a", Column::I64(vec![1]))]);
+        let call = call_with_table("upsert", "t", 2, &t);
+        let head = hex("00000400000000000000f40075707365727400f4207400fb000200000000000000");
+        assert_eq!(&call[..head.len()], &head[..]);
+        assert_eq!(&call[head.len()..], &t[..]);
     }
 }

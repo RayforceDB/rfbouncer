@@ -128,42 +128,33 @@ async fn handle(request: Request<Incoming>, core: &Arc<Core>) -> Reply {
     }
 }
 
-/// One of the reports kept in the statistics database.
+/// One of the reports kept in the statistics store.
 async fn report(core: &Arc<Core>, what: String, filter: Filter) -> Reply {
-    let stats = core.stats.clone();
-    if stats.path().is_none() {
-        let body = json!({ "error": "statistics are off: set path under [stats] to turn them on" });
+    let stats = &core.stats;
+    if !stats.enabled() {
+        let body =
+            json!({ "error": "statistics are off: set rayforce under [stats] to turn them on" });
         return reply(StatusCode::NOT_FOUND, JSON, body.to_string());
     }
-    let answer = tokio::task::spawn_blocking(move || {
-        // A report is of everything that has ended, the last seconds included.
-        stats.flush();
-        let path = stats.path().ok_or(rusqlite::Error::InvalidQuery)?;
-        let db = api::open(path)?;
-        match what.as_str() {
-            "overview" => api::overview(&db, &filter).map(Some),
-            "top" => api::top(&db, &filter).map(Some),
-            "query" => api::query(&db, &filter).map(Some),
-            "slow" => api::slow(&db, &filter).map(Some),
-            "errors" => api::errors(&db, &filter).map(Some),
-            "clients" => api::grouped(&db, &filter, "agg_client", "client").map(Some),
-            "backends" => api::grouped(&db, &filter, "agg_backend", "backend").map(Some),
-            _ => Ok(None),
-        }
-    })
-    .await;
+    // A report is of everything that has ended, the last seconds included.
+    stats.flush().await;
+    let answer = match what.as_str() {
+        "overview" => api::overview(stats, &filter).await,
+        "top" => api::top(stats, &filter).await,
+        "query" => api::query(stats, &filter).await,
+        "slow" => api::slow(stats, &filter).await,
+        "errors" => api::errors(stats, &filter).await,
+        "clients" => api::grouped(stats, &filter, "rfb_client").await,
+        "backends" => api::grouped(stats, &filter, "rfb_backend").await,
+        _ => return reply(StatusCode::NOT_FOUND, TEXT, "not found\n"),
+    };
     match answer {
-        Ok(Ok(Some(body))) => reply(StatusCode::OK, JSON, body.to_string()),
-        Ok(Ok(None)) => reply(StatusCode::NOT_FOUND, TEXT, "not found\n"),
-        Ok(Err(e)) => {
+        Ok(body) => reply(StatusCode::OK, JSON, body.to_string()),
+        Err(e) => {
             tracing::error!(error = %e, "report failed");
-            reply(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                JSON,
-                json!({ "error": e.to_string() }).to_string(),
-            )
+            let body = json!({ "error": format!("the statistics store: {e}") });
+            reply(StatusCode::BAD_GATEWAY, JSON, body.to_string())
         }
-        Err(_) => reply(StatusCode::INTERNAL_SERVER_ERROR, TEXT, "report failed\n"),
     }
 }
 
@@ -204,6 +195,7 @@ async fn live(core: &Core) -> Value {
             "paused": s.paused,
             "backends": backends,
             "queue": queue,
+            "queue_max": pool.shared.queue_max.load(Relaxed),
             "requests": c.requests.load(Relaxed),
         }));
     }
@@ -211,7 +203,7 @@ async fn live(core: &Core) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_s": core.started.elapsed().as_secs(),
         "clients": core.client_count(),
-        "stats": core.stats.path().is_some(),
+        "stats": core.stats.enabled(),
         "stats_dropped": core.stats.dropped.load(Relaxed),
         "pools": pools,
     })
