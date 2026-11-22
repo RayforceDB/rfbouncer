@@ -123,6 +123,7 @@ async fn proxy(
             arrived: Instant::now(),
             arrived_at: SystemTime::now(),
             retries: 0,
+            target: None,
         }));
 
         let limit = HEADER_LEN + config.max_request_bytes;

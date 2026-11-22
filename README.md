@@ -22,6 +22,11 @@ browser ──►   │   queue      ──► replica :5002
   would to a replica. Requests and answers pass through byte for byte.
 - **One request, one replica.** Each sync request goes to a free replica,
   round robin; with every replica busy it waits in the bouncer's queue.
+- **Two ways to choose a replica**, set per pool with `mode`. `free`, the
+  default, is the above. `round_robin` gives each request the next replica in
+  turn whether it is free or not: every replica gets the same number of
+  requests, and a request may wait behind a slow one. Either way a replica
+  that is down gets nothing.
 - **Cancel.** A client's cancel byte takes its request out of the queue, or
   is passed on to the replica running it. A client that disconnects cancels
   its request the same way, so a replica never finishes a query for nobody.

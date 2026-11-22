@@ -60,6 +60,20 @@ impl Default for StatsConfig {
     }
 }
 
+/// How a pool chooses the replica for a request.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// The next replica that is free. A request waits only when every
+    /// replica is busy, and then for whichever is free first.
+    #[default]
+    Free,
+    /// The next replica in turn, free or not. Every replica gets the same
+    /// number of requests, and a request may wait behind a slow one while
+    /// another replica is idle.
+    RoundRobin,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PoolConfig {
@@ -75,6 +89,8 @@ pub struct PoolConfig {
     pub wire_version: u8,
     pub backend_password: Option<String>,
     pub backends: Vec<String>,
+    #[serde(default)]
+    pub mode: Mode,
     /// Requests a replica runs at once. A Rayforce process evaluates one
     /// message at a time, so more than one only queues inside the replica.
     #[serde(default = "one")]
@@ -362,6 +378,12 @@ mod tests {
         let c = config(TWO).unwrap();
         assert!(c.auth_required());
         assert_eq!(c.pool[0].query_timeout, Duration::from_secs(30));
+        let turn = config(&TWO.replace("default = true", "default = true\nmode = \"round_robin\""))
+            .unwrap();
+        assert_eq!(turn.pool[1].mode, Mode::RoundRobin);
+        assert!(
+            config(&TWO.replace("default = true", "default = true\nmode = \"random\"")).is_err()
+        );
         assert_eq!(c.pool[1].query_timeout, Duration::ZERO);
         assert_eq!(c.resolve("app", b"a", 3), Target::Pool(&c.pool[0]));
         assert_eq!(c.resolve("app", b"b", 3), Target::Rejected);
@@ -378,6 +400,7 @@ mod tests {
         assert!(!c.auth_required());
         assert_eq!(c.only_pool().slots, 1);
         assert!(c.only_pool().require_restricted);
+        assert_eq!(c.only_pool().mode, Mode::Free);
     }
 
     #[test]

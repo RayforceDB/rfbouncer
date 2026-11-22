@@ -14,7 +14,7 @@ use super::backend::{self, Msg};
 use super::{
     BackendInfo, Cmd, Counters, Ending, Job, PoolHandle, QueuedInfo, Shared, Snapshot, request_text,
 };
-use crate::config::PoolConfig;
+use crate::config::{Mode, PoolConfig};
 use crate::stats::Stats;
 use crate::stats::event::Outcome;
 
@@ -270,36 +270,86 @@ impl Dispatcher {
         self.pump().await;
     }
 
-    /// Hands queued requests to free replicas until one of the two runs out.
+    /// Hands queued requests to replicas, as the pool's mode says.
     async fn pump(&mut self) {
-        while !self.paused {
-            // A client that left while queued has nobody to answer.
-            while self.queue.front().is_some_and(|j| j.reply.is_closed()) {
-                if let Some(job) = self.queue.pop_front() {
+        if self.paused {
+            return;
+        }
+        // A client that left while queued has nobody to answer.
+        let mut at = 0;
+        while at < self.queue.len() {
+            if self.queue[at].reply.is_closed() {
+                if let Some(job) = self.queue.remove(at) {
                     self.end(&job, Outcome::Cancelled);
                 }
+            } else {
+                at += 1;
             }
-            let Some(client) = self.queue.front().map(|j| j.client) else {
-                return;
-            };
+        }
+        match self.cfg.mode {
+            Mode::Free => self.pump_free(),
+            Mode::RoundRobin => self.pump_in_turn(),
+        }
+    }
+
+    /// The head of the queue goes to a free replica, until one of the two
+    /// runs out.
+    fn pump_free(&mut self) {
+        while let Some(client) = self.queue.front().map(|j| j.client) {
             let Some(idx) = self.pick(client.ip()) else {
                 return;
             };
-            let Some(job) = self.queue.pop_front() else {
-                return;
-            };
-            let r = &mut self.replicas[idx];
-            r.state = State::Busy {
-                id: job.id,
-                client,
-                since: Instant::now(),
-                frame: job.frame.clone(),
-            };
-            if let Err(mpsc::error::SendError(Msg::Run(job))) = r.tx.send(Msg::Run(job)) {
-                r.state = State::Down;
-                r.gone = true;
-                self.queue.push_front(job);
+            if let Some(job) = self.queue.pop_front() {
+                self.start(idx, job);
             }
+        }
+    }
+
+    /// Every request is given the next replica in turn when it arrives, and
+    /// waits for that one. A request whose replica went away is given
+    /// another, so a dead replica holds nothing back.
+    fn pump_in_turn(&mut self) {
+        let n = self.replicas.len();
+        let usable =
+            |r: &Replica| !matches!(r.state, State::Down) && !r.draining && !r.removed && !r.gone;
+        for at in 0..self.queue.len() {
+            if self.queue[at]
+                .target
+                .is_some_and(|t| usable(&self.replicas[t]))
+            {
+                continue;
+            }
+            let next = (0..n)
+                .map(|k| (self.cursor + k) % n)
+                .find(|i| usable(&self.replicas[*i]));
+            self.queue[at].target = next;
+            if let Some(idx) = next {
+                self.cursor = (idx + 1) % n;
+            }
+        }
+        for idx in 0..n {
+            if !matches!(self.replicas[idx].state, State::Idle) || !usable(&self.replicas[idx]) {
+                continue;
+            }
+            let waiting = self.queue.iter().position(|j| j.target == Some(idx));
+            if let Some(job) = waiting.and_then(|at| self.queue.remove(at)) {
+                self.start(idx, job);
+            }
+        }
+    }
+
+    fn start(&mut self, idx: usize, job: Job) {
+        let r = &mut self.replicas[idx];
+        r.state = State::Busy {
+            id: job.id,
+            client: job.client,
+            since: Instant::now(),
+            frame: job.frame.clone(),
+        };
+        if let Err(mpsc::error::SendError(Msg::Run(job))) = r.tx.send(Msg::Run(job)) {
+            r.state = State::Down;
+            r.gone = true;
+            self.queue.push_front(job);
         }
     }
 

@@ -286,9 +286,10 @@ fn show_config(core: &Core) -> Vec<u8> {
         rows.push((
             "pool",
             format!(
-                "{} v{} backends={} slots={} users={:?} default={} restricted={} retry={} affinity={} queue_max={} wait={:?} timeout={:?} grace={:?}",
+                "{} v{} mode={:?} backends={} slots={} users={:?} default={} restricted={} retry={} affinity={} queue_max={} wait={:?} timeout={:?} grace={:?}",
                 p.name,
                 p.wire_version,
+                p.mode,
                 p.backends.join(","),
                 p.slots,
                 p.users,

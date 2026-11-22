@@ -27,6 +27,9 @@ pub struct Job {
     pub arrived: Instant,
     pub arrived_at: SystemTime,
     pub retries: u8,
+    /// The replica this request waits for, where the pool hands requests
+    /// out in turn.
+    pub target: Option<usize>,
 }
 
 /// What a client session writes to its socket, in order.

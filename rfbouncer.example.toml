@@ -42,6 +42,13 @@ wire_version = 4
 # The password the replicas were started with (-U).
 backend_password = "replica-secret"
 backends = ["10.0.0.1:5001", "10.0.0.1:5002", "10.0.0.1:5003"]
+# How a replica is chosen for a request.
+#   "free"         the next replica that is free. A request waits only when
+#                  every replica is busy. The default.
+#   "round_robin"  the next replica in turn, free or not. Every replica gets
+#                  the same number of requests; a request may wait behind a
+#                  slow one while another replica is idle.
+mode = "free"
 # Requests a replica runs at once. A Rayforce process evaluates one message
 # at a time, so more than 1 only moves the queue into the replica.
 slots = 1
@@ -53,7 +60,7 @@ require_restricted = true
 # marked with .sys.trust that write.
 retry = true
 # Prefer the replica a client's address was served by last, so one client
-# does not see replicas that lag each other by turns.
+# does not see replicas that lag each other by turns. Only under mode = "free".
 affinity = false
 # Requests that may wait for a free replica, and for how long. Past either,
 # the client is answered with the error "busy".
