@@ -1,1 +1,29 @@
-<!doctype html><title>rfbouncer</title>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rfbouncer</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>rfbouncer</h1>
+  <nav id="tabs"></nav>
+  <span id="status"></span>
+</header>
+<div id="filters">
+  <label>Pool <select id="pool"><option value="">all pools</option></select></label>
+  <label>Range <select id="range">
+    <option value="900">last 15 minutes</option>
+    <option value="3600" selected>last hour</option>
+    <option value="21600">last 6 hours</option>
+    <option value="86400">last 24 hours</option>
+    <option value="604800">last 7 days</option>
+  </select></label>
+</div>
+<main id="view"></main>
+<div id="tooltip" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

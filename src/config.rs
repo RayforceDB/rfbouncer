@@ -242,6 +242,18 @@ impl Config {
             if !names.insert(&p.name) {
                 return bad(format!("pool {:?} is defined twice", p.name));
             }
+            // A name goes into URLs and metric labels as it is.
+            if p.name.is_empty()
+                || !p
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            {
+                return bad(format!(
+                    "pool name {:?}: use letters, digits, - and _",
+                    p.name
+                ));
+            }
             if !matches!(p.wire_version, 3 | 4) {
                 return bad(format!("pool {:?}: wire_version must be 3 or 4", p.name));
             }
