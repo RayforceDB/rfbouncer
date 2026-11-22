@@ -19,6 +19,7 @@ fn main() -> ExitCode {
     let args = Args::parse();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
     if args.check {
         return match rfbouncer::config::Config::load(&args.config) {

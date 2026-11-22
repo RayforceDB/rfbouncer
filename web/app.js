@@ -2,20 +2,27 @@
 // into the page with textContent, never as markup.
 'use strict';
 
-const TABS = [['overview', 'Overview'], ['queries', 'Queries'], ['slow', 'Slowest'], ['errors', 'Failures'],
-              ['clients', 'Clients'], ['replicas', 'Replicas'], ['now', 'Now']];
-const REFRESH_MS = 5000;
-const $ = (id) => document.getElementById(id);
+const TABS = [['overview', 'Overview'], ['live', 'Live'], ['queries', 'Queries'], ['slow', 'Slow'],
+              ['failed', 'Failed'], ['clients', 'Clients'], ['replicas', 'Replicas']];
+const RANGES = [[900, '15m', 'the last 15 minutes'], [3600, '1h', 'the last hour'], [21600, '6h', 'the last 6 hours'],
+                [86400, '24h', 'the last 24 hours'], [604800, '7d', 'the last 7 days']];
+// What the bouncer itself answers with, and what each means. Any other
+// outcome that is not ok is an error code a replica raised.
+const OUTCOMES = [['error', 'replica raised'], ['timeout', 'over the query budget'],
+                  ['busy', 'queue full or waited too long'], ['io', 'no replica answered'], ['cancel', 'client cancelled']];
+const REFRESH_S = 5;
 const SVG = 'http://www.w3.org/2000/svg';
+const $ = (id) => document.getElementById(id);
 
 function h(tag, attrs, ...children) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
     if (k === 'class') el.className = v;
     else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
     else el.setAttribute(k, v);
   }
-  for (const c of children.flat()) if (c != null) el.append(c.nodeType ? c : document.createTextNode(String(c)));
+  for (const c of children.flat()) if (c != null && c !== false) el.append(c.nodeType ? c : document.createTextNode(String(c)));
   return el;
 }
 function s(tag, attrs, text) {
@@ -25,316 +32,534 @@ function s(tag, attrs, text) {
   return el;
 }
 
+// ---- numbers and times ----
+
 const int = (n) => Math.round(n).toLocaleString('en-US');
+const sig3 = (x) => String(Number(x.toPrecision(3)));
+// A duration at three significant figures: a percentile is a bucket's edge,
+// and more digits would claim what it does not know.
 function dur(ms) {
-  if (ms >= 60000) return (ms / 60000).toFixed(1) + ' min';
-  if (ms >= 1000) return (ms / 1000).toFixed(2) + ' s';
-  if (ms >= 10) return ms.toFixed(0) + ' ms';
-  if (ms >= 1) return ms.toFixed(1) + ' ms';
-  return ms > 0 ? (ms * 1000).toFixed(0) + ' µs' : '0';
+  if (!ms) return '0 ms';
+  if (ms < 1) return sig3(ms * 1000) + ' µs';
+  if (ms < 1000) return sig3(ms) + ' ms';
+  if (ms < 60000) return sig3(ms / 1000) + ' s';
+  return span(ms / 1000);
 }
+function span(sec) {
+  sec = Math.floor(sec);
+  const d = Math.floor(sec / 86400), hh = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60), ss = sec % 60;
+  if (d) return `${d} d ${hh} h`;
+  if (hh) return `${hh} h ${two(m)} m`;
+  if (m) return `${m} m ${two(ss)} s`;
+  return `${ss} s`;
+}
+// Milliseconds for a column whose header names the unit, so a column reads
+// as magnitudes and not as a mix of units.
+const msCell = (ms) => ms >= 100 ? int(ms) : ms.toFixed(ms >= 10 ? 1 : 2);
 function bytes(n) {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
   let i = 0;
   while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
   return (i ? n.toFixed(1) : n) + ' ' + units[i];
 }
-const pct = (part, whole) => whole ? (100 * part / whole).toFixed(part && part / whole < 0.1 ? 2 : 1) + '%' : '0%';
-const clock = (t, withDate) => new Date(t).toLocaleString([], withDate
-  ? { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }
-  : { hour: '2-digit', minute: '2-digit' });
-const stamp = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+function pct(part, whole) {
+  if (!part || !whole) return '0%';
+  const p = 100 * part / whole;
+  return p < 0.1 ? '<0.1%' : p.toFixed(1) + '%';
+}
+function two(n) { return String(n).padStart(2, '0'); }
+const hm = (d) => `${two(d.getHours())}:${two(d.getMinutes())}`;
+const md = (d) => `${two(d.getMonth() + 1)}-${two(d.getDate())}`;
+const sameDay = (a, b) => a.toDateString() === b.toDateString();
+// A moment in a table: to the millisecond, with the date only where the
+// rows are not all of today.
+function stamp(ms, withDate) {
+  const d = new Date(ms);
+  const date = withDate || !sameDay(d, new Date()) ? md(d) + ' ' : '';
+  return `${date}${hm(d)}:${two(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
+}
+function zone() {
+  const off = -new Date().getTimezoneOffset();
+  if (!off) return 'UTC';
+  const a = Math.abs(off);
+  return `UTC${off > 0 ? '+' : '−'}${Math.floor(a / 60)}${a % 60 ? ':' + two(a % 60) : ''}`;
+}
 
-function route() {
-  const [tab, arg] = location.hash.slice(1).split('/');
-  return { tab: tab || 'overview', arg };
+// ---- state: everything that picks what is shown is in the address ----
+
+function state() {
+  const [path, query] = location.hash.slice(1).split('?');
+  const [tab, arg] = path.split('/');
+  const p = new URLSearchParams(query || '');
+  const range = RANGES.find((r) => r[0] === +p.get('range')) || RANGES[1];
+  return { tab: tab || 'overview', arg, pool: p.get('pool') || '', range };
 }
-function params(extra) {
-  const range = +$('range').value, to = Math.floor(Date.now() / 1000);
-  const p = new URLSearchParams({ from: to - range, to, pool: $('pool').value, ...extra });
-  return '?' + p;
+function link(tab, change) {
+  const st = { ...state(), ...change };
+  const p = new URLSearchParams();
+  if (st.pool) p.set('pool', st.pool);
+  if (st.range[0] !== 3600) p.set('range', st.range[0]);
+  const q = p.toString();
+  return '#' + tab + (q ? '?' + q : '');
 }
+const here = (st) => st.tab + (st.arg ? '/' + st.arg : '');
 async function get(path) {
   const r = await fetch(path);
-  const body = await r.json();
-  if (!r.ok) throw new Error(body.error || r.statusText);
+  let body = null;
+  try { body = await r.json(); } catch (e) { /* not ours to read */ }
+  if (!r.ok || body == null) {
+    const err = new Error(body && body.error || `${r.status} ${r.statusText}`);
+    err.status = r.status;
+    throw err;
+  }
   return body;
 }
 
-function tile(label, value, note) {
-  return h('div', { class: 'card tile' }, h('div', { class: 'label' }, label), h('div', { class: 'value' }, value),
-           note ? h('div', { class: 'note' }, note) : null);
-}
-function card(title, sub, ...body) {
-  return h('div', { class: 'card' }, h('h2', {}, title), sub ? h('p', { class: 'sub' }, sub) : null, ...body);
-}
-function table(columns, rows, onRow) {
-  if (!rows.length) return h('div', { class: 'empty' }, 'Nothing in this range.');
-  return h('table', {},
-    h('thead', {}, h('tr', {}, columns.map((c) => h('th', { class: c.cls || '' }, c.title)))),
-    h('tbody', {}, rows.map((r) => h('tr', onRow ? { class: 'link', onclick: () => onRow(r) } : {},
-      columns.map((c) => h('td', { class: c.cls || '' }, c.cell(r)))))));
-}
-const num = (title, cell) => ({ title, cell, cls: 'num' });
+// ---- pieces ----
 
-// A line chart: time across, one scale up. `series` is [{name, color, values}],
-// one value per entry of `times` (ms). The crosshair finds the time; the
-// tooltip lists every series there.
-function lineChart(times, series, format) {
-  const legend = series.length > 1 ? h('div', { class: 'legend' }, series.map((one) => {
+function section(title, sub, ...body) {
+  return h('section', {}, title ? h('h2', {}, title, sub ? h('small', {}, sub) : null) : null, ...body);
+}
+function strip(cells) {
+  return h('section', { class: 'plain' }, h('div', { class: 'strip' }, cells.filter(Boolean).map((c) => h('div', {},
+    h('div', { class: 'label' }, c.label),
+    h('div', { class: 'value' + (c.lead ? ' lead' : '') + (c.bad ? ' bad' : '') }, c.value),
+    c.sub ? h('div', { class: 'sub' }, c.sub) : null))));
+}
+function table(columns, rows, empty, wide) {
+  columns = columns.filter(Boolean);
+  if (!rows.length) return h('div', { class: 'empty' }, empty);
+  const cls = (c, r) => (typeof c.cls === 'function' ? c.cls(r) : c.cls) || '';
+  return h('table', { class: wide ? 'wide' : '' },
+    h('thead', {}, h('tr', {}, columns.map((c) => h('th', {
+      class: [typeof c.cls === 'string' && c.cls.split(' ')[0], c.sort && 'sort', c.sorted && 'sorted'].filter(Boolean).join(' '),
+      onclick: c.sort,
+    }, c.title, c.sorted ? ' ▾' : '')))),
+    h('tbody', {}, rows.map((r) => h('tr', {}, columns.map((c) => h('td', { class: cls(c, r) }, c.cell(r)))))));
+}
+const num = (title, cell, more) => ({ title, cell, cls: 'num', ...more });
+// A request's text: two lines at most in a list, the whole of it on hover
+// and on its own page. A link where there is somewhere to go.
+function text(value, href) {
+  return href ? h('a', { href, title: value }, value) : h('span', { title: value }, value);
+}
+// How a request ended, in the data's own words. `error: name` is a code a
+// replica raised; the rest are the bouncer's.
+function outcome(status) {
+  if (status === 'ok') return h('span', { class: 'dim' }, 'ok');
+  if (status === 'cancel') return 'cancel';
+  const own = OUTCOMES.some(([name]) => name === status);
+  return h('span', { class: 'bad' }, own ? status : 'error: ' + status);
+}
+function failedCell(failed, count) {
+  if (!failed) return h('span', { class: 'dim' }, '0');
+  return h('span', { class: 'bad' }, `${int(failed)}  ${pct(failed, count)}`);
+}
+function share(part, whole) {
+  const bar = h('i', {});
+  bar.style.width = (whole ? Math.max(1, 100 * part / whole) : 0) + '%';
+  return h('div', { class: 'share' }, bar);
+}
+function replicaState(r) {
+  const kind = r.state === 'down' ? 'down' : r.draining ? 'draining' : r.state;
+  return h('span', { class: kind === 'down' ? 'bad' : '' }, h('i', { class: 'dot ' + kind }), kind);
+}
+
+// ---- charts ----
+// Time across, over the whole range asked for, so a stretch without requests
+// shows as one. A point is a step of the range, not an instant: counts are
+// bars and percentiles are steps, each as wide as the step it is of.
+
+let charts = [];
+const H = 160, L = 48, R = 44, T = 8, B = 20;
+
+function niceStep(max, lines) {
+  const raw = max / lines, pow = 10 ** Math.floor(Math.log10(raw));
+  return [1, 2, 5, 10].map((m) => m * pow).find((v) => v >= raw);
+}
+function timeTicks(from, to) {
+  const len = to - from;
+  const every = len <= 900 ? 300 : len <= 3600 ? 600 : len <= 21600 ? 3600 : len <= 86400 ? 14400 : 86400;
+  const tz = -new Date(from * 1000).getTimezoneOffset() * 60;
+  const out = [];
+  for (let t = Math.ceil((from + tz) / every) * every - tz; t <= to; t += every) out.push(t);
+  return out.map((t) => [t, every >= 86400 ? md(new Date(t * 1000)) : hm(new Date(t * 1000))]);
+}
+
+// spec: { bars, log, format, series: [{name, color, of: point => value}], tip: point => [[name, value]], none }
+function chart(data, spec) {
+  const points = data.points.filter((p) => spec.series.some((x) => x.of(p) > 0));
+  if (!points.length) return h('div', { class: 'empty' }, spec.none);
+  const box = h('div', {});
+  const legend = spec.bars && spec.series.length > 1 ? h('div', { class: 'note' }, spec.series.map((x) => {
     const key = h('i', { class: 'key' });
-    key.style.background = `var(${one.color})`;
-    return h('span', {}, key, one.name);
+    key.style.background = `var(${x.color})`;
+    return h('span', {}, key, x.name + '   ');
   })) : null;
-  const plot = h('div', {});
-  // Drawn at the width it is shown at, and again when that changes, so text
-  // and strokes are never stretched.
+  const self = { mark: () => {} };
+  charts.push(self);
   let width = 0;
   new ResizeObserver(() => {
-    if (plot.clientWidth && plot.clientWidth !== width) {
-      width = plot.clientWidth;
-      plot.replaceChildren(drawLines(width, times, series, format));
+    if (box.clientWidth && box.clientWidth !== width) {
+      width = box.clientWidth;
+      box.replaceChildren(draw(width, data, points, spec, self));
     }
-  }).observe(plot);
-  return h('div', {}, legend, plot);
+  }).observe(box);
+  return h('div', {}, box, legend);
 }
-function drawLines(W, times, series, format) {
-  const H = 220, L = 8, R = series.length > 1 ? 44 : 12, T = 12, B = 22;
+
+function draw(W, data, points, spec, self) {
   const svg = s('svg', { class: 'chart', viewBox: `0 0 ${W} ${H}`, tabindex: 0 });
-  const max = Math.max(...series.flatMap((x) => x.values), 0) || 1;
-  const t0 = times[0], t1 = times[times.length - 1];
-  const x = (t) => t1 === t0 ? (L + W - R) / 2 : L + (W - L - R) * (t - t0) / (t1 - t0);
-  const y = (v) => H - B - (H - T - B) * v / max;
-  for (let i = 0; i <= 3; i++) {
-    const v = max * i / 3;
+  const { from, to, step_s: step } = data;
+  const x = (t) => L + (W - L - R) * (Math.min(Math.max(t, from), to) - from) / (to - from);
+  const values = (p) => spec.series.map((sr) => sr.of(p));
+  const top = Math.max(...points.map((p) => spec.bars ? values(p).reduce((a, b) => a + b, 0) : Math.max(...values(p))));
+
+  let y, ticks = [];
+  if (spec.log) {
+    // Decades of a millisecond; the axis spans the ones the data touches.
+    const low = Math.min(...points.flatMap((p) => values(p).filter((v) => v > 0)));
+    const lo = Math.floor(Math.log10(low)), hi = Math.max(lo + 1, Math.ceil(Math.log10(top)));
+    y = (v) => H - B - (H - T - B) * (Math.log10(Math.max(v, 10 ** lo)) - lo) / (hi - lo);
+    for (let e = lo; e <= hi; e++) ticks.push(10 ** e);
+  } else {
+    const each = niceStep(top, 3);
+    const max = each * Math.ceil(top / each);
+    y = (v) => H - B - (H - T - B) * v / max;
+    for (let v = 0; v <= max + each / 2; v += each) ticks.push(v);
+  }
+  ticks.forEach((v, i) => {
     svg.append(s('line', { class: i ? 'grid' : 'base', x1: L, x2: W - R, y1: y(v), y2: y(v) }));
-    if (i) svg.append(s('text', { x: L, y: y(v) - 4 }, format(v)));
+    svg.append(s('text', { x: L - 6, y: y(v), 'text-anchor': 'end', 'dominant-baseline': 'middle' }, spec.format(v)));
+  });
+  for (const [t, label] of timeTicks(from, to)) {
+    svg.append(s('line', { class: 'base', x1: x(t), x2: x(t), y1: H - B, y2: H - B + 3 }));
+    svg.append(s('text', { x: x(t), y: H - 4, 'text-anchor': 'middle' }, label));
   }
-  const days = t1 - t0 > 86400000;
-  for (const [t, anchor] of [[t0, 'start'], [(t0 + t1) / 2, 'middle'], [t1, 'end']]) {
-    if (t1 > t0 || anchor === 'middle') svg.append(s('text', { x: x(t), y: H - 6, 'text-anchor': anchor }, clock(t, days)));
-  }
-  const cross = s('line', { class: 'cross', y1: T, y2: H - B, visibility: 'hidden' });
+
+  const cross = s('rect', { class: 'cross', y: T, height: H - T - B, visibility: 'hidden' });
   svg.append(cross);
-  const dots = [];
-  const ends = [];
-  for (const one of series) {
-    const d = one.values.map((v, i) => `${i ? 'L' : 'M'}${x(times[i]).toFixed(1)} ${y(v).toFixed(1)}`).join('');
-    svg.append(s('path', { class: 'line', d, stroke: `var(${one.color})` }));
-    if (times.length === 1) svg.append(s('circle', { cx: x(t0), cy: y(one.values[0]), r: 4, fill: `var(${one.color})` }));
-    ends.push({ name: one.name, at: y(one.values[one.values.length - 1]) });
-    const dot = s('circle', { r: 4, fill: `var(${one.color})`, visibility: 'hidden' });
-    dots.push(dot);
-    svg.append(dot);
-  }
-  // Each line is named at its end; labels that would overlap are moved apart.
-  if (series.length > 1) {
-    ends.sort((a, b) => a.at - b.at);
-    for (let i = 1; i < ends.length; i++) ends[i].at = Math.max(ends[i].at, ends[i - 1].at + 12);
-    for (let i = ends.length - 1, low = H - B; i >= 0; i--, low -= 12) ends[i].at = Math.min(ends[i].at, low);
-    for (const e of ends) svg.append(s('text', { class: 'end', x: W - R + 6, y: e.at + 4 }, e.name));
-  }
-  const hide = () => {
-    cross.setAttribute('visibility', 'hidden');
-    dots.forEach((d) => d.setAttribute('visibility', 'hidden'));
-    $('tooltip').hidden = true;
-  };
-  const show = (i, clientX, clientY) => {
-    cross.setAttribute('x1', x(times[i]));
-    cross.setAttribute('x2', x(times[i]));
-    cross.setAttribute('visibility', 'visible');
-    series.forEach((one, k) => {
-      dots[k].setAttribute('cx', x(times[i]));
-      dots[k].setAttribute('cy', y(one.values[i]));
-      dots[k].setAttribute('visibility', 'visible');
+  const now = Date.now() / 1000;
+  if (spec.bars) {
+    for (const p of points) {
+      const x0 = x(p.t) + 0.5, w = Math.max(1, x(p.t + step) - x(p.t) - 1);
+      let base = 0;
+      spec.series.forEach((sr) => {
+        const v = sr.of(p);
+        if (v <= 0) return;
+        const rect = s('rect', { x: x0, width: w, y: y(base + v), height: Math.max(0.5, y(base) - y(base + v)), fill: `var(${sr.color})` });
+        // A step still being filled is not a drop in traffic.
+        if (p.t + step > now) rect.setAttribute('opacity', 0.4);
+        svg.append(rect);
+        base += v;
+      });
+    }
+  } else {
+    const ends = [];
+    spec.series.forEach((sr) => {
+      let d = '', last = null;
+      for (const p of points) {
+        const v = sr.of(p);
+        if (v <= 0) continue;
+        d += last != null && p.t === last ? `V${y(v).toFixed(1)}` : `M${x(p.t).toFixed(1)} ${y(v).toFixed(1)}`;
+        d += `H${x(p.t + step).toFixed(1)}`;
+        last = p.t + step;
+      }
+      svg.append(s('path', { d, stroke: `var(${sr.color})` }));
+      ends.push({ name: sr.name, at: y(sr.of(points[points.length - 1])) });
     });
+    ends.sort((a, b) => a.at - b.at);
+    for (let i = 1; i < ends.length; i++) ends[i].at = Math.max(ends[i].at, ends[i - 1].at + 13);
+    for (let i = ends.length - 1, low = H - B; i >= 0; i--, low -= 13) ends[i].at = Math.min(ends[i].at, low);
+    for (const e of ends) svg.append(s('text', { class: 'end', x: W - R + 6, y: e.at, 'dominant-baseline': 'middle' }, e.name));
+  }
+
+  // The step under the pointer is marked on every chart of the page: they
+  // share the time axis, so the eye can go straight down.
+  self.mark = (t) => {
+    const p = t == null ? null : points.find((q) => q.t === t);
+    cross.setAttribute('visibility', p ? 'visible' : 'hidden');
+    if (p) {
+      cross.setAttribute('x', x(p.t));
+      cross.setAttribute('width', Math.max(1, x(p.t + step) - x(p.t)));
+    }
+  };
+  const show = (p, clientX, clientY) => {
+    charts.forEach((c) => c.mark(p.t));
+    const a = new Date(p.t * 1000), b = new Date((p.t + step) * 1000);
+    const day = to - from > 86400 ? md(a) + ' ' : '';
+    const rows = (spec.tip || ((q) => spec.series.map((sr) => [sr.name, spec.format(sr.of(q))])))(p);
     const tip = $('tooltip');
-    tip.replaceChildren(h('div', { class: 'when' }, clock(times[i], true)), ...series.map((one) => {
-      const key = h('i', { class: 'key' });
-      key.style.background = `var(${one.color})`;
-      return h('div', {}, key, h('b', {}, format(one.values[i])), ' ', h('span', {}, one.name));
-    }));
+    tip.replaceChildren(h('div', { class: 'when' }, `${day}${hm(a)}–${hm(b)}`),
+      h('div', { class: 'rows' }, rows.flatMap(([name, value]) => [h('span', {}, name), h('b', {}, value)])));
     tip.hidden = false;
     const box = tip.getBoundingClientRect();
     tip.style.left = Math.min(clientX + 14, innerWidth - box.width - 8) + 'px';
     tip.style.top = Math.max(8, clientY - box.height - 10) + 'px';
   };
-  let at = times.length - 1;
+  const hide = () => { charts.forEach((c) => c.mark(null)); $('tooltip').hidden = true; };
+  let at = points.length - 1;
   svg.addEventListener('pointermove', (e) => {
     const box = svg.getBoundingClientRect();
-    const t = t0 + (t1 - t0) * ((e.clientX - box.left) / box.width * W - L) / (W - L - R);
-    at = times.reduce((best, v, i) => Math.abs(v - t) < Math.abs(times[best] - t) ? i : best, 0);
-    show(at, e.clientX, e.clientY);
+    const t = from + (to - from) * ((e.clientX - box.left) / box.width * W - L) / (W - L - R);
+    at = points.reduce((best, p, i) => Math.abs(p.t + step / 2 - t) < Math.abs(points[best].t + step / 2 - t) ? i : best, 0);
+    show(points[at], e.clientX, e.clientY);
   });
   svg.addEventListener('pointerleave', hide);
   svg.addEventListener('blur', hide);
   svg.addEventListener('keydown', (e) => {
     if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-    at = Math.max(0, Math.min(times.length - 1, at + (e.key === 'ArrowLeft' ? -1 : 1)));
+    at = Math.max(0, Math.min(points.length - 1, at + (e.key === 'ArrowLeft' ? -1 : 1)));
     const box = svg.getBoundingClientRect();
-    show(at, box.left + box.width * x(times[at]) / W, box.top + 40);
+    show(points[at], box.left + box.width * x(points[at].t + step / 2) / W, box.top + 40);
     e.preventDefault();
   });
   return svg;
 }
 
-function charts(data) {
-  const p = data.points;
-  if (!p.length) return [h('div', { class: 'card empty' }, 'No requests in this range.')];
-  const times = p.map((x) => x.t * 1000), per = data.step_s / 60;
-  const step = per === 1 ? 'per minute' : `per ${per} minutes`;
-  const one = (name, key) => [{ name, color: '--series-1', values: p.map((x) => x[key]) }];
-  return [h('div', { class: 'charts' },
-    card('Requests', step, lineChart(times, one('requests', 'count'), int)),
-    card('Time in the replica', 'half, 95% and 99% of requests were faster than this',
-      lineChart(times, [
-        { name: 'p50', color: '--series-1', values: p.map((x) => x.p50_ms) },
-        { name: 'p95', color: '--series-2', values: p.map((x) => x.p95_ms) },
-        { name: 'p99', color: '--series-3', values: p.map((x) => x.p99_ms) }], dur)),
-    card('Requests that did not succeed', step + ': errors, cancels, timeouts, refusals and failures',
-      lineChart(times, one('not ok', 'not_ok'), int)),
-    card('Wait for a free replica', 'average time in the bouncer\'s queue',
-      lineChart(times, one('wait', 'wait_avg_ms'), dur)))];
-}
-function tiles(t) {
-  return h('div', { class: 'tiles' },
-    tile('Requests', int(t.count)),
-    tile('Average time', dur(t.avg_ms), `p95 ${dur(t.p95_ms)} · p99 ${dur(t.p99_ms)}`),
-    tile('Did not succeed', pct(t.not_ok, t.count), `${int(t.errors)} errors · ${int(t.timeouts)} timeouts · ${int(t.refused)} refused`),
-    tile('Average wait', dur(t.wait_avg_ms), 'for a free replica'),
-    tile('Sent to clients', bytes(t.bytes_out), `${int(t.retries)} retries`));
+function threeCharts(data, label) {
+  const rate = (n) => n / data.step_s;
+  const none = `No requests in ${label}.`;
+  return h('div', { class: 'charts' },
+    section('Requests /s', null, chart(data, {
+      bars: true, format: (v) => v >= 10 ? int(v) : sig3(v), none,
+      series: [{ name: 'ok', color: '--series-1', of: (p) => rate(p.count - p.not_ok) },
+               { name: 'failed', color: '--series-2', of: (p) => rate(p.not_ok) }],
+      tip: (p) => [['ok', int(p.count - p.not_ok)], ['failed', `${int(p.not_ok)} (${pct(p.not_ok, p.count)})`]],
+    })),
+    section('Exec time', null, chart(data, {
+      log: true, format: dur, none,
+      series: [{ name: 'p99', color: '--series-3', of: (p) => p.p99_ms },
+               { name: 'p95', color: '--series-2', of: (p) => p.p95_ms },
+               { name: 'p50', color: '--series-1', of: (p) => p.p50_ms }],
+    }), h('p', { class: 'note' }, 'percentiles are histogram bucket upper bounds (powers of two)')),
+    section('Wait + exec, avg', null, chart(data, {
+      bars: true, format: dur, none,
+      series: [{ name: 'exec', color: '--series-1', of: (p) => p.avg_ms },
+               { name: 'wait', color: '--series-2', of: (p) => p.wait_avg_ms }],
+      tip: (p) => [['exec', dur(p.avg_ms)], ['wait', dur(p.wait_avg_ms)], ['max wait', dur(p.wait_max_ms)]],
+    })));
 }
 
-const samplesColumns = [
-  { title: 'When', cell: (r) => stamp(r.ts) },
-  num('Time', (r) => dur(r.ms)), num('Waited', (r) => dur(r.wait_ms)),
-  { title: 'Ended', cell: (r) => h('span', { class: 'pill' }, r.status) },
-  { title: 'Replica', cell: (r) => r.backend || '—' }, { title: 'Client', cell: (r) => r.client },
-  { title: 'Request', cell: (r) => r.text, cls: 'q' }];
-const openQuery = (r) => { location.hash = 'query/' + r.fp; };
+// The numbers of a range in one line: what failed first, since that is what
+// the page is opened for.
+function totals(t, seconds, extra) {
+  const kinds = [[t.errors, 'error'], [t.timeouts, 'timeout'], [t.refused, 'busy'], [t.failed, 'io'], [t.cancels, 'cancel']];
+  const failedSub = h('span', {}, kinds.flatMap(([n, name], i) => [i ? ' · ' : '', h('span', { class: n ? '' : 'dim' }, `${int(n)} ${name}`)]),
+    t.retries ? ` · ${int(t.retries)} retried` : '');
+  return strip([
+    { label: 'Failed', value: pct(t.not_ok, t.count), lead: true, bad: t.not_ok > 0, sub: failedSub },
+    { label: 'Exec p99', value: dur(t.p99_ms), sub: `p50 ${dur(t.p50_ms)} · p95 ${dur(t.p95_ms)}` },
+    { label: 'Wait max', value: dur(t.wait_max_ms), sub: `avg ${dur(t.wait_avg_ms)}` },
+    { label: 'Requests', value: int(t.count), sub: `${sig3(t.count / seconds)}/s` },
+    ...(extra || []),
+  ]);
+}
+function liveCells(live, pool) {
+  const pools = live.pools.filter((p) => !pool || p.name === pool);
+  const all = pools.flatMap((p) => p.backends);
+  const count = (state) => all.filter((b) => b.state === state).length;
+  const queued = pools.reduce((n, p) => n + p.queue.length, 0);
+  const limit = pools.reduce((n, p) => n + p.queue_max, 0);
+  const down = count('down');
+  return [
+    { label: 'Queued', value: `${int(queued)} / ${int(limit)}`, bad: limit > 0 && queued >= limit },
+    { label: 'Replicas', value: `${all.length - down} up`, bad: down > 0,
+      sub: `${count('busy')} busy · ${down} down${pools.some((p) => p.paused) ? ' · paused' : ''}` },
+    { label: 'Clients', value: int(live.clients) },
+  ];
+}
+function nowCell(live, pool) {
+  const [queued, replicas, clients] = liveCells(live, pool);
+  return { label: 'Now', value: replicas.value, bad: replicas.bad, sub: `${replicas.sub} · ${queued.value} queued · ${clients.value} clients` };
+}
+
+function samples(rows, empty, st, linked) {
+  const dated = st.range[0] > 86400;
+  return table([
+    { title: 'Time', cell: (r) => stamp(r.ts, dated) },
+    num('Wait', (r) => dur(r.wait_ms)), num('Exec', (r) => dur(r.ms)), num('Total', (r) => dur(r.ms + r.wait_ms)),
+    { title: 'Outcome', cell: (r) => outcome(r.status) },
+    { title: 'Replica', cell: (r) => r.backend || '—' }, { title: 'Client', cell: (r) => r.client },
+    { title: 'Request', cls: 'q', cell: (r) => text(r.text, linked ? link('query/' + r.fp) : null) },
+  ], rows, empty, true);
+}
+function poolsOf(live, pool) {
+  return live.pools.filter((p) => !pool || p.name === pool);
+}
+function replicasNow(live, pool) {
+  const rows = poolsOf(live, pool).flatMap((p) => p.backends.map((b) => ({ pool: p.name + (p.paused ? ' (paused)' : ''), ...b })));
+  return table([
+    { title: 'Replica', cell: (r) => r.addr }, { title: 'Pool', cell: (r) => r.pool }, { title: 'State', cell: replicaState },
+    num('Running', (r) => r.running ? dur(r.running.ms) : ''),
+    { title: 'Request', cls: 'q one', cell: (r) => text(r.running ? r.running.text : '') },
+    num('Served', (r) => int(r.served)), num('Conn failures', (r) => int(r.failures)),
+    { title: 'Last error', cell: (r) => r.last_error },
+  ], rows, 'No replicas configured.', true);
+}
+
+// ---- views ----
 
 const views = {
-  async overview() {
-    const data = await get('/api/overview' + params());
-    return [tiles(data.total), ...charts(data)];
+  async overview(st, live, q) {
+    const data = await get('/api/overview' + q());
+    return [totals(data.total, data.to - data.from, [nowCell(live, st.pool)]), threeCharts(data, st.range[2]),
+      section('Replicas', null, replicasNow(live, st.pool))];
   },
-  async queries() {
+  async live(st, live) {
+    const queued = poolsOf(live, st.pool).flatMap((p) => p.queue.map((x) => ({ pool: p.name, ...x })));
+    return [strip(liveCells(live, st.pool)), section('Replicas', null, replicasNow(live, st.pool)),
+      section(`Queue (${queued.length})`, null, table([
+        { title: 'Pool', cell: (r) => r.pool }, { title: 'Client', cell: (r) => r.client }, num('Waiting', (r) => dur(r.waited_ms)),
+        { title: 'Request', cls: 'q one', cell: (r) => text(r.text) }], queued, 'Queue is empty.', true))];
+  },
+  async queries(st, live, q) {
     const sort = sessionStorage.sort || 'total';
-    const data = await get('/api/top' + params({ sort, limit: 100 }));
-    const pick = h('select', { onchange: (e) => { sessionStorage.sort = e.target.value; render(); } },
-      [['total', 'total time'], ['count', 'requests'], ['avg', 'average time'], ['max', 'slowest request'],
-       ['errors', 'did not succeed'], ['bytes', 'bytes sent']].map(([v, t]) => {
-        const o = h('option', { value: v }, t);
-        o.selected = v === sort;
-        return o;
-      }));
-    return [card(`${int(data.queries)} queries`, 'Requests that differ only in their values are one query. Click one for its history.',
-      h('p', { class: 'sub' }, 'Heaviest by ', pick),
-      table([
-        { title: 'Query', cls: 'q', cell: (r) => {
-          const bar = h('div', { class: 'bar' });
-          bar.style.width = Math.max(1, 100 * r.share) + '%';
-          return h('div', {}, r.text, bar);
-        } },
-        num('Requests', (r) => int(r.count)), num('Total time', (r) => `${dur(r.total_ms)} (${pct(r.share, 1)})`),
-        num('Average', (r) => dur(r.avg_ms)), num('p95', (r) => dur(r.p95_ms)), num('Slowest', (r) => dur(r.max_ms)),
-        num('Not ok', (r) => int(r.not_ok)), num('Sent', (r) => bytes(r.bytes_out))], data.rows, openQuery))];
+    const data = await get('/api/top' + q({ sort, limit: 200 }));
+    const by = (key) => ({ sort: () => { sessionStorage.sort = key; render(true); }, sorted: sort === key });
+    const all = data.total;
+    return [section(`${int(data.rows.length)} query shapes`, 'literals replaced by ?', table([
+      { title: 'Query shape', cls: 'q', cell: (r) => text(r.text, link('query/' + r.fp)) },
+      num('Requests', (r) => int(r.count), by('count')),
+      num('Total exec', (r) => dur(r.total_ms), by('total')), num('%', (r) => pct(r.total_ms, all.total_ms)),
+      sort === 'total' && { title: '', cell: (r) => share(r.total_ms, all.total_ms) },
+      num('Avg ms', (r) => msCell(r.avg_ms), by('avg')), num('p95 ms', (r) => msCell(r.p95_ms)), num('Max ms', (r) => msCell(r.max_ms), by('max')),
+      num('Failed', (r) => failedCell(r.not_ok, r.count), by('errors')), num('Bytes out', (r) => bytes(r.bytes_out), by('bytes')),
+    ], data.rows, `No requests in ${st.range[2]}.`, true),
+    h('p', { class: 'note' }, 'percentiles are histogram bucket upper bounds (powers of two)'))];
   },
-  async query(fp) {
-    const data = await get('/api/query' + params({ fp, limit: 20 }));
-    return [card('Query', null, h('pre', { class: 'q' }, data.text || '(not seen in this range)')),
-      tiles(data.total), ...charts(data),
-      card('Slowest requests', null, table(samplesColumns, data.slow)),
-      card('Requests that did not succeed', 'the most recent kept', table(samplesColumns, data.failed))];
+  async query(st, live, q) {
+    const data = await get('/api/query' + q({ fp: st.arg, limit: 20 }));
+    const shape = h('pre', { class: 'q' }, data.text || `No requests with this shape in ${st.range[2]}.`);
+    const copy = h('button', { class: 'copy', onclick: () => {
+      const select = () => getSelection().selectAllChildren(shape);
+      if (navigator.clipboard) navigator.clipboard.writeText(data.text).then(() => { copy.textContent = 'copied'; }, select);
+      else select();
+    } }, 'copy');
+    const kept = 'the bouncer keeps the slowest requests per hour and up to 20 failed per minute, with literals';
+    return [h('section', { class: 'plain' },
+        h('p', { class: 'note' }, h('a', { href: link('queries') }, '← Queries'), `   ${st.arg}   `, data.text ? copy : null), shape),
+      totals(data.total, data.to - data.from), threeCharts(data, st.range[2]),
+      section('Slowest samples', kept, samples(data.slow, `No requests in ${st.range[2]}.`, st, false)),
+      section('Failed samples', null, samples(data.failed, `No failed requests in ${st.range[2]}.`, st, false))];
   },
-  async slow() {
-    const data = await get('/api/slow' + params({ limit: 100 }));
-    return [card('Slowest requests', 'The slowest of each hour are kept with their full text.', table(samplesColumns, data.rows, openQuery))];
+  async slow(st, live, q) {
+    const data = await get('/api/slow' + q({ limit: 100 }));
+    return [section('Slowest requests', 'by exec time; kept per hour, with literals',
+      samples(data.rows, `No requests in ${st.range[2]}.`, st, true))];
   },
-  async errors() {
-    const [data, overview] = await Promise.all([get('/api/errors' + params({ limit: 200 })), get('/api/overview' + params())]);
-    const t = overview.total;
-    return [h('div', { class: 'tiles' },
-        tile('Errors', int(t.errors), 'raised by a replica'), tile('Cancels', int(t.cancels), 'by the client'),
-        tile('Timeouts', int(t.timeouts), 'past the query budget'), tile('Refused', int(t.refused), 'queue full or wait too long'),
-        tile('Failures', int(t.failed), 'no replica could answer')),
-      card('Most recent', 'Up to 20 a minute are kept with their full text. Kinds kept: ' +
-        (data.kinds.map((k) => `${k.status} (${k.sampled})`).join(', ') || 'none'),
-        table(samplesColumns, data.rows, openQuery))];
+  async failed(st, live, q) {
+    const data = await get('/api/errors' + q({ limit: 200 }));
+    const of = (name) => (data.outcomes.find((o) => o.status === name) || { count: 0 }).count;
+    const total = data.outcomes.reduce((n, o) => n + o.count, 0);
+    const codes = data.outcomes.filter((o) => o.status !== 'ok' && !OUTCOMES.some(([name]) => name === o.status));
+    const rows = OUTCOMES.flatMap(([name, meaning]) => name === 'error'
+      ? [{ name, meaning, count: codes.reduce((n, c) => n + c.count, 0) }, ...codes.map((c) => ({ name: c.status, count: c.count, code: true }))]
+      : [{ name, meaning, count: of(name) }]);
+    const faded = (r, value) => h('span', { class: r.count ? '' : 'dim' }, value);
+    return [section('Outcomes', `of ${int(total)} requests in ${st.range[2]}`, table([
+        { title: 'Outcome', cls: (r) => r.code ? 'indent' : '', cell: (r) => faded(r, r.name) },
+        num('Count', (r) => faded(r, int(r.count))),
+        num('% of requests', (r) => faded(r, pct(r.count, total))),
+        { title: 'Meaning', cell: (r) => h('span', { class: 'dim' }, r.meaning || '') },
+      ], rows, '')),
+      section('Failed requests, newest first', 'sampled: up to 20 per minute',
+        samples(data.rows, `No failed requests in ${st.range[2]}.`, st, true))];
   },
-  async clients() {
-    const data = await get('/api/clients' + params({ limit: 200 }));
-    return [card('Clients', 'By address, the busiest first.', table([
-      { title: 'Address', cell: (r) => r.name }, { title: 'Pool', cell: (r) => r.pool },
-      num('Requests', (r) => int(r.count)), num('Not ok', (r) => int(r.not_ok)),
-      num('Total time', (r) => dur(r.total_ms)), num('Average', (r) => dur(r.avg_ms))], data.rows))];
-  },
-  async replicas() {
-    const [data, live] = await Promise.all([get('/api/backends' + params({ limit: 200 })), get('/api/live')]);
+  async clients(st, live, q) {
+    const data = await get('/api/clients' + q({ limit: 200 }));
     const total = data.rows.reduce((n, r) => n + r.count, 0);
-    return [card('Share of the work', 'Requests each replica answered in this range.', table([
-        { title: 'Replica', cell: (r) => r.name }, { title: 'Pool', cell: (r) => r.pool },
-        num('Requests', (r) => `${int(r.count)} (${pct(r.count, total)})`), num('Not ok', (r) => int(r.not_ok)),
-        num('Total time', (r) => dur(r.total_ms)), num('Average', (r) => dur(r.avg_ms))], data.rows)),
-      liveReplicas(live)];
+    return [section('Clients', null, table([
+      { title: 'Address', cell: (r) => r.name }, { title: 'Pool', cell: (r) => r.pool },
+      num('Requests', (r) => int(r.count)), num('%', (r) => pct(r.count, total)), { title: '', cell: (r) => share(r.count, total) },
+      num('Failed', (r) => failedCell(r.not_ok, r.count)), num('Total exec', (r) => dur(r.total_ms)), num('Avg ms', (r) => msCell(r.avg_ms)),
+    ], data.rows, `No clients in ${st.range[2]}.`))];
   },
-  async now() {
-    const live = await get('/api/live');
-    const queued = live.pools.flatMap((p) => p.queue.map((q) => ({ pool: p.name, ...q })));
-    return [h('div', { class: 'tiles' },
-        tile('Clients connected', int(live.clients)), tile('Waiting in the queue', int(queued.length)),
-        tile('Up for', dur(live.uptime_s * 1000), 'version ' + live.version),
-        live.stats_dropped ? tile('Statistics dropped', int(live.stats_dropped), 'requests not counted') : null),
-      liveReplicas(live),
-      card('Waiting for a replica', null, table([
-        { title: 'Pool', cell: (r) => r.pool }, { title: 'Client', cell: (r) => r.client },
-        num('Waited', (r) => dur(r.waited_ms)), { title: 'Request', cell: (r) => r.text, cls: 'q' }], queued))];
+  async replicas(st, live, q) {
+    const data = await get('/api/backends' + q({ limit: 200 }));
+    const total = data.rows.reduce((n, r) => n + r.count, 0);
+    const none = { count: 0, not_ok: 0, avg_ms: 0 };
+    const rows = poolsOf(live, st.pool).flatMap((p) => p.backends.map((b) => (
+      { pool: p.name + (p.paused ? ' (paused)' : ''), ...b, ...(data.rows.find((r) => r.pool === p.name && r.name === b.addr) || none) })));
+    return [section('Replicas', `requests are of ${st.range[2]}; state is now`, table([
+      { title: 'Replica', cell: (r) => r.addr }, { title: 'Pool', cell: (r) => r.pool }, { title: 'State', cell: replicaState },
+      num('Requests', (r) => int(r.count)), num('%', (r) => pct(r.count, total)), { title: '', cell: (r) => share(r.count, total) },
+      num('Failed', (r) => failedCell(r.not_ok, r.count)), num('Avg ms', (r) => msCell(r.avg_ms)),
+      num('Conn failures', (r) => int(r.failures)), { title: 'Last error', cell: (r) => r.last_error },
+    ], rows, 'No replicas configured.'))];
   },
 };
 
-function liveReplicas(live) {
-  const rows = live.pools.flatMap((p) => p.backends.map((b) => ({ pool: p.name + (p.paused ? ' (paused)' : ''), ...b })));
-  const state = (r) => {
-    const dot = h('i', { class: 'dot' });
-    dot.style.background = `var(${r.state === 'down' ? '--critical' : r.state === 'busy' ? '--warning' : '--good'})`;
-    return h('span', {}, dot, r.state + (r.draining ? ', draining' : ''));
-  };
-  return card('Replicas now', null, table([
-    { title: 'Replica', cell: (r) => r.addr }, { title: 'Pool', cell: (r) => r.pool }, { title: 'State', cell: state },
-    num('Served', (r) => int(r.served)), num('Failures', (r) => int(r.failures)),
-    num('Running for', (r) => r.running ? dur(r.running.ms) : ''),
-    { title: 'Request', cls: 'q', cell: (r) => r.running ? r.running.text : r.last_error }], rows));
+// ---- the frame: header, refresh, errors ----
+
+let drawn = 0, ok = false, lastGood = null, paused = false;
+const clockNow = () => { const d = new Date(); return `${hm(d)}:${two(d.getSeconds())}`; };
+function status(kind, message) {
+  $('status').className = kind;
+  $('status').replaceChildren(h('i', {}), message);
 }
 
-let drawn = 0;
-async function render() {
-  const { tab, arg } = route();
+// `changed` is true when the reader picked something else to look at; a
+// refresh on the timer redraws in place, without a flicker.
+async function render(changed) {
+  const st = state();
   const mine = ++drawn;
-  for (const a of $('tabs').children) a.className = a.hash === '#' + tab ? 'on' : '';
-  $('filters').hidden = tab === 'now';
-  $('view').classList.add('stale');
+  const tab = st.tab === 'query' ? 'queries' : st.tab;
+  $('tabs').replaceChildren(...TABS.map(([id, title]) => h('a', { href: link(id), class: id === tab ? 'on' : '' }, title)));
+  $('range').replaceChildren(...RANGES.map((r) => h('button', {
+    class: r === st.range ? 'on' : '', onclick: () => { location.hash = link(here(st), { range: r }).slice(1); },
+  }, r[1])));
+  $('range').className = st.tab === 'live' ? 'off' : '';
+  const to = Math.floor(Date.now() / 1000), from = to - st.range[0];
+  const a = new Date(from * 1000), b = new Date(to * 1000);
+  $('window').textContent = st.tab === 'live' ? '' : `${st.range[0] > 86400 ? md(a) + ' ' : ''}${hm(a)}–${hm(b)} ${zone()}`;
+  document.title = `${(TABS.find(([id]) => id === tab) || TABS[0])[1]} · rfbouncer ${location.host}`;
+  if (changed) $('view').classList.add('stale');
   try {
     const live = await get('/api/live');
-    const pool = $('pool'), chosen = pool.value;
-    pool.replaceChildren(h('option', { value: '' }, 'all pools'), ...live.pools.map((p) => h('option', { value: p.name }, p.name)));
-    pool.value = live.pools.some((p) => p.name === chosen) ? chosen : '';
-    const body = await (views[tab] || views.overview)(arg);
+    $('instance').textContent = `${location.host} · v${live.version} · up ${span(live.uptime_s)}`;
+    $('pool').replaceChildren(h('option', { value: '' }, 'all'), ...live.pools.map((p) => h('option', { value: p.name }, p.name)));
+    $('pool').value = live.pools.some((p) => p.name === st.pool) ? st.pool : '';
+    $('alert').hidden = !live.stats_dropped;
+    $('alert').textContent = `statistics dropped for ${int(live.stats_dropped)} requests: counts are low`;
+    const q = (extra) => '?' + new URLSearchParams({ from, to, pool: st.pool, ...extra });
+    const before = charts;
+    charts = [];
+    let body;
+    try { body = await (views[st.tab] || views.overview)(st, live, q); } catch (e) { charts = before; throw e; }
     if (mine !== drawn) return;
     $('tooltip').hidden = true;
     $('view').replaceChildren(...body.filter(Boolean));
-    $('status').textContent = 'updated ' + new Date().toLocaleTimeString();
+    $('view').classList.remove('broken');
+    ok = true;
+    lastGood = clockNow();
+    status('live', `live · ${REFRESH_S} s · ${lastGood}`);
   } catch (e) {
     if (mine !== drawn) return;
-    $('view').replaceChildren(h('div', { class: 'card empty' }, e.message));
-    $('status').textContent = '';
+    // What was on the page stays: it is the last thing known, and during an
+    // incident that is worth more than an empty page.
+    const gone = e.status == null;
+    if (!ok || changed || e.status === 404) {
+      $('view').replaceChildren(h('div', { class: 'empty' }, gone ? `Cannot reach rfbouncer at ${location.host}: ${e.message}` : e.message));
+      ok = false;
+    } else {
+      $('view').classList.add('broken');
+    }
+    status('bad', gone ? `no answer from rfbouncer since ${lastGood || clockNow()} · retrying every ${REFRESH_S} s` : e.message);
   }
   $('view').classList.remove('stale');
 }
 
-$('tabs').append(...TABS.map(([id, title]) => h('a', { href: '#' + id }, title)));
-addEventListener('hashchange', render);
-$('pool').addEventListener('change', render);
-$('range').addEventListener('change', render);
-// A page nobody is pointing at is refreshed; one being read is left alone.
-setInterval(() => { if ($('tooltip').hidden && !document.hidden && !getSelection().toString()) render(); }, REFRESH_MS);
-render();
+addEventListener('hashchange', () => render(true));
+$('pool').addEventListener('change', () => { location.hash = link(here(state()), { pool: $('pool').value }).slice(1); });
+// A page being read is left alone: a tooltip open, text selected, or the
+// tab in the background.
+setInterval(() => {
+  const busy = !$('tooltip').hidden || document.hidden || getSelection().toString() !== '';
+  if (busy !== paused) {
+    paused = busy;
+    if (ok && lastGood) status(busy ? '' : 'live', `${busy ? 'paused' : 'live · ' + REFRESH_S + ' s'} · ${lastGood}`);
+  }
+  if (!busy) render(false);
+}, REFRESH_S * 1000);
+render(true);
