@@ -2,6 +2,8 @@
 //! own binary, and a small blocking client that speaks the wire.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
+pub mod fake;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
