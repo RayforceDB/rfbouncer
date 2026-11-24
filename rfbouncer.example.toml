@@ -123,6 +123,11 @@ affinity = false
 # the client is answered with the error "busy".
 queue_max = 1000
 query_wait_timeout = "10s"
+# How long a request that finds the queue full waits to be told "busy".
+# Clients that ask again the moment they are refused would otherwise do so
+# as fast as the bouncer can refuse them, and take the processor from the
+# requests it is serving. 0 answers at once.
+busy_delay = "100ms"
 # How long a replica may take to start answering. Past it the request is
 # cancelled and answered with "timeout"; 0 is no limit, and then a replica
 # that hangs holds its request for good.

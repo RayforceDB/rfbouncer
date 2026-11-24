@@ -7,6 +7,7 @@ mod support;
 
 use std::io::Write;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use rfbouncer::wire::frame::{self, MSG_RESPONSE};
 use support::fake::{Fake, read_request};
@@ -121,4 +122,29 @@ fn a_client_that_leaves_the_middle_of_the_queue_is_forgotten_while_it_waits() {
     hog.cancel();
     assert_eq!(hog.query_error_after_cancel(), Some("cancel".to_owned()));
     assert_eq!(ahead.recv(), int(2));
+}
+
+#[test]
+fn a_client_refused_at_a_full_queue_cannot_ask_again_faster_than_the_delay() {
+    let replica = Rayforce::start(&[]);
+    let extra = format!("{OPEN}\nqueue_max = 1\nbusy_delay = \"300ms\"");
+    let bouncer = Bouncer::start(&pool(&[&replica], &extra));
+    let mut hog = Client::connect(bouncer.port);
+    hog.send(&slow(600_000));
+    bouncer.wait_busy(1);
+    let mut queued = Client::connect(bouncer.port);
+    queued.send("(+ 1 1)");
+    bouncer.wait_queued(1);
+    // As fast as it can for 1.2 s: told at once it is refused thousands of
+    // times, and that is what kept the replicas' tasks from their turn.
+    let mut eager = Client::connect(bouncer.port);
+    let (started, mut refusals) = (Instant::now(), 0);
+    while started.elapsed() < Duration::from_millis(1200) {
+        assert_eq!(eager.query_error("(+ 2 2)"), Some("busy".to_owned()));
+        refusals += 1;
+    }
+    assert!((1..=4).contains(&refusals), "refused {refusals} times");
+    hog.cancel();
+    assert_eq!(hog.query_error_after_cancel(), Some("cancel".to_owned()));
+    assert_eq!(queued.recv(), int(2));
 }

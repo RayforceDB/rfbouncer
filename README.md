@@ -52,7 +52,9 @@ speaks 4. Set `wire_version` to the one your replicas speak; the default is 4.
 - **Budgets.** A request whose replica has not begun to answer within
   `query_timeout` (30 s unless set) is cancelled and answered with the error
   `timeout`; one that waits for a replica past `query_wait_timeout`, or finds
-  the queue full, is answered with `busy`. A client that takes longer than
+  the queue full, is answered with `busy`, the latter after `busy_delay`
+  (100 ms unless set), so that clients which ask again at once cannot take
+  the bouncer from the requests it is serving. A client that takes longer than
   `transfer_timeout` to receive an answer is cut off, so a slow reader cannot
   hold a replica.
 - **Failing replicas.** A replica that dies before any of its answer reached

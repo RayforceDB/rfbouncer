@@ -222,6 +222,10 @@ pub struct PoolConfig {
     pub queue_max: usize,
     #[serde(default = "secs_10", deserialize_with = "duration")]
     pub query_wait_timeout: Duration,
+    /// How long a request that finds the queue full waits to be told so;
+    /// zero is at once.
+    #[serde(default = "millis_100", deserialize_with = "duration")]
+    pub busy_delay: Duration,
     /// How long a replica may take to start answering; zero is no limit.
     #[serde(default = "secs_30", deserialize_with = "duration")]
     pub query_timeout: Duration,
@@ -293,6 +297,9 @@ fn one() -> usize {
 }
 fn yes() -> bool {
     true
+}
+fn millis_100() -> Duration {
+    Duration::from_millis(100)
 }
 fn secs_1() -> Duration {
     Duration::from_secs(1)

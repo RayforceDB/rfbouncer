@@ -177,6 +177,9 @@ impl Dispatcher {
     }
 
     async fn handle(&mut self, cmd: Cmd) {
+        // The status board reads every replica connection, and what a
+        // client sends changes nothing about them.
+        let from_client = matches!(cmd, Cmd::Submit(_) | Cmd::Cancel(_));
         match cmd {
             Cmd::Submit(job) => self.submit(job).await,
             Cmd::Cancel(id) => self.cancel(id).await,
@@ -264,8 +267,10 @@ impl Dispatcher {
                 }
             }
         }
-        self.note_status();
-        self.retire();
+        if !from_client {
+            self.note_status();
+            self.retire();
+        }
         self.pump();
     }
 
@@ -281,8 +286,7 @@ impl Dispatcher {
             // place in it. A paused pool holds every request, this one too.
             self.answer_cached(job, answer);
         } else if self.queue.len() >= self.cfg.queue_max {
-            job.refuse("busy", "the queue is full").await;
-            self.end(&job, Outcome::Busy);
+            self.refuse_full(job);
         } else {
             self.queue.push_back(job);
         }
@@ -374,6 +378,42 @@ impl Dispatcher {
         });
     }
 
+    /// Tells a request there is no room for it, after `busy_delay` and on
+    /// a task of its own. Told at once, clients that ask again the moment
+    /// they are refused do so a hundred thousand times a second, and the
+    /// tasks that serve the replicas wait their turn behind them: the pool
+    /// then answers hundreds of requests a second where it could answer
+    /// tens of thousands. Held for the delay, each of them asks a few times
+    /// a second, whatever it does.
+    fn refuse_full(&self, job: Job) {
+        let (shared, delay) = (self.shared.clone(), self.cfg.busy_delay);
+        tokio::spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            job.refuse("busy", "the queue is full").await;
+            let ending = Ending {
+                backend: None,
+                wait: job.arrived.elapsed(),
+                exec: Duration::ZERO,
+                bytes_out: 0,
+                outcome: Outcome::Busy,
+            };
+            shared.report(&job, ending);
+        });
+    }
+
+    /// Takes out of the queue, in one pass, the requests `gone` is true
+    /// of. Nothing is moved when there are none, which is nearly always.
+    fn take_where(&mut self, gone: impl Fn(&Job) -> bool) -> VecDeque<Job> {
+        if !self.queue.iter().any(&gone) {
+            return VecDeque::new();
+        }
+        let (taken, kept) = std::mem::take(&mut self.queue).into_iter().partition(gone);
+        self.queue = kept;
+        taken
+    }
+
     /// Reports a request that ended in the queue, where no replica saw it.
     fn end(&self, job: &Job, outcome: Outcome) {
         let ending = Ending {
@@ -390,18 +430,11 @@ impl Dispatcher {
     /// holds its requests for as long as it is paused.
     async fn expire(&mut self) {
         let limit = self.cfg.query_wait_timeout;
-        let mut at = 0;
-        while !self.paused && at < self.queue.len() {
-            if self.queue[at].queued_at.elapsed() > limit {
-                if let Some(job) = self.queue.remove(at) {
-                    job.refuse("busy", "no replica became free in time").await;
-                    self.end(&job, Outcome::Busy);
-                }
-            } else {
-                at += 1;
-            }
-        }
         if !self.paused {
+            for job in self.take_where(|j| j.queued_at.elapsed() > limit) {
+                job.refuse("busy", "no replica became free in time").await;
+                self.end(&job, Outcome::Busy);
+            }
             self.forget_gone();
         }
         self.pump();
@@ -427,15 +460,8 @@ impl Dispatcher {
     /// is why it is not done for every command: `pump_free` looks only at
     /// the request it is about to hand out, and the tick finds the rest.
     fn forget_gone(&mut self) {
-        let mut at = 0;
-        while at < self.queue.len() {
-            if self.queue[at].reply.is_closed() {
-                if let Some(job) = self.queue.remove(at) {
-                    self.end(&job, Outcome::Cancelled);
-                }
-            } else {
-                at += 1;
-            }
+        for job in self.take_where(|j| j.reply.is_closed()) {
+            self.end(&job, Outcome::Cancelled);
         }
     }
 
