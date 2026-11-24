@@ -22,6 +22,12 @@ max_request_bytes = "16MiB"
 shutdown_timeout = "30s"
 # How long a client may sit between two requests; 0 is forever.
 client_idle_timeout = "0"
+# Open the port so that a second rfbouncer may open it too (SO_REUSEPORT).
+# That is how a new process takes over from the old one without a client
+# being refused: see "Restarting without dropping clients" in the README.
+# With it on, starting a second process by mistake is not an error either.
+# Needs a restart to change.
+reuse_port = false
 
 # An address refused this many logins within the window is locked out for the
 # period: every login from it is refused, the right password included, over
@@ -141,3 +147,15 @@ cache_ttl = "0"
 cache_max_bytes = "64MiB"
 # The largest answer kept, counted together with its request.
 cache_max_entry = "1MiB"
+
+# A replica connection that has been idle for health_check_interval is sent
+# a request that costs nothing, and the replica has health_check_timeout to
+# answer it. One that does not is taken for hung: its connection is dropped,
+# it shows as down, and it is tried again like any replica that went away.
+# Either setting at 0 turns the check off, and so does slots above 1.
+# The answer comes from the replica's one evaluating thread, so the limit
+# must be longer than anything a replica does that is not a request of this
+# bouncer: a timer of its own, a query from a client that connects to it
+# directly or through another bouncer.
+health_check_interval = "10s"
+health_check_timeout = "5s"

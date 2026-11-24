@@ -559,5 +559,6 @@ fn a_stop_past_its_timeout_ends_the_process_anyway() {
     bouncer.wait_busy(1);
     signal(bouncer.pid(), "TERM");
     eventually("the bouncer exited", || bouncer.exited().is_some());
-    assert!(c.try_recv().is_err());
+    // The replica was told to stop on the way out, and said so.
+    assert_eq!(c.query_error_after_cancel(), Some("cancel".to_owned()));
 }

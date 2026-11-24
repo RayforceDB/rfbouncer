@@ -165,6 +165,16 @@ impl Dispatcher {
         match cmd {
             Cmd::Submit(job) => self.submit(job).await,
             Cmd::Cancel(id) => self.cancel(id).await,
+            Cmd::CancelRunning => {
+                // As a client's own cancel: the replica is told to stop and
+                // its answer to that, the error `cancel`, goes to the client.
+                for r in &self.replicas {
+                    if let Some(run) = &r.running {
+                        self.cancelled.insert(run.id);
+                        let _ = r.tx.send(Msg::Cancel(run.id));
+                    }
+                }
+            }
             Cmd::Up(idx) => {
                 let r = &mut self.replicas[idx];
                 r.connected = true;

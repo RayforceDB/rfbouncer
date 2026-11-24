@@ -32,6 +32,10 @@ pub struct Config {
     /// How long a client may sit between two requests; zero is forever.
     #[serde(default, deserialize_with = "duration")]
     pub client_idle_timeout: Duration,
+    /// Bind the port with SO_REUSEPORT, so that a second bouncer may be
+    /// started on it while this one is still serving.
+    #[serde(default)]
+    pub reuse_port: bool,
     #[serde(default)]
     pub stats: StatsConfig,
     pub pool: Vec<PoolConfig>,
@@ -233,6 +237,13 @@ pub struct PoolConfig {
     /// The largest answer kept, counted together with its request.
     #[serde(default = "mib_1", deserialize_with = "size")]
     pub cache_max_entry: usize,
+    /// How long a replica connection sits idle before it is asked whether
+    /// the replica still answers; zero is never.
+    #[serde(default = "secs_10", deserialize_with = "duration")]
+    pub health_check_interval: Duration,
+    /// How long the replica has to answer that; zero is no check at all.
+    #[serde(default = "secs_5", deserialize_with = "duration")]
+    pub health_check_timeout: Duration,
 }
 
 fn mib_1() -> usize {
@@ -591,6 +602,9 @@ mod tests {
         assert_eq!(c.only_pool().slots, 1);
         assert!(c.only_pool().require_restricted);
         assert_eq!(c.only_pool().mode, Mode::Free);
+        assert!(!c.reuse_port);
+        assert_eq!(c.only_pool().health_check_interval, Duration::from_secs(10));
+        assert_eq!(c.only_pool().health_check_timeout, Duration::from_secs(5));
     }
 
     #[test]

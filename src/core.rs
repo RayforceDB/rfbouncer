@@ -40,6 +40,8 @@ pub struct Core {
     pub lockout: Lockout,
     /// Connections in clear text turned away where TLS is required.
     pub cleartext_refused: AtomicU64,
+    /// Connections taken off the port that have yet to say who they are.
+    pending: AtomicU64,
     /// One reload at a time: two at once would each compare against the
     /// same old configuration.
     reloading: Mutex<()>,
@@ -77,6 +79,7 @@ impl Core {
             refused: AtomicU64::new(0),
             lockout: Lockout::default(),
             cleartext_refused: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
             reloading: Mutex::new(()),
         })
     }
@@ -154,6 +157,18 @@ impl Core {
         lock(&self.clients).len()
     }
 
+    /// Counts a connection as accepted and not yet known for what it is,
+    /// until the returned guard is dropped. A stop waits for these too: a
+    /// client let in a moment before it is owed an answer like any other.
+    pub fn pending(self: &Arc<Self>) -> Pending {
+        self.pending.fetch_add(1, Relaxed);
+        Pending(self.clone())
+    }
+
+    pub fn pending_count(&self) -> u64 {
+        self.pending.load(Relaxed)
+    }
+
     pub fn with_clients<R>(&self, f: impl FnOnce(&HashMap<u64, ClientInfo>) -> R) -> R {
         f(&lock(&self.clients))
     }
@@ -166,6 +181,14 @@ impl Core {
             core: self.clone(),
             id,
         }
+    }
+}
+
+pub struct Pending(Arc<Core>);
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.0.pending.fetch_sub(1, Relaxed);
     }
 }
 

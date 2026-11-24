@@ -289,6 +289,7 @@ fn show_config(core: &Core) -> Vec<u8> {
             "client_idle_timeout",
             format!("{:?}", c.client_idle_timeout),
         ),
+        ("reuse_port", c.reuse_port.to_string()),
         (
             "stats.rayforce",
             c.stats.rayforce.clone().unwrap_or_default(),
@@ -321,7 +322,7 @@ fn show_config(core: &Core) -> Vec<u8> {
         rows.push((
             "pool",
             format!(
-                "{} v{} mode={:?} backends={} slots={} users={:?} default={} restricted={} retry={} affinity={} queue_max={} wait={:?} timeout={:?} grace={:?}",
+                "{} v{} mode={:?} backends={} slots={} users={:?} default={} restricted={} retry={} affinity={} queue_max={} wait={:?} timeout={:?} grace={:?} health_check_interval={:?} health_check_timeout={:?}",
                 p.name,
                 p.wire_version,
                 p.mode,
@@ -335,7 +336,9 @@ fn show_config(core: &Core) -> Vec<u8> {
                 p.queue_max,
                 p.query_wait_timeout,
                 p.query_timeout,
-                p.cancel_grace
+                p.cancel_grace,
+                p.health_check_interval,
+                p.health_check_timeout
             ),
         ));
     }

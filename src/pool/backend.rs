@@ -170,18 +170,26 @@ fn greeting_failure(e: &greeting::GreetError, version: u8) -> String {
     }
 }
 
-/// Asks the replica for something only a restricted connection is refused.
-async fn probe(stream: &mut TcpStream, version: u8) -> Result<(), String> {
-    let io = |e: std::io::Error| format!("probe: {e}");
+/// Sends the probe and reads the frame that comes back.
+async fn ask(stream: &mut TcpStream, version: u8) -> Result<(Header, Vec<u8>), String> {
+    let io = |e: std::io::Error| e.to_string();
     stream
         .write_all(&frame::frame(version, MSG_SYNC, &value::str_atom(PROBE)))
         .await
         .map_err(io)?;
     let mut raw = [0u8; HEADER_LEN];
     stream.read_exact(&mut raw).await.map_err(io)?;
-    let header = Header::parse(&raw, version, DRAIN_MAX).map_err(|e| format!("probe: {e}"))?;
+    let header = Header::parse(&raw, version, DRAIN_MAX).map_err(|e| e.to_string())?;
     let mut payload = vec![0u8; header.size];
     stream.read_exact(&mut payload).await.map_err(io)?;
+    Ok((header, payload))
+}
+
+/// Asks the replica for something only a restricted connection is refused.
+async fn probe(stream: &mut TcpStream, version: u8) -> Result<(), String> {
+    let (_, payload) = ask(stream, version)
+        .await
+        .map_err(|e| format!("probe: {e}"))?;
     match value::error_code(&payload).as_deref() {
         Some("access") => Ok(()),
         _ => Err(
@@ -194,8 +202,20 @@ async fn probe(stream: &mut TcpStream, version: u8) -> Result<(), String> {
 /// Holds an open connection: runs what it is handed, and notices a replica
 /// that closes it or speaks out of turn.
 async fn serve(ctx: &Ctx, stream: &mut TcpStream, rx: &mut mpsc::UnboundedReceiver<Msg>) -> Next {
+    let mut idle_since = tokio::time::Instant::now();
+    let mut reconfigured = ctx.cfg.clone();
     loop {
+        let cfg = ctx.cfg.borrow().clone();
+        // With several connections to one replica, an idle one would be
+        // answered only after the query on its neighbour, and a replica hard
+        // at work would be taken for a dead one: there the check is left out.
+        let checked = cfg.slots == 1
+            && !cfg.health_check_interval.is_zero()
+            && !cfg.health_check_timeout.is_zero();
         tokio::select! {
+            // In this order, so a request that is already here is never made
+            // to wait for a check that happens to be due at the same moment.
+            biased;
             msg = rx.recv() => match msg {
                 None | Some(Msg::Stop) => return Next::Stop,
                 Some(Msg::Reconnect) => return Next::Reconnect("reconnect requested".into()),
@@ -228,6 +248,8 @@ async fn serve(ctx: &Ctx, stream: &mut TcpStream, rx: &mut mpsc::UnboundedReceiv
                         (None, Some(reason)) => return Next::Reconnect(reason),
                         (None, None) => {}
                     }
+                    // A request that was answered says all a check would.
+                    idle_since = tokio::time::Instant::now();
                 }
             },
             ready = stream.readable() => {
@@ -240,6 +262,30 @@ async fn serve(ctx: &Ctx, stream: &mut TcpStream, rx: &mut mpsc::UnboundedReceiv
                     Ok(_) => return Next::Reconnect("unsolicited data from the replica".into()),
                     Err(e) => return Next::Reconnect(e.to_string()),
                 }
+            }
+            // A reload may have changed how often to check.
+            Ok(()) = reconfigured.changed() => {}
+            // The connection is idle, and only an idle one comes here: a
+            // request holds this task until it is over. One handed over
+            // while the check runs waits in the channel, for the check's
+            // limit at most; if the check fails it is given back unsent and
+            // goes to another replica.
+            () = sleep_until(idle_since + cfg.health_check_interval), if checked => {
+                let limit = cfg.health_check_timeout;
+                let failed = match timeout(limit, ask(stream, cfg.wire_version)).await {
+                    // An answer of any kind: the evaluating thread is alive.
+                    Ok(Ok((header, _))) if header.msgtype == MSG_RESPONSE => None,
+                    Ok(Ok(_)) => Some("unsolicited data from the replica".to_owned()),
+                    Ok(Err(e)) => Some(e),
+                    Err(_) => Some(format!("no answer within {limit:?}")),
+                };
+                let counters = &ctx.shared.counters;
+                if let Some(reason) = failed {
+                    counters.health_checks_failed.fetch_add(1, Relaxed);
+                    return Next::Reconnect(format!("health check: {reason}"));
+                }
+                counters.health_checks_ok.fetch_add(1, Relaxed);
+                idle_since = tokio::time::Instant::now();
             }
         }
     }

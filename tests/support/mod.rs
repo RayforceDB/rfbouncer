@@ -336,6 +336,41 @@ impl Bouncer {
     }
 }
 
+impl Bouncer {
+    /// A second process on the same port, from the same configuration file,
+    /// which must say `reuse_port = true`. The port is open already, so
+    /// this waits for the new process to say that it listens.
+    pub fn start_beside(&self) -> Self {
+        use std::io::BufRead;
+        let mut child = spawn(
+            Command::new(env!("CARGO_BIN_EXE_rfbouncer"))
+                .arg("--config")
+                .arg(&self.config)
+                .stdin(Stdio::null())
+                .stderr(Stdio::piped()),
+        );
+        let log = std::io::BufReader::new(child.stderr.take().unwrap());
+        let bouncer = Self {
+            child,
+            port: self.port,
+            config: self.config.clone(),
+        };
+        let (started, listening) = std::sync::mpsc::channel();
+        // Read to the end, so the process never blocks on a full pipe.
+        std::thread::spawn(move || {
+            for line in log.lines().map_while(Result::ok) {
+                if line.contains("rfbouncer started") {
+                    let _ = started.send(());
+                }
+            }
+        });
+        listening
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the second bouncer did not start");
+        bouncer
+    }
+}
+
 impl Drop for Bouncer {
     fn drop(&mut self) {
         let _ = self.child.kill();

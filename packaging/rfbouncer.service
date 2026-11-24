@@ -21,5 +21,20 @@ LimitNOFILE=65536
 # Longer than shutdown_timeout, so requests in flight are let finish.
 TimeoutStopSec=45
 
+# Restarting without dropping clients. `systemctl restart` stops the old
+# process before it starts the new one, and clients are refused in between.
+# To hand the port over instead, set `reuse_port = true` in the
+# configuration, install this file as rfbouncer@.service, and run it under
+# two names by turns:
+#
+#     systemctl start rfbouncer@b
+#     journalctl -u rfbouncer@b -f     # wait for "rfbouncer started"
+#     systemctl stop rfbouncer@a
+#
+# The next restart starts rfbouncer@a and stops rfbouncer@b. The stop sends
+# SIGTERM: the old process closes the port at once, finishes the requests it
+# has, and exits. On Linux, set net.ipv4.tcp_migrate_req=1 as well, so a
+# connection that reached the old process as it closed is moved to the new.
+
 [Install]
 WantedBy=multi-user.target

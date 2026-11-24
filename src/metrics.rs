@@ -100,6 +100,7 @@ pub async fn render(core: &Core) -> String {
     let (mut requests, mut totals, mut gauges, mut replicas) =
         (String::new(), String::new(), String::new(), String::new());
     let (mut exec, mut wait) = (String::new(), String::new());
+    let mut health = String::new();
     for pool in core.pools() {
         let Some(s) = pool.snapshot().await else {
             continue;
@@ -132,6 +133,16 @@ pub async fn render(core: &Core) -> String {
             ("cache_bytes", pool.shared.cache.size().1 as u64),
         ] {
             let _ = writeln!(totals, "rfbouncer_{metric}{{pool=\"{name}\"}} {value}");
+        }
+        for (result, n) in [
+            ("ok", &c.health_checks_ok),
+            ("failed", &c.health_checks_failed),
+        ] {
+            let n = n.load(Relaxed);
+            let _ = writeln!(
+                health,
+                "rfbouncer_health_checks_total{{pool=\"{name}\",result=\"{result}\"}} {n}"
+            );
         }
         histogram(
             &mut exec,
@@ -191,6 +202,8 @@ pub async fn render(core: &Core) -> String {
     out.push_str(&exec);
     out.push_str("# HELP rfbouncer_wait_seconds Time a request waited for a replica.\n# TYPE rfbouncer_wait_seconds histogram\n");
     out.push_str(&wait);
+    out.push_str("# HELP rfbouncer_health_checks_total Checks of idle replica connections, by whether the replica answered in time.\n# TYPE rfbouncer_health_checks_total counter\n");
+    out.push_str(&health);
     out.push_str(&gauges);
     out.push_str(&replicas);
     out

@@ -60,6 +60,21 @@ speaks 4. Set `wire_version` to the one your replicas speak; the default is 4.
   [Compression](#compression).
 - **Result cache**, off unless a pool sets `cache_ttl`: the same request
   within that time is answered from memory. See [Result cache](#result-cache).
+- **Health checks.** A replica connection that has sat idle for
+  `health_check_interval` (10 s) is asked something that costs nothing, and
+  a replica that has not answered within `health_check_timeout` (5 s) is
+  taken for hung: the connection is dropped, the replica shows as down with
+  `health check: no answer within 5s` as its last error, and it is tried
+  again with the usual backoff. So a replica that hangs is found while it is
+  idle, not by the request that would have hung with it. The check is never
+  sent on a connection that is running a request, is not counted as a
+  request anywhere, and is counted in `rfbouncer_health_checks_total`. A
+  request handed to a connection during a check waits for the check, its
+  limit at most. A replica answers from its one evaluating thread, so the
+  check cannot tell a hung replica from one busy for somebody else, a client
+  of its own or another bouncer: keep the limit above the longest such work,
+  or set either setting to 0 to turn the check off. With `slots` above 1
+  there is no check, for the same reason.
 - **Pools.** Several pools on one port; the user name in a client's
   credentials picks the pool.
 - **Admin console**, read with any Rayforce client.
@@ -121,6 +136,57 @@ and go. A file that does not parse leaves the running configuration alone.
 `listen`, `admin_listen` and `[stats]` need a restart. `SIGTERM` stops taking
 connections, lets the requests in flight end (for `shutdown_timeout` at
 most), and exits.
+
+When `shutdown_timeout` runs out with requests still running, each of their
+replicas is sent a cancel before the process exits, and has a second to take
+it: the client is answered with the error `cancel`, and no replica is left
+computing an answer for nobody.
+
+### Restarting without dropping clients
+
+With `reuse_port = true` the port is opened with `SO_REUSEPORT`, and a second
+process can open it while the first is still serving. A restart is then:
+
+1. Start the new process, with the same configuration, beside the old one.
+2. Wait for it to log `rfbouncer started`: from then on it takes connections.
+3. Send the old process `SIGTERM`.
+
+The old process closes its listening socket at once, so every connection made
+from then on reaches the new one. What it had already accepted, it serves:
+
+- A request in flight is answered in full, if it ends within
+  `shutdown_timeout`. Past that it is cancelled and answered with the error
+  `cancel`.
+- A client that had connected and not yet sent a request, greeted or not, has
+  2 s to send one, and is answered. A client that opens a connection for each
+  request therefore never notices the restart.
+- A persistent client is closed between two requests: after the answer to the
+  request in flight, or at once if it was idle. It reads a clean end of
+  stream, connects again, and reaches the new process. A request it sends
+  just as its connection is closed is either read, and then answered before
+  the close, or never read at all: the client then gets an end of stream or a
+  reset in place of an answer, the request was run by no replica, and sending
+  it again on a new connection is safe.
+
+While both run, each has its own connections to the replicas and its own
+queue, so a replica may be given two requests at once and run one after the
+other; `/metrics`, the report pages and the admin console reach whichever
+process the system picks. A report sums what both wrote to the statistics
+store.
+
+How the system shares the port differs. Linux spreads new connections over
+all the processes listening, and a connection that has finished connecting
+to the old process but that it has not yet accepted when it closes its socket
+is reset; the old process accepts everything waiting before it closes, which
+leaves a window of microseconds. `sysctl net.ipv4.tcp_migrate_req=1` (Linux
+5.14) closes it: such connections are moved to the process still listening.
+macOS and the BSDs give every new connection to the process that opened the
+port last, so the old one is idle from the moment the new one starts.
+
+`SO_REUSEPORT` lets any process of the same user open the port, and makes a
+second process started by mistake serve beside the first where it would have
+failed with "address in use". [`packaging/rfbouncer.service`](packaging/rfbouncer.service)
+says how to do the three steps under systemd.
 
 ### Give each replica its own cores
 

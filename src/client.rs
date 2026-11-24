@@ -13,7 +13,7 @@ use tokio::time::timeout;
 
 use crate::admin;
 use crate::config::Target;
-use crate::core::{ClientInfo, Core};
+use crate::core::{ClientInfo, Core, Pending};
 use crate::listener::Scope;
 use crate::pool::{Cmd, Job, Reply};
 use crate::wire::frame::{HEADER_LEN, Header, MSG_SYNC};
@@ -26,6 +26,8 @@ const REFUSAL_DELAY: Duration = Duration::from_millis(500);
 /// How long a client may refuse to take bytes of its answer. A client that
 /// stops reading would otherwise hold a replica for as long as it liked.
 const WRITE_STALL: Duration = Duration::from_secs(30);
+/// How long a client let in just before a stop has to send its request.
+const LAST_REQUEST: Duration = Duration::from_secs(2);
 
 /// A client's connection: TCP, or a TLS tunnel over it.
 pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send {
@@ -47,13 +49,23 @@ impl Transport for BufReader<tokio_rustls::server::TlsStream<TcpStream>> {
     }
 }
 
-pub async fn serve<S: Transport>(mut stream: S, peer: SocketAddr, scope: Scope, core: Arc<Core>) {
+pub async fn serve<S: Transport>(
+    mut stream: S,
+    peer: SocketAddr,
+    scope: Scope,
+    core: Arc<Core>,
+    pending: Pending,
+) {
     let greeted = timeout(GREET_TIMEOUT, greet(&mut stream, peer, scope, &core)).await;
     let Ok(Ok(Some((version, user, pool)))) = greeted else {
         return;
     };
     match pool {
-        None => admin::session(stream, version, &core).await,
+        None => {
+            // An open console must not hold up a stop.
+            drop(pending);
+            admin::session(stream, version, &core).await;
+        }
         Some(pool) => {
             if let Err(e) = proxy(stream, peer, version, user.into(), pool.into(), &core).await {
                 tracing::debug!(%peer, error = %e, "client connection ended");
@@ -136,16 +148,35 @@ async fn proxy<S: Transport>(
     let cancels = oob::Watch::new(stream.tcp())?;
     let (mut rd, mut wr) = tokio::io::split(stream);
     let mut buf = BytesMut::new();
+    let mut served = false;
     loop {
         let config = core.config();
         let idle = config.client_idle_timeout;
         let next = read_frame(&mut rd, &mut buf, version, config.max_request_bytes);
         let frame = tokio::select! {
-            frame = next => frame?,
+            // In this order: a request that has arrived whole is served
+            // even when the stop is already known.
+            biased;
+            frame = next => Some(frame?),
             () = tokio::time::sleep(idle), if !idle.is_zero() => return Ok(()),
             // Between two requests is the one place a client can be let go
             // without losing anything.
-            _ = shutdown.wait_for(|stop| *stop) => return Ok(()),
+            stop = shutdown.wait_for(|stop| *stop) => stop.ok().and(None),
+        };
+        let frame = match frame {
+            Some(frame) => frame,
+            None if served && buf.is_empty() => return Ok(()),
+            // Told to stop, but not between two requests after all: one has
+            // begun to arrive, or this client was let in a moment ago and
+            // has had none yet. A client that opens a connection for each
+            // request must get its one answer.
+            None => {
+                let last = read_frame(&mut rd, &mut buf, version, config.max_request_bytes);
+                match timeout(LAST_REQUEST, last).await {
+                    Ok(frame) => frame?,
+                    Err(_) => return Ok(()),
+                }
+            }
         };
         let Some(frame) = frame else {
             return Ok(());
@@ -158,6 +189,7 @@ async fn proxy<S: Transport>(
             return Ok(());
         };
         registered.count_request();
+        served = true;
         let (reply, mut replies) = mpsc::channel(8);
         let id = core.next_id();
         pool.send(Cmd::Submit(Job {

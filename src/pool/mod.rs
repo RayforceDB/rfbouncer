@@ -128,6 +128,10 @@ pub struct Counters {
     /// statistics' buckets: bucket `i` counts those under 2^i µs.
     pub exec_hist: [AtomicU64; BUCKETS],
     pub wait_hist: [AtomicU64; BUCKETS],
+    /// Health checks of idle replica connections: those answered in time,
+    /// and those that were not and cost the connection.
+    pub health_checks_ok: AtomicU64,
+    pub health_checks_failed: AtomicU64,
 }
 
 /// What a pool's tasks share: its name, its counters, the statistics sink.
@@ -200,6 +204,8 @@ pub enum Cmd {
     Submit(Job),
     /// The client of this job sent its cancel byte.
     Cancel(u64),
+    /// The process is about to exit: stop whatever the replicas are running.
+    CancelRunning,
     /// The replica's connection is open.
     Up(usize),
     /// The replica's connection is gone, and why.

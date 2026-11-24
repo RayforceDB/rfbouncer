@@ -455,3 +455,64 @@ fn an_address_that_keeps_failing_is_locked_out_for_a_while() {
     }
     assert_eq!(bouncer.metric("rfbouncer_auth_lockouts_total"), 2.0);
 }
+
+#[test]
+fn a_client_half_way_into_tls_at_a_stop_is_still_served() {
+    let (cert, key) = certificate();
+    let files = Files::new(&cert, &key);
+    let replica = Rayforce::start(&[]);
+    let bouncer = Bouncer::start(&format!("{}{}", files.section(""), pool(&[&replica], OPEN)));
+    // The first flight of a handshake is sent and its answer not yet read
+    // when the stop comes: the bouncer knows no client here, only a
+    // connection it has accepted.
+    let mut roots = rustls::RootCertStore::empty();
+    for der in CertificateDer::pem_slice_iter(cert.as_bytes()) {
+        roots.add(der.unwrap()).unwrap();
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = "localhost".try_into().unwrap();
+    let mut conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+    let mut sock = support::connect(bouncer.port).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    conn.write_tls(&mut sock).unwrap();
+    support::signal(bouncer.pid(), "TERM");
+    eventually("the port is closed", || {
+        support::connect(bouncer.port).is_err()
+    });
+    let mut stream = rustls::StreamOwned::new(conn, sock);
+    while stream.conn.is_handshaking() {
+        stream.conn.complete_io(&mut stream.sock).unwrap();
+    }
+    assert!(greet(&mut stream, ("", "")));
+    send(&mut stream, "(+ 1 2)");
+    assert_eq!(recv(&mut stream), int(3));
+}
+
+#[test]
+fn a_restart_on_shared_ports_hands_over_the_admin_address_too() {
+    let replica = Rayforce::start(&[]);
+    let admin = free_port();
+    let mut old = Bouncer::start_as_is(&format!(
+        "reuse_port = true\nadmin_listen = \"127.0.0.1:{admin}\"\nadmin_password = \"root\"\n{}",
+        pool(&[&replica], OPEN)
+    ));
+    eventually("the admin address answers and the replica is up", || {
+        support::connect(admin).is_ok() && http_get(admin, "/healthz", None).0 == 200
+    });
+    // The new process opens both addresses while the old one holds them.
+    let _new = old.start_beside();
+    support::signal(old.pid(), "TERM");
+    eventually("the old bouncer exited", || old.exited().is_some());
+    // And is alone on both afterwards.
+    eventually("the new bouncer has reached the replica", || {
+        http_get(admin, "/healthz", None).0 == 200
+    });
+    assert_eq!(http_get(admin, "/metrics", Some("root")).0, 200);
+    assert_eq!(Client::connect(old.port).query("(+ 1 2)"), int(3));
+}
