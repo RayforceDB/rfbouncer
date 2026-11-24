@@ -1,0 +1,1 @@
+(select {from: t where: (in id [1 2 3])})  ; first

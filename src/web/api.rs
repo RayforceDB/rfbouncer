@@ -73,7 +73,7 @@ impl Filter {
 
     /// The condition every query of this filter shares: `column` between
     /// `lo` and `hi`, the pool, and the fingerprint where one is asked for.
-    fn condition(&self, column: &str, lo: i64, hi: i64, with_fp: bool, more: &str) -> String {
+    pub fn condition(&self, column: &str, lo: i64, hi: i64, with_fp: bool, more: &str) -> String {
         let mut out = format!("(and (>= {column} {lo}) (<= {column} {hi})");
         if !self.pool.is_empty() {
             out.push_str(&format!(" (== pool (as 'SYMBOL \"{}\"))", self.pool));
@@ -86,7 +86,7 @@ impl Filter {
         out
     }
 
-    fn minutes(&self, with_fp: bool) -> String {
+    pub fn minutes(&self, with_fp: bool) -> String {
         self.condition("minute", self.from / 60, self.to / 60, with_fp, "")
     }
 

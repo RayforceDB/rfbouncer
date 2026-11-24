@@ -416,7 +416,7 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         let bad = |why: String| Err(ConfigError::Invalid(why));
         if self.pool.is_empty() {
             return bad("at least one [[pool]] is required".into());

@@ -1,0 +1,4 @@
+listen = "127.0.0.1:1"
+[[pool]]
+name = "p"
+backends = ["h:1"]

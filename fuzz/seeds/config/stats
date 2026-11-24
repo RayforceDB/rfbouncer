@@ -1,0 +1,18 @@
+listen = "127.0.0.1:5000"
+admin_password = "root"
+max_request_bytes = "16MiB"
+client_idle_timeout = "0"
+[stats]
+rayforce = "127.0.0.1:5100"
+retention_samples = "7d"
+[[pool]]
+name = "main"
+users = ["app"]
+password = "a"
+wire_version = 3
+backends = ["127.0.0.1:1"]
+query_timeout = "30s"
+[[pool]]
+name = "reports"
+default = true
+backends = ["127.0.0.1:2"]

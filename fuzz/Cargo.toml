@@ -1,0 +1,96 @@
+[package]
+name = "rfbouncer-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+rfbouncer = { path = ".." }
+tokio = { version = "1", features = ["rt", "io-util", "time", "net"] }
+toml = "1"
+
+# A workspace of its own: the fuzz targets need a nightly compiler and must
+# not become part of the crate's own build, lints or lock file.
+[workspace]
+
+[profile.release]
+debug = 1
+# The crate's invariants are written as debug assertions and overflow checks;
+# a fuzzer that compiles them out finds less.
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "frame_header"
+path = "fuzz_targets/frame_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_frame"
+path = "fuzz_targets/read_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "greeting"
+path = "fuzz_targets/greeting.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress"
+path = "fuzz_targets/decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value_decode"
+path = "fuzz_targets/value_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_text"
+path = "fuzz_targets/request_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "normalize"
+path = "fuzz_targets/normalize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter"
+path = "fuzz_targets/filter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "admin"
+path = "fuzz_targets/admin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
