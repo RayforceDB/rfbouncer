@@ -69,7 +69,7 @@ pub fn normalize_with(source: &str, symbols: bool) -> (String, u64) {
                 value(&mut out);
             }
             _ => {
-                let end = token_end(bytes, i);
+                let end = char_end(bytes, i).unwrap_or_else(|| token_end(bytes, i));
                 let number = c.is_ascii_digit()
                     || (c == b'-' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit));
                 let symbol = symbols
@@ -132,6 +132,33 @@ fn skip_string(bytes: &[u8], mut i: usize) -> usize {
         }
     }
     bytes.len()
+}
+
+/// The index past a character literal that opens at `i`: `'x'`, whatever
+/// `x` is but a blank or a closing bracket, or `'\x'` with an escape, as
+/// the lexer's `parse_symbol` reads them. Its character may be one that
+/// would end any other token, or open a string or a comment.
+fn char_end(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes[i] != b'\'' {
+        return None;
+    }
+    let at = |j: usize| bytes.get(j).copied();
+    let octal = |j: usize| at(j).is_some_and(|b| (b'0'..=b'7').contains(&b));
+    match at(i + 1)? {
+        b' ' | b'\t' | b'\n' | b')' | b']' | b'}' => None,
+        b'\\' => {
+            at(i + 2)?;
+            // An octal escape is one to three digits; with two digits after
+            // the first that are not both octal, the lexer takes one or two.
+            let len = match (octal(i + 2), octal(i + 3), octal(i + 4)) {
+                (true, true, true) => 3,
+                (true, true, false) => 2,
+                _ => 1,
+            };
+            (at(i + 2 + len) == Some(b'\'')).then_some(i + 3 + len)
+        }
+        _ => (at(i + 2) == Some(b'\'')).then_some(i + 3),
+    }
 }
 
 fn token_end(bytes: &[u8], mut i: usize) -> usize {
@@ -244,6 +271,29 @@ mod tests {
         assert_eq!(s("{from :trades}"), "{from :trades}");
         assert_eq!(s("{side: :buy}"), "{side: ?}");
         assert_eq!(s("(f : 'x)"), "(f : ?)");
+    }
+
+    #[test]
+    fn a_character_may_be_one_that_ends_other_tokens() {
+        // Each is one token, and what follows it is read as before.
+        for c in [
+            "'('", "'['", "'{'", "'\"'", "';'", "'\\''", "'\\n'", "'\\\\'", "'\\101'", "'\\\"'",
+        ] {
+            let source = format!("(split name {c}) ; done\n(+ 1 2)");
+            assert_eq!(n(&source), format!("(split name {c}) (+ ? ?)"), "{c}");
+            assert_eq!(s(&source), "(split name ?) (+ ? ?)", "{c}");
+        }
+        assert_eq!(n("(f 'a'\"s\")"), "(f 'a' ?)");
+        // A blank or a closing bracket after the quote makes it the empty
+        // symbol, as the lexer has it, and not a character.
+        assert_eq!(n("(f ' ' 1)"), "(f ' ' ?)");
+        assert_eq!(n("(g (f ')') 1)"), "(g (f ') ') ?)");
+        // Not closed: a symbol, ended where a token ends.
+        assert_eq!(n("(f 'ab (g 1))"), "(f 'ab (g ?))");
+        assert_eq!(n("(f '\\n (g 1))"), "(f '\\n (g ?))");
+        for cut in ["'", "'(", "'\\", "'\\1", "'\\12", "'\\123"] {
+            let _ = (n(cut), s(cut));
+        }
     }
 
     #[test]
