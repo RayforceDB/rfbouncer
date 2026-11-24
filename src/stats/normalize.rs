@@ -52,7 +52,12 @@ pub fn normalize_with(source: &str, symbols: bool) -> (String, u64) {
                 i += 1;
             }
             b')' | b']' | b'}' => {
-                open.pop();
+                // A closer of another kind closes nothing: in broken
+                // source the brackets that are open stay open. An opener
+                // and its own closer are one or two apart in ASCII.
+                if open.last().is_some_and(|o| o.abs_diff(c) <= 2) {
+                    open.pop();
+                }
                 if c == b']'
                     && let Some((start, only_values, _)) = vectors.pop()
                     && only_values
@@ -147,7 +152,13 @@ fn char_end(bytes: &[u8], i: usize) -> Option<usize> {
     match at(i + 1)? {
         b' ' | b'\t' | b'\n' | b')' | b']' | b'}' => None,
         b'\\' => {
-            at(i + 2)?;
+            // The lexer takes an escaped blank for a character too. Here it
+            // is not one: blanks between two tokens come out as one space,
+            // and `'\`, a blank and a later `'` would then read as a
+            // character in the shape though they were none in the source.
+            if matches!(at(i + 2)?, b' ' | b'\t' | b'\n' | b'\r') {
+                return None;
+            }
             // An octal escape is one to three digits; with two digits after
             // the first that are not both octal, the lexer takes one or two.
             let len = match (octal(i + 2), octal(i + 3), octal(i + 4)) {

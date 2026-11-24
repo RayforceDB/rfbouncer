@@ -9,9 +9,9 @@ use std::time::Duration;
 use proptest::collection::vec;
 use proptest::prelude::*;
 use rfbouncer::config::{parse_duration, parse_size};
-use rfbouncer::stats::normalize::normalize;
+use rfbouncer::stats::normalize::{normalize, normalize_with};
 use rfbouncer::stats::store::{BUCKETS, bucket, quantile};
-use rfbouncer::wire::compress::{decompress, decompress_prefix};
+use rfbouncer::wire::compress::{compress, decompress, decompress_prefix};
 use rfbouncer::wire::value::{Column, Value, decode, table};
 
 // ---- the normalizer ----
@@ -169,67 +169,29 @@ proptest! {
     }
 
     #[test]
-    fn a_shape_is_its_own_shape_and_no_longer_than_its_source(text in any_text()) {
-        let (normal, _) = normalize(&text);
+    fn a_shape_is_its_own_shape_and_no_longer_than_its_source(text in any_text(), symbols in any::<bool>()) {
+        let (normal, _) = normalize_with(&text, symbols);
         // A placeholder or a space for each byte of the source at the most.
         prop_assert!(normal.len() <= 2 * text.len(), "{:?} -> {:?}", text, normal);
-        prop_assert!(!normal.contains(['"', ';', '\n', '\r', '\t']));
-        prop_assert_eq!(normalize(&normal).0, normal);
+        prop_assert_eq!(normalize_with(&normal, symbols).0, normal);
     }
 
     #[test]
-    fn a_written_query_keeps_every_name_and_no_value(tree in node(), seed in any::<u64>()) {
-        let source = write(&tree, seed, &[1]);
-        let (normal, _) = normalize(&source);
-        let mut all = Vec::new();
-        tokens(&tree, &mut std::iter::repeat(seed), &mut all);
-        let names: Vec<&String> = all.iter().filter(|t| !t.starts_with(|c: char| c.is_ascii_digit() || "-\"()[]{}".contains(c))).collect();
-        let kept: Vec<&str> = normal
-            .split(|c: char| " ()[]{}".contains(c))
-            .filter(|w| !w.is_empty() && *w != "?")
-            .collect();
-        prop_assert_eq!(kept, names, "{:?} -> {:?}", source, normal);
+    fn values_and_spacing_do_not_change_the_fingerprint_with_symbols_as_values(
+        tree in node(),
+        (seed_a, seed_b) in any::<(u64, u64)>(),
+        (spacing_a, spacing_b) in (vec(any::<u8>(), 1..12), vec(any::<u8>(), 1..12)),
+    ) {
+        let a = write(&tree, seed_a, &spacing_a);
+        let b = write(&tree, seed_b, &spacing_b);
+        prop_assert_eq!(normalize_with(&a, true), normalize_with(&b, true), "{:?} and {:?}", a, b);
+        // Taking symbols for values only ever takes more for a value.
+        let (kept, taken) = (normalize(&a).0, normalize_with(&a, true).0);
+        prop_assert!(taken.len() <= kept.len(), "{:?} -> {:?} and {:?}", a, kept, taken);
     }
 }
 
 // ---- compression ----
-
-/// A writer for the stream `decompress` reads, after `ray_ipc_compress` in
-/// rayforce's `src/core/ipc.c`: the size, then the bytes as deltas, in runs
-/// and literal stretches. `cuts` chooses where each stretch ends and of
-/// which kind it is, so one payload is written in many ways.
-fn compress(plain: &[u8], cuts: &[u8]) -> Vec<u8> {
-    let mut out = (plain.len() as u32).to_le_bytes().to_vec();
-    let mut before = 0u8;
-    let deltas: Vec<u8> = plain
-        .iter()
-        .map(|b| {
-            let delta = b.wrapping_sub(before);
-            before = *b;
-            delta
-        })
-        .collect();
-    let mut cuts = cuts.iter().cycle();
-    let mut at = 0;
-    while at < deltas.len() {
-        let cut = usize::from(cuts.next().copied().unwrap_or(0));
-        let run = deltas[at..]
-            .iter()
-            .take_while(|d| **d == deltas[at])
-            .count();
-        if cut % 2 == 0 {
-            let n = run.min(cut / 2 % 127 + 1);
-            out.extend([n as u8, deltas[at]]);
-            at += n;
-        } else {
-            let n = (deltas.len() - at).min(cut / 2 % 128 + 1);
-            out.push((n as u8).wrapping_neg());
-            out.extend(&deltas[at..at + n]);
-            at += n;
-        }
-    }
-    out
-}
 
 /// Payloads with stretches that repeat and stretches that climb evenly, as
 /// vectors of numbers have, and plain noise.
@@ -251,21 +213,33 @@ fn payload() -> impl Strategy<Value = Vec<u8>> {
 
 proptest! {
     #[test]
-    fn what_is_compressed_decompresses_to_itself(plain in payload(), cuts in vec(any::<u8>(), 1..16)) {
-        let wire = compress(&plain, &cuts);
+    fn what_is_compressed_decompresses_to_itself(plain in payload()) {
+        // The compressor declines what it cannot make smaller, as the
+        // server does; what it takes must come back whole.
+        let Some(wire) = compress(&plain) else { return Ok(()) };
+        prop_assert!(wire.len() < plain.len());
         prop_assert_eq!(decompress(&wire, plain.len()), Ok(plain.clone()));
         // One byte under its size it is refused before anything is read.
         prop_assert!(decompress(&wire, plain.len() - 1).is_err());
     }
 
     #[test]
+    fn what_repeats_is_made_smaller(byte in any::<u8>(), step in any::<u8>(), len in 8usize..3000) {
+        // A constant stretch and an evenly climbing one are both runs of
+        // one delta: about two bytes for every 127.
+        let plain: Vec<u8> = (0..len).map(|i| byte.wrapping_add(step.wrapping_mul(i as u8))).collect();
+        let wire = compress(&plain).expect("runs compress");
+        prop_assert!(wire.len() <= 4 + 2 + 2 * len.div_ceil(127), "{} bytes for {}", wire.len(), len);
+        prop_assert_eq!(decompress(&wire, len), Ok(plain));
+    }
+
+    #[test]
     fn the_start_of_a_payload_is_the_start_of_the_whole(
         plain in payload(),
-        cuts in vec(any::<u8>(), 1..16),
         limit in 0usize..2000,
         cut in any::<prop::sample::Index>(),
     ) {
-        let wire = compress(&plain, &cuts);
+        let Some(wire) = compress(&plain) else { return Ok(()) };
         let start = decompress_prefix(&wire, limit);
         prop_assert_eq!(&start[..], &plain[..limit.min(plain.len())]);
         // Broken off anywhere, it gives a start of the whole and no more.
@@ -449,4 +423,27 @@ fn counts_too_large_to_sum_still_have_a_quantile() {
     hist[9] = 2;
     assert_eq!(quantile(&hist, 0.5), 8);
     assert_eq!(quantile(&[u64::MAX; BUCKETS], 0.99), 1);
+}
+
+#[test]
+fn a_closer_of_another_kind_does_not_end_a_vector() {
+    // Found by `a_shape_is_its_own_shape_and_no_longer_than_its_source`
+    // with symbols taken for values: the `}` closed the inner `[` for the
+    // purpose of telling names from symbols, so `a` was kept as a name, and
+    // the shape that came out was not its own shape.
+    let (shape, _) = normalize_with("[\"\"[}]a", true);
+    assert_eq!(shape, "[? [?] ?");
+    assert_eq!(normalize_with(&shape, true).0, shape);
+}
+
+#[test]
+fn blanks_that_become_one_space_do_not_make_a_character() {
+    // Found by the `normalize` fuzz target: a symbol named by a backslash,
+    // blanks, and a later quote. With the blanks brought down to one space
+    // the shape read as the character `'\ '`, and was not its own shape.
+    for symbols in [false, true] {
+        let (shape, _) = normalize_with("v '\\\r\r\r'\\\r\r x", symbols);
+        assert_eq!(normalize_with(&shape, symbols).0, shape, "{shape:?}");
+    }
+    assert_eq!(normalize("(f '\\  '\\ y)").0, "(f '\\ '\\ y)");
 }
