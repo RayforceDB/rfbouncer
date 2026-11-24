@@ -77,6 +77,11 @@ max_fingerprints_per_minute = 2000
 # name many distinct symbols. The table after from:, the columns after by:,
 # asc: and desc:, and a function's parameters stay.
 normalize_symbols = false
+# A directory on the store's host where the store keeps the days that are
+# over, so that only the current day is in its memory. Reports read both.
+# Nothing there is ever deleted: remove old days' directories yourself. Not
+# set by default, and then everything stays in memory.
+# disk = "/var/lib/rfbouncer/days"
 
 [[pool]]
 name = "main"

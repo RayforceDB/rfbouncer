@@ -67,6 +67,22 @@ impl Stats {
         }
     }
 
+    /// The directory the store keeps days that are over in, if it has one.
+    pub fn disk(&self) -> Option<&str> {
+        self.cfg.as_ref()?.disk.as_deref()
+    }
+
+    /// The last day the store has on disk, in days since 1970.
+    pub async fn disk_day(&self) -> Result<Option<i64>, String> {
+        let Some(root) = self.disk() else {
+            return Ok(None);
+        };
+        Ok(match self.query(&store::disk_day(root)).await? {
+            Value::I64(day) if day >= 0 => Some(day),
+            _ => None,
+        })
+    }
+
     /// Has everything reported so far written to the store, waiting five
     /// seconds at most.
     pub async fn flush(&self) {

@@ -131,6 +131,85 @@ fn schema() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// The tables with a row a minute: what the store keeps on disk by the day
+/// when it is given a directory. `rfb_agg` is last, as it is written last:
+/// a day counts as on disk once it is there.
+const BY_MINUTE: [&str; 6] = [
+    "rfb_backend",
+    "rfb_client",
+    "rfb_status",
+    "rfb_fp_client",
+    "rfb_fp_backend",
+    "rfb_agg",
+];
+
+/// The days of `table` under `root`, as one table with the day in `part`.
+/// Mounted where it is asked for and never bound to a name: a name's value
+/// goes into the store's journal and snapshots, and this one is the disk.
+pub fn on_disk(root: &str, table: &str) -> String {
+    format!("(.db.parted.get \"{root}\" '{table})")
+}
+
+/// The last day on disk, in days since 1970, or -1 with none. It is read
+/// off the directory each time, so there is nothing in the store's memory
+/// that could come to disagree with it.
+pub fn disk_day(root: &str) -> String {
+    format!(
+        "(try (max (at {} 'part)) (fn [e] -1))",
+        on_disk(root, "rfb_agg")
+    )
+}
+
+/// Moves the days that are over from the store's memory to `root`, a
+/// directory per day and in it a splayed table per table, which is the
+/// layout `.db.parted.get` reads.
+///
+/// A day is written once, by whichever bouncer asks first: the store
+/// evaluates one message at a time, and the message looks at the disk
+/// before it writes. After that the day is the disk's, and memory lets go
+/// of every row of it.
+async fn archive(conn: &mut Conn, root: &str) -> Result<(), String> {
+    // A day is over an hour after it ended: that long is left for another
+    // bouncer's clock and for its last write.
+    let over = unix(SystemTime::now()).as_secs().saturating_sub(3600) / 86_400;
+    let held = Rows::of(
+        conn.eval(&format!(
+            "(select {{from: rfb_agg where: (< minute {}) by: {{d: (div minute 1440)}} n: (count minute)}})",
+            over * 1440
+        ))
+        .await?,
+    )?;
+    let mut days: Vec<u64> = (0..held.len()).map(|row| held.int("d", row)).collect();
+    days.sort_unstable();
+    let last = disk_day(root);
+    for day in &days {
+        let writes: String = BY_MINUTE
+            .iter()
+            .map(|t| {
+                format!(
+                    " (.db.splayed.set \"{root}/{day}/{t}\" (select {{from: {t} where: (== (div minute 1440) {day})}}) \"{root}/.sym\")"
+                )
+            })
+            .collect();
+        conn.eval(&format!("(if (> {day} {last}) (do{writes} 0) 0)"))
+            .await?;
+    }
+    if !days.is_empty() {
+        if !matches!(conn.eval(&last).await?, Value::I64(0..)) {
+            return Err(format!(
+                "the days under {root} cannot be read: a day's directory without rfb_agg has to be removed"
+            ));
+        }
+        for table in BY_MINUTE {
+            conn.eval(&format!(
+                "(delete {{from: '{table} where: (< minute (* 1440 (+ 1 {last})))}})"
+            ))
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Makes the tables that are not there yet, and refuses a store whose
 /// tables are of another layout than this build writes.
 pub async fn ensure_schema(conn: &mut Conn) -> Result<(), String> {
@@ -377,6 +456,14 @@ impl Writer {
         if self.conn.is_none() {
             let mut conn = Conn::open(&self.cfg).await?;
             ensure_schema(&mut conn).await?;
+            // Here as well as every hour: a store that went down while a day
+            // was being moved comes back with it in both places.
+            // Failing at it is no reason not to count: the days stay in memory.
+            if let Some(root) = &self.cfg.disk
+                && let Err(e) = archive(&mut conn, root).await
+            {
+                tracing::error!(error = %e, "statistics: cannot move days to disk");
+            }
             let known = Rows::of(conn.eval("(select {from: rfb_fp fp: fp})").await?)?;
             self.known = (0..known.len()).map(|row| known.int("fp", row)).collect();
             self.conn = Some(conn);
@@ -759,6 +846,13 @@ impl Writer {
         let now = unix(SystemTime::now());
         let aggregates = now.saturating_sub(self.cfg.retention_aggregates).as_secs() / 60;
         let samples = now.saturating_sub(self.cfg.retention_samples).as_millis();
+        // The shapes of the days on disk are in use as well.
+        let on_disk = self.cfg.disk.as_ref().map_or_else(String::new, |root| {
+            format!(
+                " (try (distinct (at {} 'fp)) (fn [e] (as 'I64 [])))",
+                on_disk(root, "rfb_agg")
+            )
+        });
         let statements = [
             format!("(delete {{from: 'rfb_agg where: (< minute {aggregates})}})"),
             format!("(delete {{from: 'rfb_backend where: (< minute {aggregates})}})"),
@@ -767,16 +861,20 @@ impl Writer {
             format!("(delete {{from: 'rfb_fp_client where: (< minute {aggregates})}})"),
             format!("(delete {{from: 'rfb_fp_backend where: (< minute {aggregates})}})"),
             format!("(delete {{from: 'rfb_sample where: (< ts {samples})}})"),
-            "(set rfb_live_agg (at rfb_agg 'fp))".to_owned(),
+            format!("(set rfb_live_agg (concat (at rfb_agg 'fp){on_disk}))"),
             "(set rfb_live_sample (at rfb_sample 'fp))".to_owned(),
             "(delete {from: 'rfb_fp where: (and (not (in fp rfb_live_agg)) (not (in fp rfb_live_sample)))})".to_owned(),
             "(select {from: rfb_fp fp: fp})".to_owned(),
         ];
         let result: Result<(), String> = async {
+            let disk = self.cfg.disk.clone();
             let conn = self.conn().await?;
             let mut last = Value::Other;
             for statement in &statements {
                 last = conn.eval(statement).await?;
+            }
+            if let Some(root) = &disk {
+                archive(conn, root).await?;
             }
             let known = Rows::of(last)?;
             self.known = (0..known.len()).map(|row| known.int("fp", row)).collect();

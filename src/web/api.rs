@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::stats::Stats;
-use crate::stats::store::{BUCKETS, COUNTERS, Rows, quantile};
+use crate::stats::store::{BUCKETS, COUNTERS, Rows, on_disk, quantile};
 
 /// The year 2100, in Unix seconds.
 const MAX_TIME: i64 = 4_102_444_800;
@@ -28,6 +28,8 @@ pub struct Filter {
     pub fp: Option<u64>,
     pub sort: String,
     pub limit: usize,
+    /// The last day the store keeps on disk, where it keeps any there.
+    pub disk_day: Option<i64>,
 }
 
 impl Filter {
@@ -99,6 +101,35 @@ impl Filter {
             ..self.clone()
         }
     }
+}
+
+/// What `select` gives over `table`: over the rows in the store's memory
+/// and, where the range reaches a day kept on disk, over the days there. A
+/// day is in one of the two, so the caller adds the answers up. `select` is
+/// given what to select from and the condition.
+async fn from_both(
+    stats: &Stats,
+    f: &Filter,
+    table: &str,
+    with_fp: bool,
+    select: impl Fn(&str, &str) -> String,
+) -> Result<Vec<Rows>, String> {
+    let condition = f.minutes(with_fp);
+    let mut out = vec![Rows::of(stats.query(&select(table, &condition)).await?)?];
+    if let Some((root, last)) = stats.disk().zip(f.disk_day)
+        && f.from.div_euclid(86_400) <= last
+    {
+        // The day is the directory's name: a bound on it is what keeps the
+        // other days' files from being read.
+        let condition = format!(
+            "(and (>= part {}) (<= part {}) {condition})",
+            f.from.div_euclid(86_400),
+            f.to.div_euclid(86_400)
+        );
+        let source = select(&on_disk(root, table), &condition);
+        out.push(Rows::of(stats.query(&source).await?)?);
+    }
+    Ok(out)
 }
 
 #[derive(Default, Clone)]
@@ -189,13 +220,12 @@ async fn summed(stats: &Stats, f: &Filter, key: &str) -> Result<Vec<(i64, Acc)>,
     for i in 0..BUCKETS {
         columns.push_str(&format!(" s_h{i}: (sum h{i}) s_w{i}: (sum w{i})"));
     }
-    let source = format!(
-        "(select {{from: rfb_agg where: {} by: {{k: {key}}}{columns}}})",
-        f.minutes(true)
-    );
-    let rows = Rows::of(stats.query(&source).await?)?;
-    Ok((0..rows.len())
-        .map(|row| {
+    let select = |from: &str, condition: &str| {
+        format!("(select {{from: {from} where: {condition} by: {{k: {key}}}{columns}}})")
+    };
+    let mut sums: BTreeMap<i64, Acc> = BTreeMap::new();
+    for rows in from_both(stats, f, "rfb_agg", true, select).await? {
+        for row in 0..rows.len() {
             let mut acc = Acc::default();
             for (slot, name) in acc.counters.iter_mut().zip(COUNTERS) {
                 *slot = rows.int(&format!("s_{name}"), row);
@@ -206,9 +236,10 @@ async fn summed(stats: &Stats, f: &Filter, key: &str) -> Result<Vec<(i64, Acc)>,
             for (i, slot) in acc.wait_hist.iter_mut().enumerate() {
                 *slot = rows.int(&format!("s_w{i}"), row);
             }
-            (rows.int("k", row) as i64, acc)
-        })
-        .collect())
+            sums.entry(rows.int("k", row) as i64).or_default().add(&acc);
+        }
+    }
+    Ok(sums.into_iter().collect())
 }
 
 /// The whole range as one row, and as a series of at most `POINTS` steps.
@@ -244,14 +275,16 @@ async fn series(stats: &Stats, f: &Filter) -> Result<Value, String> {
 /// `cancel`, `timeout`, `busy` and `io`, and every error code a replica
 /// raised.
 async fn outcomes(stats: &Stats, f: &Filter) -> Result<Value, String> {
-    let source = format!(
-        "(select {{from: rfb_status where: {} by: status n: (sum count)}})",
-        f.minutes(false)
-    );
-    let rows = Rows::of(stats.query(&source).await?)?;
-    let mut list: Vec<(String, u64)> = (0..rows.len())
-        .map(|row| (rows.text("status", row), rows.int("n", row)))
-        .collect();
+    let select = |from: &str, condition: &str| {
+        format!("(select {{from: {from} where: {condition} by: status n: (sum count)}})")
+    };
+    let mut sums: BTreeMap<String, u64> = BTreeMap::new();
+    for rows in from_both(stats, f, "rfb_status", false, select).await? {
+        for row in 0..rows.len() {
+            *sums.entry(rows.text("status", row)).or_default() += rows.int("n", row);
+        }
+    }
+    let mut list: Vec<(String, u64)> = sums.into_iter().collect();
     list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     Ok(list
         .into_iter()
@@ -400,28 +433,34 @@ async fn grouped_rows(
     table: &str,
     with_fp: bool,
 ) -> Result<Vec<Value>, String> {
-    let source = format!(
-        "(select {{from: {table} where: {} by: [pool who] n: (sum count) e: (sum errors) d: (sum dur_sum)}})",
-        f.minutes(with_fp)
-    );
-    let rows = Rows::of(stats.query(&source).await?)?;
-    let mut order: Vec<usize> = (0..rows.len()).collect();
-    order.sort_by_key(|row| {
-        (
-            std::cmp::Reverse(rows.int("n", *row)),
-            rows.text("who", *row),
+    let select = |from: &str, condition: &str| {
+        format!(
+            "(select {{from: {from} where: {condition} by: [pool who] n: (sum count) e: (sum errors) d: (sum dur_sum)}})"
         )
-    });
+    };
+    // Per pool and name: requests, those not ok, and time.
+    let mut sums: BTreeMap<(String, String), [u64; 3]> = BTreeMap::new();
+    for rows in from_both(stats, f, table, with_fp, select).await? {
+        for row in 0..rows.len() {
+            let sum = sums
+                .entry((rows.text("pool", row), rows.text("who", row)))
+                .or_default();
+            for (slot, name) in sum.iter_mut().zip(["n", "e", "d"]) {
+                *slot += rows.int(name, row);
+            }
+        }
+    }
+    let mut order: Vec<_> = sums.into_iter().collect();
+    order.sort_by(|a, b| b.1[0].cmp(&a.1[0]).then_with(|| a.0.1.cmp(&b.0.1)));
     let listed: Vec<Value> = order
         .into_iter()
         .take(f.limit)
-        .map(|row| {
-            let (count, dur) = (rows.int("n", row), rows.int("d", row));
+        .map(|((pool, name), [count, not_ok, dur])| {
             json!({
-                "pool": rows.text("pool", row),
-                "name": rows.text("who", row),
+                "pool": pool,
+                "name": name,
                 "count": count,
-                "not_ok": rows.int("e", row),
+                "not_ok": not_ok,
                 "total_ms": ms(dur),
                 "avg_ms": if count == 0 { 0.0 } else { ms(dur) / count as f64 },
             })

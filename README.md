@@ -26,7 +26,8 @@ speaks 4. Set `wire_version` to the one your replicas speak; the default is 4.
 
 - On Linux a client's cancel is passed on as it arrives. Elsewhere the
   socket is asked every 20 ms, so it is up to 20 ms late.
-- The statistics store keeps everything in memory.
+- The statistics store keeps everything in memory, unless it is given a
+  directory for the days that are over (`disk` under `[stats]`).
 - TLS is there to be turned on, and is off until `[tls]` is set: without it
   the admin password and the report pages travel in the clear.
 
@@ -434,7 +435,8 @@ While the store is away, requests are served as before, the reports answer
 `502`, and the minute being filled waits in memory; a store that stays away
 past the end of a minute costs that minute.
 
-Sizing. Everything the store holds is in memory, about 400 bytes a row of
+Sizing. Everything the store holds is in memory (of the current day only,
+with `disk` set: see [Days on disk](#days-on-disk)), about 650 bytes a row of
 `rfb_agg`, one row a minute for each query shape seen in it. Names and
 symbols are part of a shape, so `(== sym 'AAPL)` and `(== sym 'MSFT)` are two:
 a workload with many distinct symbols has many shapes, unless
@@ -444,6 +446,46 @@ each. The journal grows with
 every row written, and only rows that changed are written. Lower
 `retention_aggregates` or `max_fingerprints_per_minute` if either is too
 much.
+
+### Days on disk
+
+With `disk = "/var/lib/rfbouncer/days"` under `[stats]` the store keeps only
+the current day in memory. The path is on the store's host, and the store
+writes there, not the bouncer. An hour after a day ended (UTC), the bouncer
+has the store write that day's rows to `<disk>/<day>/<table>`, a splayed
+table for each of `rfb_agg`, `rfb_status`, `rfb_backend`, `rfb_client`,
+`rfb_fp_client` and `rfb_fp_backend`, and drop them from memory. `<day>` is
+the number of days since 1970. It is the layout Rayforce reads as one table
+partitioned by day:
+
+```lisp
+(select {from: (.db.parted.get "/var/lib/rfbouncer/days" 'rfb_agg)
+         where: (>= part 20000) by: part n: (sum count)})
+```
+
+A report whose range reaches back to a day on disk asks both and adds the
+answers up; one of today asks memory alone. Days are moved when a bouncer
+connects to the store and every hour after; with several bouncers on one
+store, whichever asks first moves a day and the others find it done.
+
+What to know before turning it on:
+
+- **Nothing on disk is ever deleted.** Rayforce has no function that removes
+  a file, so `retention_aggregates` applies to memory only. Remove the
+  directories of days you no longer want, oldest first, with a cron job.
+- `rfb_fp` and `rfb_sample` stay in memory: they are small, and a sample is
+  looked up by its time, not its day.
+- A day on disk is final. Rows of it that reach the store later, from a
+  bouncer that could not reach the store for over an hour around midnight,
+  are dropped.
+- A day is written in one message to the store, which answers nothing else
+  meanwhile. A bouncer gives the store ten seconds to answer and logs an
+  error past that; a day that was not finished is written again the next
+  hour.
+- If the store dies while writing a day and has no journal to bring the day
+  back from, the day's directory is left without `rfb_agg` and no day on
+  disk can be read until that directory is removed. The bouncer logs
+  `the days under ... cannot be read`.
 
 ## Compression
 

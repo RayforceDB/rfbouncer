@@ -206,6 +206,10 @@ async fn report(core: &Arc<Core>, what: String, filter: Filter) -> Reply {
     }
     // A report is of everything that has ended, the last seconds included.
     stats.flush().await;
+    let mut filter = filter;
+    // Asked once for the whole report. A store that cannot be asked fails
+    // the report's own queries just below.
+    filter.disk_day = stats.disk_day().await.unwrap_or(None);
     let answer = match what.as_str() {
         "overview" => api::overview(stats, &filter).await,
         "top" => api::top(stats, &filter).await,

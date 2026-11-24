@@ -455,3 +455,123 @@ fn a_store_of_the_layout_before_is_refused_in_so_many_words() {
             .is_some()
     );
 }
+
+#[test]
+fn days_that_are_over_are_kept_on_disk_and_still_reported() {
+    let replica = Rayforce::start(&[]);
+    let root = std::env::temp_dir().join(format!("rfbouncer-disk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let journal = root.with_extension("journal");
+    let _ = std::fs::remove_dir_all(&journal);
+    std::fs::create_dir_all(&journal).unwrap();
+    let journal = journal.join("log").display().to_string();
+    let mut store = Rayforce::start(&["-L", &journal]);
+    let body = format!(
+        "admin_password = \"root\"\n[stats]\nrayforce = \"{}\"\ndisk = \"{}\"\n{}",
+        store.addr(),
+        root.display(),
+        pool(&[&replica], "require_restricted = false")
+    );
+    let bouncer = Bouncer::start(&body);
+    let mut c = Client::connect(bouncer.port);
+    for i in 0..4 {
+        assert_eq!(c.query(&format!("(+ {i} 1)")), int(i + 1));
+    }
+    assert_eq!(c.query_error("(nosuch 1)"), Some("name".to_owned()));
+    let ever = "from=0&to=4102444800";
+    let overview = http_json(bouncer.port, &format!("/api/overview?{ever}"), "root");
+    assert_eq!(overview["total"]["count"], 5);
+
+    // The same requests three days ago, as if the store had been running.
+    let mut direct = Client::connect(store.port);
+    for (table, keys) in [
+        ("rfb_agg", 4),
+        ("rfb_status", 4),
+        ("rfb_client", 4),
+        ("rfb_backend", 4),
+        ("rfb_fp_client", 5),
+        ("rfb_fp_backend", 5),
+    ] {
+        direct.query(&format!(
+            "(upsert '{table} {keys} (update {{from: {table} minute: (- minute 4320)}}))"
+        ));
+    }
+    assert_eq!(direct.query("(sum (at rfb_agg 'count))"), int(10));
+
+    // A bouncer moves them when it comes to the store.
+    drop(bouncer);
+    let bouncer = Bouncer::start(&body);
+    assert_eq!(Client::connect(bouncer.port).query("(+ 9 9)"), int(18));
+    let report = |what: &str| http_json(bouncer.port, &format!("/api/{what}?{ever}"), "root");
+    let overview = report("overview");
+    assert_eq!(overview["total"]["count"], 11, "{overview}");
+    assert_eq!(overview["total"]["errors"], 2);
+    assert_eq!(direct.query("(sum (at rfb_agg 'count))"), int(6));
+    assert_eq!(direct.query("(sum (at rfb_fp_client 'count))"), int(6));
+    let days: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .filter_map(|e| e.unwrap().file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    assert_eq!(days.len(), 1, "{days:?}");
+    assert!(root.join(&days[0]).join("rfb_agg").is_dir());
+
+    // Every report adds the two up.
+    let top = report("top");
+    let plus = row(&top, "(+ ? ?)");
+    assert_eq!(plus["count"], 9, "{top}");
+    let count_of = |outcomes: &Value, status: &str| {
+        let found = outcomes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["status"] == status);
+        found.map_or(0, |o| o["count"].as_u64().unwrap())
+    };
+    assert_eq!(count_of(&overview["outcomes"], "name"), 2);
+    assert_eq!(report("clients")["rows"][0]["count"], 11);
+    assert_eq!(report("backends")["rows"][0]["count"], 11);
+    let one = http_json(
+        bouncer.port,
+        &format!("/api/query?{ever}&fp={}", plus["fp"].as_str().unwrap()),
+        "root",
+    );
+    assert_eq!(one["total"]["count"], 9);
+    assert_eq!(one["clients"][0]["count"], 9);
+    // A range that ends before today is all from disk, one that begins
+    // today all from memory.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let old = http_json(
+        bouncer.port,
+        &format!("/api/overview?from=0&to={}", now - 2 * 86_400),
+        "root",
+    );
+    assert_eq!(old["total"]["count"], 5, "{old}");
+    assert_eq!(
+        http_json(bouncer.port, "/api/overview", "root")["total"]["count"],
+        6
+    );
+
+    // The day is written once: a bouncer that comes later leaves it alone.
+    drop(bouncer);
+    let bouncer = Bouncer::start(&body);
+    assert_eq!(Client::connect(bouncer.port).query("(+ 9 9)"), int(18));
+    let overview = http_json(bouncer.port, &format!("/api/overview?{ever}"), "root");
+    assert_eq!(overview["total"]["count"], 12, "{overview}");
+
+    // A store that comes back from its journal has each day in one place.
+    let port = store.port;
+    drop(direct);
+    store.kill();
+    let _back = Rayforce::start_on(port, &["-L", &journal]);
+    assert_eq!(Client::connect(bouncer.port).query("(+ 9 9)"), int(18));
+    support::eventually("the store is back with every request once", || {
+        let (status, body) = http_get(bouncer.port, &format!("/api/overview?{ever}"), Some("root"));
+        status == 200 && serde_json::from_str::<Value>(&body).unwrap()["total"]["count"] == 13
+    });
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(root.with_extension("journal"));
+}

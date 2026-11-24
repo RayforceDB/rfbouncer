@@ -121,6 +121,9 @@ pub struct StatsConfig {
     /// Replace symbols with `?` in a query's shape, as other values are.
     #[serde(default)]
     pub normalize_symbols: bool,
+    /// A directory on the store's host where it keeps the days that are
+    /// over, off its memory. Without it everything stays in memory.
+    pub disk: Option<String>,
 }
 
 impl Default for StatsConfig {
@@ -134,6 +137,7 @@ impl Default for StatsConfig {
             retention_samples: days_7(),
             max_fingerprints_per_minute: default_fingerprints(),
             normalize_symbols: false,
+            disk: None,
         }
     }
 }
@@ -432,6 +436,16 @@ impl Config {
                     .into(),
             );
         }
+        // The path is written into the source the store evaluates.
+        if let Some(disk) = &self.stats.disk
+            && (!disk.starts_with('/')
+                || disk.contains(['"', '\\'])
+                || disk.contains(char::is_control))
+        {
+            return bad(format!(
+                "[stats] disk {disk:?}: expected an absolute path without quotes or backslashes"
+            ));
+        }
         if self.pool.iter().filter(|p| p.default).count() > 1 {
             return bad("only one pool may be the default".into());
         }
@@ -636,6 +650,15 @@ mod tests {
         assert!(config(&format!("auth_lockout_period = \"0\"\n{TWO}")).is_err());
         let off = format!("auth_lockout_failures = 0\nauth_lockout_period = \"0\"\n{TWO}");
         assert!(config(&off).is_ok());
+        for disk in ["relative/path", "/a\\\"b", "/a\\\\b", "/a\\nb"] {
+            let stats = format!(
+                "[stats]\n        disk = \"{disk}\"\n        [[pool]]\n        name = \"main\""
+            );
+            assert!(
+                config(&TWO.replace("[[pool]]\n        name = \"main\"", &stats)).is_err(),
+                "{disk}"
+            );
+        }
         assert!(
             config(&TWO.replace(
                 "[[pool]]\n        name = \"main\"",
