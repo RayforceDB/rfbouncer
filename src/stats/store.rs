@@ -13,7 +13,7 @@ use tokio::time::Instant;
 
 use super::Msg;
 use super::event::{Event, Outcome};
-use super::normalize::normalize;
+use super::normalize::normalize_with;
 use super::rf::Conn;
 use crate::config::StatsConfig;
 use crate::pool::{binary_fingerprint, request_source, request_text};
@@ -31,9 +31,14 @@ const SLOW_PER_HOUR: usize = 20;
 const ERRORS_PER_MINUTE: usize = 20;
 /// Where requests past `max_fingerprints_per_minute` are counted.
 const OTHER: (u64, &str) = (0, "<other queries>");
+/// Where a query shape's requests are counted once the minute holds
+/// `max_fingerprints_per_minute` pairs of a shape and a client, or of a
+/// shape and a replica.
+const OTHER_WHO: &str = "<other>";
 
 /// The counters of a row of `rfb_agg`, in column order, after its key
-/// (minute, pool, fp, src) and before its histogram (h0..h31).
+/// (minute, pool, fp, src) and before its histograms: of the time in the
+/// replica (h0..h31), then of the wait for one (w0..w31).
 pub const COUNTERS: [&str; 13] = [
     "count",
     "errors",
@@ -74,18 +79,30 @@ fn schema() -> Vec<(&'static str, String)> {
     let int = "(as 'I64 [])";
     let sym = "(as 'SYMBOL [])";
     let make = |names: &[String], types: &[&str]| {
-        format!("(table [{}] (list {}))", names.join(" "), types.join(" "))
+        // Rayforce 3.0 calls a function with 64 arguments at most, and
+        // `rfb_agg` has more columns than that: its list is made in parts.
+        let columns = types
+            .chunks(60)
+            .map(|part| format!("(list {})", part.join(" ")))
+            .reduce(|all, part| format!("(concat {all} {part})"))
+            .unwrap_or_default();
+        format!("(table [{}] {columns})", names.join(" "))
     };
     let own = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
 
     let mut agg = own(&["minute", "pool", "fp", "src"]);
     agg.extend(COUNTERS.iter().map(|c| (*c).to_owned()));
     agg.extend((0..BUCKETS).map(|i| format!("h{i}")));
+    agg.extend((0..BUCKETS).map(|i| format!("w{i}")));
     let mut agg_types = vec![int, sym, int, sym];
     agg_types.resize(agg.len(), int);
 
     let small = own(&["minute", "pool", "who", "src", "count", "errors", "dur_sum"]);
     let status = own(&["minute", "pool", "status", "src", "count"]);
+    let by_fp = own(&[
+        "minute", "pool", "fp", "who", "src", "count", "errors", "dur_sum",
+    ]);
+    let by_fp_types = [int, sym, int, sym, sym, int, int, int];
     let sample = own(&[
         "kind", "pool", "bucket", "slot", "src", "ts", "fp", "dur", "wait", "backend", "client",
         "status", "text",
@@ -109,6 +126,8 @@ fn schema() -> Vec<(&'static str, String)> {
             make(&own(&["fp", "first_seen", "text"]), &[int, int, "(list)"]),
         ),
         ("rfb_sample", make(&sample, &sample_types)),
+        ("rfb_fp_client", make(&by_fp, &by_fp_types)),
+        ("rfb_fp_backend", make(&by_fp, &by_fp_types)),
     ]
 }
 
@@ -118,15 +137,19 @@ pub async fn ensure_schema(conn: &mut Conn) -> Result<(), String> {
     for (name, empty) in schema() {
         if conn.eval(&format!("(count {name})")).await.is_err() {
             conn.eval(&format!("(set {name} {empty})")).await?;
-        } else if name != "rfb_fp"
-            && conn
-                .eval(&format!("(count (at {name} 'src))"))
+        } else if name != "rfb_fp" {
+            // The column each layout so far added to the table: a store made
+            // before any of them is told here, not by a failed write later.
+            let newest = if name == "rfb_agg" { "w0" } else { "src" };
+            if conn
+                .eval(&format!("(count (at {name} '{newest}))"))
                 .await
                 .is_err()
-        {
-            return Err(format!(
-                "{name} is of an older layout: start an empty store, or delete the rfb_ tables in this one"
-            ));
+            {
+                return Err(format!(
+                    "{name} is of an older layout (it has no column {newest}): start an empty store, or delete the rfb_ tables in this one"
+                ));
+            }
         }
     }
     Ok(())
@@ -160,6 +183,7 @@ pub fn quantile(hist: &[u64; BUCKETS], q: f64) -> u64 {
 struct Agg {
     counters: [u64; COUNTERS.len()],
     hist: [u64; BUCKETS],
+    wait_hist: [u64; BUCKETS],
 }
 
 #[derive(Default, Clone)]
@@ -187,6 +211,8 @@ struct Sample {
 }
 
 type Key = (String, String);
+/// A pool, a query shape, and a client or a replica.
+type FpKey = (String, u64, String);
 
 struct Writer {
     cfg: StatsConfig,
@@ -199,6 +225,8 @@ struct Writer {
     backends: HashMap<Key, Small>,
     clients: HashMap<Key, Small>,
     statuses: HashMap<Key, u64>,
+    fp_clients: HashMap<FpKey, Small>,
+    fp_backends: HashMap<FpKey, Small>,
     /// The normalized text of every fingerprint of this minute.
     texts: HashMap<u64, String>,
     /// Fingerprints whose text the store already has.
@@ -216,6 +244,8 @@ struct Writer {
     dirty_backends: HashSet<Key>,
     dirty_clients: HashSet<Key>,
     dirty_statuses: HashSet<Key>,
+    dirty_fp_clients: HashSet<FpKey>,
+    dirty_fp_backends: HashSet<FpKey>,
 }
 
 fn unix(at: SystemTime) -> Duration {
@@ -307,6 +337,10 @@ pub async fn run(cfg: StatsConfig, mut rx: Receiver<Msg>) {
         dirty_backends: HashSet::new(),
         dirty_clients: HashSet::new(),
         dirty_statuses: HashSet::new(),
+        fp_clients: HashMap::new(),
+        fp_backends: HashMap::new(),
+        dirty_fp_clients: HashSet::new(),
+        dirty_fp_backends: HashSet::new(),
     };
     let mut next_flush = Instant::now() + FLUSH_EVERY;
     let mut next_prune = Instant::now();
@@ -355,6 +389,8 @@ impl Writer {
             && self.dirty_backends.is_empty()
             && self.dirty_clients.is_empty()
             && self.dirty_statuses.is_empty()
+            && self.dirty_fp_clients.is_empty()
+            && self.dirty_fp_backends.is_empty()
             && self.samples.is_empty())
     }
 
@@ -363,6 +399,8 @@ impl Writer {
         self.dirty_backends.clear();
         self.dirty_clients.clear();
         self.dirty_statuses.clear();
+        self.dirty_fp_clients.clear();
+        self.dirty_fp_backends.clear();
         self.samples.clear();
     }
 
@@ -381,6 +419,8 @@ impl Writer {
         self.backends.clear();
         self.clients.clear();
         self.statuses.clear();
+        self.fp_clients.clear();
+        self.fp_backends.clear();
         self.texts.clear();
         self.errors_this_minute.clear();
         self.minute = minute;
@@ -402,7 +442,7 @@ impl Writer {
         // has no text to normalize and is known by its bytes.
         let (text, normal, mut fp) = match request_source(&e.frame) {
             Some(text) => {
-                let (normal, fp) = normalize(&text);
+                let (normal, fp) = normalize_with(&text, self.cfg.normalize_symbols);
                 (text, normal, fp)
             }
             None => {
@@ -446,10 +486,11 @@ impl Writer {
         c[WAIT_MAX] = c[WAIT_MAX].max(wait);
         c[BYTES_IN] += e.bytes_in;
         c[BYTES_OUT] += e.bytes_out;
-        // The histogram is of time in a replica, and an answer from the
-        // cache spent none there.
+        // The histograms are of time in a replica and in the queue, and an
+        // answer from the cache spent none in either.
         if e.outcome != Outcome::Cached {
             a.hist[bucket(dur)] += 1;
+            a.wait_hist[bucket(wait)] += 1;
         }
         self.dirty_agg.insert((pool.clone(), fp));
 
@@ -464,6 +505,25 @@ impl Writer {
         count(&mut self.clients, &mut self.dirty_clients, &client);
         if !backend.is_empty() {
             count(&mut self.backends, &mut self.dirty_backends, &backend);
+        }
+        // Shapes times clients is not bounded by either: past the limit a
+        // shape's further clients are counted together, so the minute holds
+        // at most the limit and one row more for each shape.
+        let limit = self.cfg.max_fingerprints_per_minute;
+        let count = |rows: &mut HashMap<FpKey, Small>, dirty: &mut HashSet<FpKey>, who: &str| {
+            let mut key = (pool.clone(), fp, who.to_owned());
+            if !rows.contains_key(&key) && rows.len() >= limit {
+                key.2 = OTHER_WHO.to_owned();
+            }
+            let small = rows.entry(key.clone()).or_default();
+            small.count += 1;
+            small.errors += u64::from(failed);
+            small.dur_sum += dur;
+            dirty.insert(key);
+        };
+        count(&mut self.fp_clients, &mut self.dirty_fp_clients, &client);
+        if !backend.is_empty() {
+            count(&mut self.fp_backends, &mut self.dirty_fp_backends, &backend);
         }
         let key = (pool.clone(), status.clone());
         *self.statuses.entry(key.clone()).or_default() += 1;
@@ -573,6 +633,12 @@ impl Writer {
         for i in 0..BUCKETS {
             agg.push((format!("h{i}"), ints(rows.iter().map(|(_, a)| a.hist[i]))));
         }
+        for i in 0..BUCKETS {
+            agg.push((
+                format!("w{i}"),
+                ints(rows.iter().map(|(_, a)| a.wait_hist[i])),
+            ));
+        }
         let agg = (!rows.is_empty()).then(|| value::table(&agg));
 
         let small = |all: &HashMap<Key, Small>, dirty: &HashSet<Key>| {
@@ -598,6 +664,30 @@ impl Writer {
         };
         let backends = small(&self.backends, &self.dirty_backends);
         let clients = small(&self.clients, &self.dirty_clients);
+        let by_fp = |all: &HashMap<FpKey, Small>, dirty: &HashSet<FpKey>| {
+            let rows: Vec<(&FpKey, &Small)> =
+                dirty.iter().filter_map(|k| all.get_key_value(k)).collect();
+            (!rows.is_empty()).then(|| {
+                value::table(&[
+                    ("minute", ints(rows.iter().map(|_| minute))),
+                    (
+                        "pool",
+                        Column::Sym(rows.iter().map(|(k, _)| k.0.clone()).collect()),
+                    ),
+                    ("fp", ints(rows.iter().map(|(k, _)| k.1))),
+                    (
+                        "who",
+                        Column::Sym(rows.iter().map(|(k, _)| k.2.clone()).collect()),
+                    ),
+                    ("src", src(rows.len())),
+                    ("count", ints(rows.iter().map(|(_, s)| s.count))),
+                    ("errors", ints(rows.iter().map(|(_, s)| s.errors))),
+                    ("dur_sum", ints(rows.iter().map(|(_, s)| s.dur_sum))),
+                ])
+            })
+        };
+        let fp_clients = by_fp(&self.fp_clients, &self.dirty_fp_clients);
+        let fp_backends = by_fp(&self.fp_backends, &self.dirty_fp_backends);
         let statuses: Vec<(&Key, &u64)> = self
             .dirty_statuses
             .iter()
@@ -648,6 +738,8 @@ impl Writer {
             ("rfb_client", 4, clients),
             ("rfb_status", 4, statuses),
             ("rfb_sample", 5, samples),
+            ("rfb_fp_client", 5, fp_clients),
+            ("rfb_fp_backend", 5, fp_backends),
         ];
         let conn = self.conn().await?;
         for (table, keys, rows) in writes {
@@ -672,6 +764,8 @@ impl Writer {
             format!("(delete {{from: 'rfb_backend where: (< minute {aggregates})}})"),
             format!("(delete {{from: 'rfb_client where: (< minute {aggregates})}})"),
             format!("(delete {{from: 'rfb_status where: (< minute {aggregates})}})"),
+            format!("(delete {{from: 'rfb_fp_client where: (< minute {aggregates})}})"),
+            format!("(delete {{from: 'rfb_fp_backend where: (< minute {aggregates})}})"),
             format!("(delete {{from: 'rfb_sample where: (< ts {samples})}})"),
             "(set rfb_live_agg (at rfb_agg 'fp))".to_owned(),
             "(set rfb_live_sample (at rfb_sample 'fp))".to_owned(),

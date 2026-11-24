@@ -87,12 +87,25 @@ impl Filter {
     fn minutes(&self, with_fp: bool) -> String {
         self.condition("minute", self.from / 60, self.to / 60, with_fp, "")
     }
+
+    /// The same filter over the period just before this one: as many
+    /// minutes, ending where this one begins. Rows are whole minutes, so
+    /// the two are alike to within a minute of requests.
+    fn before(&self) -> Self {
+        let (first, last) = (self.from / 60, self.to / 60);
+        Self {
+            from: (2 * first - last - 1) * 60,
+            to: (first - 1) * 60,
+            ..self.clone()
+        }
+    }
 }
 
 #[derive(Default, Clone)]
 struct Acc {
     counters: [u64; COUNTERS.len()],
     hist: [u64; BUCKETS],
+    wait_hist: [u64; BUCKETS],
 }
 
 impl Acc {
@@ -112,6 +125,9 @@ impl Acc {
             };
         }
         for (mine, theirs) in self.hist.iter_mut().zip(o.hist) {
+            *mine += theirs;
+        }
+        for (mine, theirs) in self.wait_hist.iter_mut().zip(o.wait_hist) {
             *mine += theirs;
         }
     }
@@ -146,6 +162,9 @@ impl Acc {
             "max_ms": ms(self.get("dur_max")),
             "wait_avg_ms": per(self.get("wait_sum")),
             "wait_max_ms": ms(self.get("wait_max")),
+            "wait_p50_ms": ms(quantile(&self.wait_hist, 0.50)),
+            "wait_p95_ms": ms(quantile(&self.wait_hist, 0.95)),
+            "wait_p99_ms": ms(quantile(&self.wait_hist, 0.99)),
             "p50_ms": ms(quantile(&self.hist, 0.50)),
             "p95_ms": ms(quantile(&self.hist, 0.95)),
             "p99_ms": ms(quantile(&self.hist, 0.99)),
@@ -168,7 +187,7 @@ async fn summed(stats: &Stats, f: &Filter, key: &str) -> Result<Vec<(i64, Acc)>,
         columns.push_str(&format!(" s_{name}: ({how} {name})"));
     }
     for i in 0..BUCKETS {
-        columns.push_str(&format!(" s_h{i}: (sum h{i})"));
+        columns.push_str(&format!(" s_h{i}: (sum h{i}) s_w{i}: (sum w{i})"));
     }
     let source = format!(
         "(select {{from: rfb_agg where: {} by: {{k: {key}}}{columns}}})",
@@ -183,6 +202,9 @@ async fn summed(stats: &Stats, f: &Filter, key: &str) -> Result<Vec<(i64, Acc)>,
             }
             for (i, slot) in acc.hist.iter_mut().enumerate() {
                 *slot = rows.int(&format!("s_h{i}"), row);
+            }
+            for (i, slot) in acc.wait_hist.iter_mut().enumerate() {
+                *slot = rows.int(&format!("s_w{i}"), row);
             }
             (rows.int("k", row) as i64, acc)
         })
@@ -207,8 +229,14 @@ async fn series(stats: &Stats, f: &Filter) -> Result<Value, String> {
             point
         })
         .collect();
+    // What an operator asks during an incident is what changed: the period
+    // before, as one row, is what the totals are held against.
+    let mut previous = Acc::default();
+    for (_, acc) in summed(stats, &f.before(), &format!("(xbar minute {MAX_TIME})")).await? {
+        previous.add(&acc);
+    }
     Ok(
-        json!({ "from": f.from, "to": f.to, "step_s": step * 60, "total": total.json(), "points": points }),
+        json!({ "from": f.from, "to": f.to, "step_s": step * 60, "total": total.json(), "previous": previous.json(), "points": points }),
     )
 }
 
@@ -270,6 +298,10 @@ pub async fn top(stats: &Stats, f: &Filter) -> Result<Value, String> {
     rows.truncate(f.limit);
     let fps: Vec<u64> = rows.iter().map(|(fp, _)| *fp as u64).collect();
     let texts = texts(stats, &fps).await?;
+    let before: BTreeMap<i64, Acc> = summed(stats, &f.before(), "fp")
+        .await?
+        .into_iter()
+        .collect();
     let total = all.get("dur_sum");
     let listed: Vec<Value> = rows
         .iter()
@@ -278,6 +310,11 @@ pub async fn top(stats: &Stats, f: &Filter) -> Result<Value, String> {
             let mut row = acc.json();
             row["fp"] = json!(format!("{fp:016x}"));
             row["text"] = json!(texts.get(&fp).cloned().unwrap_or_default());
+            let previous = before.get(&(fp as i64)).cloned().unwrap_or_default();
+            row["previous"] = json!({
+                "count": previous.get("count"),
+                "avg_ms": previous.json()["avg_ms"],
+            });
             row["share"] = json!(if total == 0 {
                 0.0
             } else {
@@ -332,6 +369,8 @@ pub async fn query(stats: &Stats, f: &Filter) -> Result<Value, String> {
     );
     out["slow"] = samples(stats, f, "slow", "dur").await?;
     out["failed"] = samples(stats, f, "error", "ts").await?;
+    out["clients"] = json!(grouped_rows(stats, f, "rfb_fp_client", true).await?);
+    out["backends"] = json!(grouped_rows(stats, f, "rfb_fp_backend", true).await?);
     Ok(out)
 }
 
@@ -350,9 +389,20 @@ pub async fn errors(stats: &Stats, f: &Filter) -> Result<Value, String> {
 /// Requests per client address (`rfb_client`) or per replica
 /// (`rfb_backend`), the busiest first.
 pub async fn grouped(stats: &Stats, f: &Filter, table: &str) -> Result<Value, String> {
+    Ok(json!({ "rows": grouped_rows(stats, f, table, false).await? }))
+}
+
+/// The rows of `grouped`; `with_fp` for the tables that also have a query
+/// shape in their key, of which the filter's is taken.
+async fn grouped_rows(
+    stats: &Stats,
+    f: &Filter,
+    table: &str,
+    with_fp: bool,
+) -> Result<Vec<Value>, String> {
     let source = format!(
         "(select {{from: {table} where: {} by: [pool who] n: (sum count) e: (sum errors) d: (sum dur_sum)}})",
-        f.minutes(false)
+        f.minutes(with_fp)
     );
     let rows = Rows::of(stats.query(&source).await?)?;
     let mut order: Vec<usize> = (0..rows.len()).collect();
@@ -377,7 +427,7 @@ pub async fn grouped(stats: &Stats, f: &Filter, table: &str) -> Result<Value, St
             })
         })
         .collect();
-    Ok(json!({ "rows": listed }))
+    Ok(listed)
 }
 
 #[cfg(test)]
@@ -402,6 +452,20 @@ mod tests {
         assert_eq!(Filter::parse("fp=zz").fp, None);
         assert_eq!(Filter::parse("limit=999999").limit, 500);
         assert_eq!(Filter::parse("limit=0").limit, 1);
+    }
+
+    #[test]
+    fn the_period_before_is_as_long_and_ends_where_the_range_begins() {
+        let f = Filter::parse("from=6000&to=9599&pool=main&fp=ff");
+        assert_eq!(
+            f.before().minutes(true),
+            "(and (>= minute 40) (<= minute 99) (== pool (as 'SYMBOL \"main\")) (== fp 255))"
+        );
+        // At the start of time there is nothing before, and nothing breaks.
+        assert_eq!(
+            Filter::parse("from=0&to=59").before().minutes(false),
+            "(and (>= minute -1) (<= minute -1))"
+        );
     }
 
     #[test]

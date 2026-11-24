@@ -216,3 +216,242 @@ fn without_an_admin_password_there_are_no_pages() {
     assert_eq!(http_get(bouncer.port, "/", Some("root")).0, 403);
     assert_eq!(Client::connect(bouncer.port).query("(+ 1 2)"), int(3));
 }
+
+#[test]
+fn the_wait_for_a_replica_has_percentiles() {
+    let replica = Rayforce::start(&[]);
+    let store = Rayforce::start(&["-u", "s"]);
+    let bouncer = Bouncer::start(&config(&replica, &store));
+    let (mut first, mut second) = (Client::connect(bouncer.port), Client::connect(bouncer.port));
+    first.send(&slow(60_000));
+    bouncer.wait_busy(1);
+    second.send("(+ 1 1)");
+    bouncer.wait_queued(1);
+    first.cancel();
+    first.recv();
+    assert_eq!(second.recv(), int(2));
+
+    let overview = http_json(bouncer.port, "/api/overview", "root");
+    let of = |name: &str| overview["total"][name].as_f64().unwrap();
+    // Of two requests one waited: the 99th percentile is the edge of the
+    // bucket that wait fell into, so it is no less than the longest wait.
+    assert!(of("wait_max_ms") > 0.0, "{overview}");
+    assert!(of("wait_p99_ms") >= of("wait_max_ms"), "{overview}");
+    assert!(of("wait_p50_ms") < of("wait_p99_ms"), "{overview}");
+    assert!(of("wait_p95_ms") <= of("wait_p99_ms"), "{overview}");
+    let point = &overview["points"][0];
+    assert_eq!(point["wait_p99_ms"], overview["total"]["wait_p99_ms"]);
+}
+
+#[test]
+fn a_query_shape_shows_its_clients_and_its_replicas() {
+    let (a, b) = (Rayforce::start(&[]), Rayforce::start(&[]));
+    let store = Rayforce::start(&["-u", "s"]);
+    let body = format!(
+        "admin_password = \"root\"\n[stats]\nrayforce = \"{}\"\npassword = \"s\"\n{}",
+        store.addr(),
+        pool(
+            &[&a, &b],
+            "require_restricted = false\nmode = \"round_robin\""
+        )
+    );
+    let bouncer = Bouncer::start(&body);
+    let mut c = Client::connect(bouncer.port);
+    for i in 0..4 {
+        assert_eq!(c.query(&format!("(+ {i} 1)")), int(i + 1));
+    }
+    assert_eq!(c.query_error("(nosuch 1)"), Some("name".to_owned()));
+
+    let top = http_json(bouncer.port, "/api/top", "root");
+    let fp = |text: &str| row(&top, text)["fp"].as_str().unwrap().to_owned();
+    let plus = http_json(
+        bouncer.port,
+        &format!("/api/query?fp={}", fp("(+ ? ?)")),
+        "root",
+    );
+    let clients = plus["clients"].as_array().unwrap();
+    assert_eq!(clients.len(), 1, "{plus}");
+    assert_eq!(
+        (clients[0]["name"].as_str(), clients[0]["count"].as_u64()),
+        (Some("127.0.0.1"), Some(4))
+    );
+    let replicas = plus["backends"].as_array().unwrap();
+    let mut names: Vec<&str> = replicas
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    let (a, b) = (a.addr(), b.addr());
+    let mut both = [a.as_str(), b.as_str()];
+    both.sort_unstable();
+    assert_eq!(names, both, "{plus}");
+    assert!(replicas.iter().all(|r| r["count"] == 2), "{plus}");
+
+    // Another shape's requests are its own.
+    let nosuch = http_json(
+        bouncer.port,
+        &format!("/api/query?fp={}", fp("(nosuch ?)")),
+        "root",
+    );
+    assert_eq!(nosuch["clients"][0]["count"], 1);
+    assert_eq!(nosuch["clients"][0]["not_ok"], 1);
+    assert_eq!(nosuch["backends"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_shape_s_replicas_past_the_limit_are_counted_together() {
+    let (a, b) = (Rayforce::start(&[]), Rayforce::start(&[]));
+    let store = Rayforce::start(&[]);
+    let body = format!(
+        "admin_password = \"root\"\n[stats]\nrayforce = \"{}\"\nmax_fingerprints_per_minute = 1\n{}",
+        store.addr(),
+        pool(
+            &[&a, &b],
+            "require_restricted = false\nmode = \"round_robin\""
+        )
+    );
+    let bouncer = Bouncer::start(&body);
+    let mut c = Client::connect(bouncer.port);
+    for i in 0..6 {
+        assert_eq!(c.query(&format!("(+ {i} 1)")), int(i + 1));
+    }
+    let top = http_json(bouncer.port, "/api/top", "root");
+    let one = http_json(
+        bouncer.port,
+        &format!("/api/query?fp={}", top["rows"][0]["fp"].as_str().unwrap()),
+        "root",
+    );
+    let replicas = one["backends"].as_array().unwrap();
+    assert_eq!(replicas.len(), 2, "{one}");
+    assert!(replicas.iter().any(|r| r["name"] == "<other>"), "{one}");
+    assert!(replicas.iter().all(|r| r["count"] == 3), "{one}");
+    assert_eq!(
+        Client::connect(store.port).query("(count rfb_fp_backend)"),
+        int(2)
+    );
+}
+
+#[test]
+fn symbols_are_values_when_the_setting_says_so() {
+    let replica = Rayforce::start(&[]);
+    let store = Rayforce::start(&[]);
+    let body = format!(
+        "admin_password = \"root\"\n[stats]\nrayforce = \"{}\"\nnormalize_symbols = true\n{}",
+        store.addr(),
+        pool(&[&replica], "require_restricted = false")
+    );
+    let bouncer = Bouncer::start(&body);
+    let mut c = Client::connect(bouncer.port);
+    for sym in ["AAPL", "MSFT", "GOOG"] {
+        c.query(&format!("(== 'IBM '{sym})"));
+    }
+    let top = http_json(bouncer.port, "/api/top", "root");
+    assert_eq!(top["rows"].as_array().unwrap().len(), 1, "{top}");
+    assert_eq!(row(&top, "(== ? ?)")["count"], 3);
+}
+
+#[test]
+fn totals_come_with_those_of_the_period_before() {
+    let replica = Rayforce::start(&[]);
+    let store = Rayforce::start(&[]);
+    let body = format!(
+        "admin_password = \"root\"\n[stats]\nrayforce = \"{}\"\n{}",
+        store.addr(),
+        pool(&[&replica], "require_restricted = false")
+    );
+    let bouncer = Bouncer::start(&body);
+    let mut c = Client::connect(bouncer.port);
+    for i in 0..4 {
+        assert_eq!(c.query(&format!("(+ {i} 1)")), int(i + 1));
+    }
+    let overview = http_json(bouncer.port, "/api/overview", "root");
+    assert_eq!(overview["total"]["count"], 4);
+    assert_eq!(overview["previous"]["count"], 0);
+    let top = http_json(bouncer.port, "/api/top", "root");
+    assert_eq!(row(&top, "(+ ? ?)")["previous"]["count"], 0);
+
+    // The same requests an hour and a half ago: before the last hour, and
+    // within the hour before it.
+    let mut direct = Client::connect(store.port);
+    direct.query("(upsert 'rfb_agg 4 (update {from: rfb_agg minute: (- minute 90)}))");
+    c.query("(- 1 1)");
+    let overview = http_json(bouncer.port, "/api/overview", "root");
+    assert_eq!(overview["total"]["count"], 5);
+    assert_eq!(overview["previous"]["count"], 4);
+    assert_eq!(
+        overview["previous"]["p99_ms"],
+        row(&top, "(+ ? ?)")["p99_ms"]
+    );
+    let top = http_json(bouncer.port, "/api/top", "root");
+    let plus = row(&top, "(+ ? ?)");
+    assert_eq!(plus["previous"]["count"], 4);
+    assert_eq!(plus["previous"]["avg_ms"], plus["avg_ms"]);
+    assert_eq!(row(&top, "(- ? ?)")["previous"]["count"], 0);
+    let one = http_json(
+        bouncer.port,
+        &format!("/api/query?fp={}", plus["fp"].as_str().unwrap()),
+        "root",
+    );
+    assert_eq!(one["previous"]["count"], 4);
+}
+
+#[test]
+fn a_store_of_the_layout_before_is_refused_in_so_many_words() {
+    let replica = Rayforce::start(&[]);
+    let store = Rayforce::start(&[]);
+    // `rfb_agg` as it was before the wait had a histogram.
+    let mut columns: Vec<String> = [
+        "minute",
+        "pool",
+        "fp",
+        "src",
+        "count",
+        "errors",
+        "cancels",
+        "timeouts",
+        "refused",
+        "failed",
+        "retries",
+        "dur_sum",
+        "dur_max",
+        "wait_sum",
+        "wait_max",
+        "bytes_in",
+        "bytes_out",
+    ]
+    .iter()
+    .map(|c| (*c).to_owned())
+    .collect();
+    columns.extend((0..32).map(|i| format!("h{i}")));
+    let types: Vec<&str> = columns
+        .iter()
+        .map(|c| match c.as_str() {
+            "pool" | "src" => "(as 'SYMBOL [])",
+            _ => "(as 'I64 [])",
+        })
+        .collect();
+    Client::connect(store.port).query(&format!(
+        "(set rfb_agg (table [{}] (list {})))",
+        columns.join(" "),
+        types.join(" ")
+    ));
+    let body = format!(
+        "admin_password = \"root\"\n[stats]\nrayforce = \"{}\"\n{}",
+        store.addr(),
+        pool(&[&replica], "require_restricted = false")
+    );
+    let bouncer = Bouncer::start(&body);
+    assert_eq!(Client::connect(bouncer.port).query("(+ 1 1)"), int(2));
+    let (status, body) = http_get(bouncer.port, "/api/overview", Some("root"));
+    assert_eq!(status, 502);
+    assert!(
+        body.contains("rfb_agg is of an older layout (it has no column w0)"),
+        "{body}"
+    );
+    // Nothing was made beside the table it could not use.
+    assert!(
+        Client::connect(store.port)
+            .query_error("(count rfb_fp_client)")
+            .is_some()
+    );
+}

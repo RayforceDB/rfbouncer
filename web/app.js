@@ -123,7 +123,7 @@ function section(title, sub, ...body) {
 function strip(cells) {
   return h('section', { class: 'plain' }, h('div', { class: 'strip' }, cells.filter(Boolean).map((c) => h('div', {},
     h('div', { class: 'label' }, c.label),
-    h('div', { class: 'value' + (c.lead ? ' lead' : '') + (c.bad ? ' bad' : '') }, c.value),
+    h('div', { class: 'value' + (c.lead ? ' lead' : '') + (c.bad ? ' bad' : '') }, c.value, c.delta),
     c.sub ? h('div', { class: 'sub' }, c.sub) : null))));
 }
 function table(columns, rows, empty, wide) {
@@ -154,6 +154,20 @@ function outcome(status) {
 function failedCell(failed, count) {
   if (!failed) return h('span', { class: 'dim' }, '0');
   return h('span', { class: 'bad' }, `${int(failed)}  ${pct(failed, count)}`);
+}
+// How a number moved against the period before: which way and by how much,
+// the earlier number on hover. Empty where it moved by less than a tenth:
+// periods are whole minutes and percentiles are bucket edges, so less than
+// that is no change, and a page where nothing changed should say nothing.
+function delta(now, was, format, fresh) {
+  const el = h('span', { class: 'delta' });
+  now = now || 0; was = was || 0;
+  if (now === was || (was && now / was > 0.9 && now / was < 1.1)) return el;
+  const r = now / was;
+  el.textContent = !was && fresh ? fresh : (now > was ? '▲ ' : '▼ ') + (!was ? `from ${format(0)}` : !now ? `from ${format(was)}`
+    : r >= 2 ? `${sig3(Number(r.toPrecision(2)))}×` : `${Math.round(Math.abs(r - 1) * 100)}%`);
+  el.title = `${format(was)} in the period before`;
+  return el;
 }
 function share(part, whole) {
   const bar = h('i', {});
@@ -337,21 +351,28 @@ function threeCharts(data, label) {
       bars: true, format: dur, none,
       series: [{ name: 'exec', color: '--series-1', of: (p) => p.avg_ms },
                { name: 'wait', color: '--series-2', of: (p) => p.wait_avg_ms }],
-      tip: (p) => [['exec', dur(p.avg_ms)], ['wait', dur(p.wait_avg_ms)], ['max wait', dur(p.wait_max_ms)]],
+      tip: (p) => [['exec', dur(p.avg_ms)], ['wait', dur(p.wait_avg_ms)], ['wait p50', dur(p.wait_p50_ms)],
+        ['wait p95', dur(p.wait_p95_ms)], ['wait p99', dur(p.wait_p99_ms)], ['max wait', dur(p.wait_max_ms)]],
     })));
 }
 
 // The numbers of a range in one line: what failed first, since that is what
 // the page is opened for.
-function totals(t, seconds, extra) {
+// `was` is the same of the period before; with no requests in it there
+// is nothing to hold a time or a rate against.
+function totals(t, seconds, extra, was) {
+  const rate = (x) => x.count ? x.not_ok / x.count : 0;
+  const moved = (now, then, format) => was && was.count ? delta(now, then, format) : null;
   const kinds = [[t.errors, 'error'], [t.timeouts, 'timeout'], [t.refused, 'busy'], [t.failed, 'io'], [t.cancels, 'cancel']];
   const failedSub = h('span', {}, kinds.flatMap(([n, name], i) => [i ? ' · ' : '', h('span', { class: n ? '' : 'dim' }, `${int(n)} ${name}`)]),
     t.retries ? ` · ${int(t.retries)} retried` : '');
   return strip([
-    { label: 'Failed', value: pct(t.not_ok, t.count), lead: true, bad: t.not_ok > 0, sub: failedSub },
-    { label: 'Exec p99', value: dur(t.p99_ms), sub: `p50 ${dur(t.p50_ms)} · p95 ${dur(t.p95_ms)}` },
-    { label: 'Wait max', value: dur(t.wait_max_ms), sub: `avg ${dur(t.wait_avg_ms)}` },
-    { label: 'Requests', value: int(t.count), sub: `${sig3(t.count / seconds)}/s` },
+    { label: 'Failed', value: pct(t.not_ok, t.count), lead: true, bad: t.not_ok > 0, sub: failedSub,
+      delta: moved(rate(t), rate(was), (x) => pct(x, 1)) },
+    { label: 'Exec p99', value: dur(t.p99_ms), sub: `p50 ${dur(t.p50_ms)} · p95 ${dur(t.p95_ms)}`, delta: moved(t.p99_ms, was.p99_ms, dur) },
+    { label: 'Wait p99', value: dur(t.wait_p99_ms), delta: moved(t.wait_p99_ms, was.wait_p99_ms, dur),
+      sub: `p50 ${dur(t.wait_p50_ms)} · p95 ${dur(t.wait_p95_ms)} · max ${dur(t.wait_max_ms)} · avg ${dur(t.wait_avg_ms)}` },
+    { label: 'Requests', value: int(t.count), sub: `${sig3(t.count / seconds)}/s`, delta: was && delta(t.count, was.count, int) },
     ...(extra || []),
   ]);
 }
@@ -403,7 +424,7 @@ function replicasNow(live, pool) {
 const views = {
   async overview(st, live, q) {
     const data = await get('/api/overview' + q());
-    return [totals(data.total, data.to - data.from, [nowCell(live, st.pool)]), threeCharts(data, st.range[2]),
+    return [totals(data.total, data.to - data.from, [nowCell(live, st.pool)], data.previous), threeCharts(data, st.range[2]),
       section('Replicas', null, replicasNow(live, st.pool))];
   },
   async live(st, live) {
@@ -420,13 +441,15 @@ const views = {
     const all = data.total;
     return [section(`${int(data.rows.length)} query shapes`, 'literals replaced by ?', table([
       { title: 'Query shape', cls: 'q', cell: (r) => text(r.text, link('query/' + r.fp)) },
-      num('Requests', (r) => int(r.count), by('count')),
+      num('Requests', (r) => [int(r.count), delta(r.count, r.previous.count, int, 'new')], by('count')),
       num('Total exec', (r) => dur(r.total_ms), by('total')), num('%', (r) => pct(r.total_ms, all.total_ms)),
       sort === 'total' && { title: '', cell: (r) => share(r.total_ms, all.total_ms) },
-      num('Avg ms', (r) => msCell(r.avg_ms), by('avg')), num('p95 ms', (r) => msCell(r.p95_ms)), num('Max ms', (r) => msCell(r.max_ms), by('max')),
+      num('Avg ms', (r) => [msCell(r.avg_ms), r.previous.count ? delta(r.avg_ms, r.previous.avg_ms, (v) => msCell(v) + ' ms') : delta(0, 0)], by('avg')),
+      num('p95 ms', (r) => msCell(r.p95_ms)), num('Max ms', (r) => msCell(r.max_ms), by('max')),
+      num('Wait p95 ms', (r) => msCell(r.wait_p95_ms)),
       num('Failed', (r) => failedCell(r.not_ok, r.count), by('errors')), num('Bytes out', (r) => bytes(r.bytes_out), by('bytes')),
     ], data.rows, `No requests in ${st.range[2]}.`, true),
-    h('p', { class: 'note' }, 'percentiles are histogram bucket upper bounds (powers of two)'))];
+    h('p', { class: 'note' }, 'percentiles are histogram bucket upper bounds (powers of two) · ▲ ▼ against the period before, where it differs by a tenth or more'))];
   },
   async query(st, live, q) {
     const data = await get('/api/query' + q({ fp: st.arg, limit: 20 }));
@@ -436,10 +459,21 @@ const views = {
       if (navigator.clipboard) navigator.clipboard.writeText(data.text).then(() => { copy.textContent = 'copied'; }, select);
       else select();
     } }, 'copy');
+    // Who sends this shape and which replicas run it. `<other>` is where
+    // the bouncer counts those past its limit of rows a minute.
+    const who = (title, first, rows) => {
+      const total = rows.reduce((n, r) => n + r.count, 0);
+      return section(title, rows.length >= 20 ? 'the 20 with the most requests' : null, table([
+        { title: first, cell: (r) => r.name }, { title: 'Pool', cell: (r) => r.pool },
+        num('Requests', (r) => int(r.count)), num('%', (r) => pct(r.count, total)), { title: '', cell: (r) => share(r.count, total) },
+        num('Failed', (r) => failedCell(r.not_ok, r.count)), num('Total exec', (r) => dur(r.total_ms)), num('Avg ms', (r) => msCell(r.avg_ms)),
+      ], rows, `No requests in ${st.range[2]}.`));
+    };
     const kept = 'the bouncer keeps the slowest requests per hour and up to 20 failed per minute, with literals';
     return [h('section', { class: 'plain' },
         h('p', { class: 'note' }, h('a', { href: link('queries') }, '← Queries'), `   ${st.arg}   `, data.text ? copy : null), shape),
-      totals(data.total, data.to - data.from), threeCharts(data, st.range[2]),
+      totals(data.total, data.to - data.from, null, data.previous), threeCharts(data, st.range[2]),
+      h('div', { class: 'pair' }, who('Clients', 'Address', data.clients), who('Replicas', 'Replica', data.backends)),
       section('Slowest samples', kept, samples(data.slow, `No requests in ${st.range[2]}.`, st, false)),
       section('Failed samples', null, samples(data.failed, `No failed requests in ${st.range[2]}.`, st, false))];
   },

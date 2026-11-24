@@ -334,6 +334,47 @@ name). With `[stats] rayforce` set, the pages show:
 - **Clients**, **Replicas**: who sends the work and who does it.
 - **Now**: what each replica is running and what waits in the queue.
 
+The wait for a replica has percentiles like the time in one: p50, p95 and
+p99 in the totals, in the tooltip of the wait chart, and p95 for each query
+shape.
+
+Beside each total stands how it moved against the period before, the equally
+long one that ends where the selected range begins: `▲ 34%`, `▼ 12%`,
+`▲ 3.2×`, and the earlier number on hover. Queries shows the same for each
+shape's requests and average exec, and `new` for a shape the period before
+did not have. Where a number moved by less than a tenth nothing is shown:
+rows are whole minutes and percentiles are bucket edges, so the two periods
+are alike only to about that.
+
+The page of one query shape also lists the clients that send it and the
+replicas that run it. A minute keeps at most `max_fingerprints_per_minute`
+pairs of a shape and a client, and as many of a shape and a replica; past
+that a shape's further clients are counted together as `<other>`.
+
+### Symbols in query shapes
+
+Symbols are kept in a shape, which is right while they name tables and
+columns and wrong for a workload that asks for thousands of instruments by
+name: every one of them is a shape of its own. `normalize_symbols = true`
+under `[stats]` replaces them with `?` as other values are: `'name` (and a
+character, `'c'`), `:name`, and the bare names in a `[ ]` vector, which
+Rayforce reads as symbols too. So `(== sym 'AAPL)` and `(== sym 'MSFT)` are
+both `(== sym ?)`, and `(in sym [AAPL MSFT])` is `(in sym [?])`.
+
+What stays is what its place shows to be part of the query rather than a
+value in it:
+
+- the table after `from:`, as in `{from: 'trades}`. Queries of different
+  tables are different queries with different costs, and there are only as
+  many tables as the replicas hold;
+- the columns after `by:`, `asc:` and `desc:`, as in `by: [sym side]`;
+- a function's parameters, `(fn [x y] ...)`.
+
+Everything else goes, column names and type names included: `(at t 'price)`
+is `(at t ?)` and `(as 'I64 x)` is `(as ? x)`, since the text cannot tell
+them from a value. Turning the setting on or off gives every affected query
+a new shape from then on; what was counted before stays under the old one.
+
 Only requests sent as source text have a text to show; a request sent as a
 serialized value is told from others by its bytes and shown as
 `<binary N bytes>`. Percentiles come from a histogram
@@ -374,11 +415,16 @@ the minute being filled every ten seconds. They are ordinary tables:
 
 | Table | A row is |
 |---|---|
-| `rfb_agg` | a minute, a pool and a query shape: counts by outcome, time and wait sums and maxima, bytes, and a histogram of time in `h0`..`h31` (`h<i>` counts requests under 2^i µs) |
+| `rfb_agg` | a minute, a pool and a query shape: counts by outcome, time and wait sums and maxima, bytes, a histogram of time in `h0`..`h31` (`h<i>` counts requests under 2^i µs) and one of the wait in `w0`..`w31` |
 | `rfb_status` | a minute, a pool and an outcome (`ok`, `cached`, `cancel`, `timeout`, `busy`, `io`, or a replica's error code) |
 | `rfb_backend`, `rfb_client` | a minute, a pool and a replica or a client address |
 | `rfb_fp` | a query shape's text |
 | `rfb_sample` | a request kept whole: the slowest of each hour and up to 20 failed a minute |
+| `rfb_fp_client`, `rfb_fp_backend` | a minute, a pool, a query shape and a client address or a replica |
+
+A store whose tables are of an earlier layout is refused with a message that
+names the table and the column it lacks: start an empty store, or delete the
+`rfb_` tables in the old one.
 
 Several bouncers may share one store: every row carries the process that
 wrote it (`src`), and a report sums them. A bouncer that restarts writes rows
@@ -391,7 +437,10 @@ past the end of a minute costs that minute.
 Sizing. Everything the store holds is in memory, about 400 bytes a row of
 `rfb_agg`, one row a minute for each query shape seen in it. Names and
 symbols are part of a shape, so `(== sym 'AAPL)` and `(== sym 'MSFT)` are two:
-a workload with many distinct symbols has many shapes. The journal grows with
+a workload with many distinct symbols has many shapes, unless
+`normalize_symbols` is set. `rfb_fp_client` and `rfb_fp_backend` hold eight
+numbers a row and at most twice `max_fingerprints_per_minute` rows a minute
+each. The journal grows with
 every row written, and only rows that changed are written. Lower
 `retention_aggregates` or `max_fingerprints_per_minute` if either is too
 much.

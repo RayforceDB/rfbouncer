@@ -118,6 +118,9 @@ pub struct StatsConfig {
     pub retention_samples: Duration,
     #[serde(default = "default_fingerprints")]
     pub max_fingerprints_per_minute: usize,
+    /// Replace symbols with `?` in a query's shape, as other values are.
+    #[serde(default)]
+    pub normalize_symbols: bool,
 }
 
 impl Default for StatsConfig {
@@ -130,6 +133,7 @@ impl Default for StatsConfig {
             retention_aggregates: days_30(),
             retention_samples: days_7(),
             max_fingerprints_per_minute: default_fingerprints(),
+            normalize_symbols: false,
         }
     }
 }
