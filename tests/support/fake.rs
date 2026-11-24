@@ -3,8 +3,9 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -234,5 +235,22 @@ impl Report {
             query: self.query.to_owned(),
         }
         .encode()
+    }
+}
+
+/// Holds a stand-in replica's answer until the test lets it go, so that how
+/// long a request runs is the test's to say and not the machine's.
+pub struct Gate(Mutex<Receiver<()>>);
+
+/// A gate and what opens it: each `send` lets one waiting request through.
+pub fn gate() -> (Sender<()>, Gate) {
+    let (open, held) = channel();
+    (open, Gate(Mutex::new(held)))
+}
+
+impl Gate {
+    /// Waits to be let through; false when the test is over.
+    pub fn wait(&self) -> bool {
+        self.0.lock().unwrap().recv().is_ok()
     }
 }

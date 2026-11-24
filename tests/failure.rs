@@ -4,11 +4,11 @@
 
 mod support;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use rfbouncer::wire::frame::{self, MSG_RESPONSE};
-use support::fake::{Fake, answer_forever, read_request};
+use support::fake::{Fake, answer_forever, gate, read_request};
 use support::{Bouncer, Client, Rayforce, eventually, int, pool, signal, slow};
 
 const OPEN: &str = "require_restricted = false";
@@ -17,12 +17,17 @@ const OPEN: &str = "require_restricted = false";
 fn a_request_whose_replica_dies_is_run_again_on_another() {
     let mut doomed = Rayforce::start(&[]);
     let other = Rayforce::start(&[]);
+    // The same request is long on the replica that dies and short on the
+    // other: it cannot have ended before the kill, however fast the machine,
+    // and its answer says which replica gave it.
+    Client::connect(doomed.port).query("(set n 600000)");
+    Client::connect(other.port).query("(set n 8)");
     let bouncer = Bouncer::start(&pool(&[&doomed, &other], OPEN));
     let mut c = Client::connect(bouncer.port);
-    c.send(&slow(8000));
+    c.send("(count (map (fn [i] (sum (til 1000000))) (til n)))");
     bouncer.wait_busy(1);
     doomed.kill();
-    assert_eq!(c.recv(), int(8000));
+    assert_eq!(c.recv(), int(8));
     // The pool goes on with what is left.
     for i in 0..10 {
         assert_eq!(
@@ -38,7 +43,7 @@ fn without_retry_the_client_is_told() {
     let other = Rayforce::start(&[]);
     let bouncer = Bouncer::start(&pool(&[&doomed, &other], &format!("{OPEN}\nretry = false")));
     let mut c = Client::connect(bouncer.port);
-    c.send(&slow(8000));
+    c.send(&slow(60_000));
     bouncer.wait_busy(1);
     doomed.kill();
     assert_eq!(
@@ -133,7 +138,9 @@ fn a_replica_that_speaks_out_of_turn_gets_a_new_connection() {
             // What a subscription left on the connection would push.
             std::thread::sleep(Duration::from_millis(300));
             let _ = stream.write_all(&frame::frame(support::wire(), 0, &int(7)));
-            std::thread::sleep(Duration::from_secs(5));
+            // Held open until the bouncer closes it: a second connection
+            // is then the bouncer's doing and not this one running out.
+            let _ = stream.read(&mut [0u8; 1]);
         } else {
             answer_forever(stream, 42);
         }
@@ -183,12 +190,27 @@ fn a_reload_brings_the_pool_to_the_new_list() {
 
 #[test]
 fn a_stop_lets_the_request_in_flight_finish() {
-    let replica = Rayforce::start(&[]);
-    let mut bouncer = Bouncer::start(&pool(&[&replica], OPEN));
+    // The replica answers when the test says so, which is after the stop
+    // was taken: a request that had already ended would prove nothing.
+    let (answer, held) = gate();
+    let replica = Fake::start(move |mut stream, _| {
+        while read_request(&mut stream) && held.wait() {
+            let _ = stream.write_all(&frame::frame(support::wire(), MSG_RESPONSE, &int(6000)));
+        }
+    });
+    let mut bouncer = Bouncer::start(&format!(
+        "[[pool]]\nname = \"main\"\n{OPEN}\nbackends = [\"{}\"]\n",
+        replica.addr()
+    ));
     let mut c = Client::connect(bouncer.port);
-    c.send(&slow(6000));
+    c.send("(+ 1 1)");
     bouncer.wait_busy(1);
     signal(bouncer.pid(), "TERM");
+    eventually("the bouncer stopped taking connections", || {
+        support::connect(bouncer.port).is_err()
+    });
+    assert!(bouncer.exited().is_none(), "it left its request behind");
+    answer.send(()).unwrap();
     assert_eq!(c.recv(), int(6000));
     eventually("the bouncer exited", || bouncer.exited().is_some());
     assert!(bouncer.exited().unwrap().success());

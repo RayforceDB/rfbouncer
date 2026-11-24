@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use rfbouncer::wire::frame::{self, FLAG_COMPRESSED, Header, MSG_RESPONSE};
 use rfbouncer::wire::value::error_code;
-use support::fake::{Fake, answer_forever, read_request};
+use support::fake::{Fake, answer_forever, gate, read_request};
 use support::{
     Bouncer, Client, Rayforce, Refused, eventually, http_get, http_json, int, pool, signal, slow,
 };
@@ -87,17 +87,19 @@ fn a_reconnect_asked_for_meanwhile_does_not_deafen_a_request_to_its_cancel() {
 fn a_request_given_back_by_a_dead_replica_waits_afresh_for_another() {
     // The first replica takes a request, holds it past the pool's whole
     // wait budget, and dies. The second is busy at that moment.
-    let dying = Fake::start(|mut stream, n| {
+    // Both do so when the test says, not after a time of their own.
+    let (die, alive) = gate();
+    let (answer, held) = gate();
+    let dying = Fake::start(move |mut stream, n| {
         if n == 0 {
             read_request(&mut stream);
-            std::thread::sleep(Duration::from_millis(2500));
+            alive.wait();
         } else {
             answer_forever(stream, 42);
         }
     });
-    let slow_one = Fake::start(|mut stream, _| {
-        while read_request(&mut stream) {
-            std::thread::sleep(Duration::from_millis(3500));
+    let slow_one = Fake::start(move |mut stream, _| {
+        while read_request(&mut stream) && held.wait() {
             let _ = stream.write_all(&frame::frame(support::wire(), MSG_RESPONSE, &int(42)));
         }
     });
@@ -110,6 +112,11 @@ fn a_request_given_back_by_a_dead_replica_waits_afresh_for_another() {
     bouncer.wait_busy(2);
     // Before, it was answered `busy` the moment it came back: it had been
     // in the bouncer longer than a request may wait.
+    std::thread::sleep(Duration::from_millis(2200));
+    die.send(()).unwrap();
+    bouncer.wait_queued(1);
+    answer.send(()).unwrap();
+    answer.send(()).unwrap();
     assert_eq!(first.recv(), int(42));
     assert_eq!(second.recv(), int(42));
     assert_eq!(
@@ -220,6 +227,7 @@ fn a_paused_pool_holds_a_request_for_as_long_as_it_is_paused() {
     admin.query("pause");
     let mut c = Client::connect_as(bouncer.port, support::wire(), Some(("app", "pw"))).unwrap();
     c.send("(+ 1 2)");
+    bouncer.wait_queued(1);
     c.stream
         .set_read_timeout(Some(Duration::from_millis(1200)))
         .unwrap();
@@ -309,10 +317,13 @@ fn connections_are_limited_and_given_back() {
     eventually("the place is given back", || {
         Client::connect_as(bouncer.port, support::wire(), None).is_ok()
     });
-    // A client that sits between two requests longer than it may is let go.
-    std::thread::sleep(Duration::from_millis(900));
-    first.send("(+ 1 1)");
-    assert!(first.try_recv().is_err(), "an idle client was kept");
+    // A client that sits between two requests longer than it may is let go:
+    // the read ends when the bouncer closes, however late that is.
+    assert_eq!(
+        first.stream.read(&mut [0u8; 1]).ok(),
+        Some(0),
+        "an idle client was kept"
+    );
 }
 
 #[test]
@@ -396,9 +407,10 @@ fn shapes_past_the_limit_are_counted_together_and_samples_can_be_left_out() {
 
 #[test]
 fn a_pool_of_wire_version_three_speaks_it_to_both_sides() {
-    let old = Fake::start_speaking(3, |mut stream, _| {
-        while read_request(&mut stream) {
-            std::thread::sleep(Duration::from_millis(600));
+    // Each answer is held until the test has seen the queue full.
+    let (answer, held) = gate();
+    let old = Fake::start_speaking(3, move |mut stream, _| {
+        while read_request(&mut stream) && held.wait() {
             let _ = stream.write_all(&frame::frame(3, MSG_RESPONSE, &int(3)));
         }
     });
@@ -420,6 +432,8 @@ fn a_pool_of_wire_version_three_speaks_it_to_both_sides() {
         (busy.len(), error_code(&busy)),
         (9, Some("busy".to_owned()))
     );
+    answer.send(()).unwrap();
+    answer.send(()).unwrap();
     assert_eq!(running.recv(), int(3));
     assert_eq!(queued.recv(), int(3));
 }
@@ -541,7 +555,7 @@ fn a_replica_that_greets_and_hangs_up_is_not_hammered() {
     // 0.1 s, 0.2 s, 0.4 s, 0.8 s apart: a handful, not the thousands a
     // retry with no pause would make.
     assert!(
-        flapping.accepted() <= 8,
+        (1..=8).contains(&flapping.accepted()),
         "{} connections in two seconds",
         flapping.accepted()
     );

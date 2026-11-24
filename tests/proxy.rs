@@ -4,8 +4,10 @@
 
 mod support;
 
-use std::time::{Duration, Instant};
+use std::io::Write;
 
+use rfbouncer::wire::frame::{self, MSG_RESPONSE};
+use support::fake::{Fake, gate, read_request};
 use support::{Bouncer, Client, Rayforce, Refused, int, pool, slow};
 
 #[test]
@@ -45,16 +47,13 @@ fn a_slow_query_on_one_replica_does_not_hold_the_others() {
     bouncer.wait_busy(1);
 
     // A connection per query, as a client without a pool of its own does it.
-    let started = Instant::now();
     for i in 0..40 {
         let mut c = Client::connect(bouncer.port);
         assert_eq!(c.query(&format!("(+ {i} 1)")), int(i + 1));
     }
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "short queries waited behind the slow one"
-    );
 
+    // The slow one is still there to be cancelled, so none of the short
+    // queries waited behind it: no clock is needed to say so.
     hog.cancel();
     assert_eq!(hog.query_error_after_cancel(), Some("cancel".to_owned()));
     assert_eq!(hog.query("(+ 1 1)"), int(2));
@@ -62,14 +61,30 @@ fn a_slow_query_on_one_replica_does_not_hold_the_others() {
 
 #[test]
 fn requests_queue_when_every_replica_is_busy() {
-    let replica = Rayforce::start(&[]);
-    let bouncer = Bouncer::start(&pool(&[&replica], "require_restricted = false"));
+    // The replica answers its requests with 1, 2, ... and each when the test
+    // says so: the first is certain to be running when the second comes.
+    let (answer, held) = gate();
+    let replica = Fake::start(move |mut stream, _| {
+        let mut n = 0;
+        while read_request(&mut stream) && held.wait() {
+            n += 1;
+            let _ = stream.write_all(&frame::frame(support::wire(), MSG_RESPONSE, &int(n)));
+        }
+    });
+    let bouncer = Bouncer::start(&format!(
+        "[[pool]]\nname = \"main\"\nrequire_restricted = false\nbackends = [\"{}\"]\n",
+        replica.addr()
+    ));
     let mut first = Client::connect(bouncer.port);
-    first.send(&slow(4000));
+    first.send("(+ 1 1)");
+    bouncer.wait_busy(1);
     let mut second = Client::connect(bouncer.port);
     second.send("(+ 2 2)");
-    assert_eq!(first.recv(), int(4000));
-    assert_eq!(second.recv(), int(4));
+    bouncer.wait_queued(1);
+    answer.send(()).unwrap();
+    assert_eq!(first.recv(), int(1));
+    answer.send(()).unwrap();
+    assert_eq!(second.recv(), int(2));
 }
 
 #[test]

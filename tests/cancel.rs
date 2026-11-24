@@ -40,7 +40,7 @@ fn a_cancel_takes_a_waiting_request_out_of_the_queue() {
     bouncer.wait_busy(1);
     let mut waiting = Client::connect(bouncer.port);
     waiting.send("(+ 1 1)");
-    std::thread::sleep(Duration::from_millis(100));
+    bouncer.wait_queued(1);
     let started = Instant::now();
     waiting.cancel();
     assert_eq!(
@@ -97,7 +97,7 @@ fn a_full_queue_turns_a_request_away() {
     bouncer.wait_busy(1);
     let mut queued = Client::connect(bouncer.port);
     queued.send("(+ 1 1)");
-    std::thread::sleep(Duration::from_millis(100));
+    bouncer.wait_queued(1);
     let mut refused = Client::connect(bouncer.port);
     assert_eq!(refused.query_error("(+ 2 2)"), Some("busy".to_owned()));
     running.cancel();

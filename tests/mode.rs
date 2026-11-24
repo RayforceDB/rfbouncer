@@ -6,7 +6,7 @@ mod support;
 
 use std::time::Duration;
 
-use support::{Bouncer, Client, Rayforce, int, pool, slow};
+use support::{Bouncer, Client, Rayforce, eventually, int, pool, slow};
 
 /// Two replicas that answer `who` with 1 and 2.
 fn pair() -> [Rayforce; 2] {
@@ -22,11 +22,18 @@ fn four_behind_a_slow_one(bouncer: &Bouncer) -> (Client, Vec<Client>) {
     let mut hog = Client::connect(bouncer.port);
     hog.send(&slow(60_000));
     bouncer.wait_busy(1);
-    let clients = (0..4)
-        .map(|_| {
+    // A request has arrived when it is answered or in the queue. Each is
+    // sent once the one before has, so they arrive in the order sent.
+    let arrived = || {
+        let pool = &bouncer.live()["pools"][0];
+        pool["requests"].as_u64().unwrap() + pool["queue"].as_array().unwrap().len() as u64
+    };
+    let before = arrived();
+    let clients = (1..=4)
+        .map(|i| {
             let mut c = Client::connect(bouncer.port);
             c.send("who");
-            std::thread::sleep(Duration::from_millis(50));
+            eventually("the request arrived", || arrived() >= before + i);
             c
         })
         .collect();
@@ -49,11 +56,14 @@ fn answered(c: &mut Client) -> Option<Vec<u8>> {
 fn free_sends_every_request_past_a_busy_replica() {
     let [a, b] = pair();
     let bouncer = Bouncer::start(&pool(&[&a, &b], "require_restricted = false"));
-    let (hog, mut clients) = four_behind_a_slow_one(&bouncer);
+    let (mut hog, mut clients) = four_behind_a_slow_one(&bouncer);
+    // Answered while the slow request still holds the first replica, so
+    // however long an answer takes it did not wait for that one.
     for c in &mut clients {
-        assert_eq!(answered(c), Some(int(2)));
+        assert_eq!(c.recv(), int(2));
     }
     hog.cancel();
+    assert_eq!(hog.query_error_after_cancel(), Some("cancel".to_owned()));
 }
 
 #[test]
@@ -66,8 +76,8 @@ fn round_robin_gives_each_replica_its_turn_busy_or_not() {
     let (hog, mut clients) = four_behind_a_slow_one(&bouncer);
     // The slow request took the first replica's turn; the four after it
     // are the second's, the first's, the second's, the first's.
-    assert_eq!(answered(&mut clients[0]), Some(int(2)));
-    assert_eq!(answered(&mut clients[2]), Some(int(2)));
+    assert_eq!(clients[0].recv(), int(2));
+    assert_eq!(clients[2].recv(), int(2));
     assert_eq!(answered(&mut clients[1]), None);
     assert_eq!(answered(&mut clients[3]), None);
     hog.cancel();
@@ -103,10 +113,11 @@ fn a_reload_changes_the_mode() {
     ));
     std::thread::sleep(Duration::from_millis(300));
     let (hog, mut clients) = four_behind_a_slow_one(&bouncer);
-    let waiting = clients
-        .iter_mut()
-        .filter_map(|c| answered(c).is_none().then_some(()))
-        .count();
-    assert_eq!(waiting, 2);
+    // Two wait for the busy replica's turn and two were the other's: which
+    // replica answered says so, with no guess at how long an answer takes.
+    bouncer.wait_queued(2);
     hog.cancel();
+    let mut who: Vec<Vec<u8>> = clients.iter_mut().map(Client::recv).collect();
+    who.sort();
+    assert_eq!(who, [int(1), int(1), int(2), int(2)]);
 }

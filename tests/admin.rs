@@ -98,6 +98,9 @@ fn a_paused_pool_holds_requests_until_resumed() {
     a.query("pause main");
     let mut c = user(&bouncer);
     c.send("(+ 1 2)");
+    // In the queue with the replica free: an answer that is merely slow
+    // would not be taken for one that is held.
+    bouncer.wait_queued(1);
     c.stream
         .set_read_timeout(Some(Duration::from_millis(300)))
         .unwrap();
