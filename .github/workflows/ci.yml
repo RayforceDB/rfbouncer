@@ -72,7 +72,8 @@ jobs:
       # The repository pins a stable compiler; the fuzz crate is built with
       # the nightly one, for the host as it is, so the sanitizer links.
       - name: Which host the targets are built for
-        run: echo "FUZZ_TARGET=$(rustc +nightly -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
+        run: |
+          echo "FUZZ_TARGET=$(rustc +nightly -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
