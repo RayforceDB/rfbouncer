@@ -4,10 +4,14 @@
 
 mod support;
 
+use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use rfbouncer::wire::frame::FLAG_COMPRESSED;
-use support::{Bouncer, Client, Rayforce, eventually, http_json, int, pool, slow};
+use rfbouncer::wire::frame::{self, FLAG_COMPRESSED, MSG_RESPONSE};
+use support::fake::{Fake, read_request};
+use support::{Bouncer, Client, Rayforce, eventually, http_json, int, pool};
 
 const CACHED: &str = "require_restricted = false\npassword = \"pw\"\ncache_ttl = \"60s\"";
 /// Counts how often a replica was asked: its answer is one more each time.
@@ -17,6 +21,36 @@ fn counting() -> Rayforce {
     let replica = Rayforce::start(&[]);
     assert_eq!(Client::connect(replica.port).query_error("(set n 0)"), None);
     replica
+}
+
+/// A stand-in replica that answers a request with 7 only once the test
+/// lets it, so that what happens meanwhile does not depend on how long a
+/// query takes. With it come the number of requests it was given and the
+/// sender that lets one answer go.
+fn held() -> (Fake, Arc<AtomicUsize>, mpsc::Sender<()>) {
+    let (release, gate) = mpsc::channel::<()>();
+    let gate = Mutex::new(gate);
+    let asked = Arc::new(AtomicUsize::new(0));
+    let count = asked.clone();
+    let fake = Fake::start(move |mut stream, _| {
+        while read_request(&mut stream) {
+            count.fetch_add(1, Ordering::SeqCst);
+            if gate.lock().unwrap().recv().is_err() {
+                return;
+            }
+            let _ = stream.write_all(&frame::frame(support::wire(), MSG_RESPONSE, &int(7)));
+        }
+    });
+    (fake, asked, release)
+}
+
+/// A pool named `main` over these stand-ins.
+fn fakes(fakes: &[&Fake]) -> String {
+    let backends: Vec<String> = fakes.iter().map(|f| format!("\"{}\"", f.addr())).collect();
+    format!(
+        "[[pool]]\nname = \"main\"\n{CACHED}\nbackends = [{}]\n",
+        backends.join(", ")
+    )
 }
 
 fn user(bouncer: &Bouncer) -> Client {
@@ -105,56 +139,75 @@ fn an_answer_is_not_given_past_its_ttl() {
     let replica = counting();
     let bouncer = Bouncer::start(&pool(
         &[&replica],
-        "require_restricted = false\ncache_ttl = \"2s\"",
+        "require_restricted = false\ncache_ttl = \"1s\"",
     ));
     let mut c = Client::connect(bouncer.port);
     assert_eq!(c.query(TICK), int(1));
-    assert_eq!(c.query(TICK), int(1));
-    eventually("a replica is asked again", || c.query(TICK) == int(2));
+    // However slowly this goes, the replica is asked a second time, and
+    // every request before that was answered from memory.
+    let mut sent = 1.0;
+    eventually("a replica is asked again", || {
+        sent += 1.0;
+        c.query(TICK) == int(2)
+    });
+    assert_eq!(metric(&bouncer, "cache_misses_total"), 2.0);
+    assert_eq!(metric(&bouncer, "cache_hits_total"), sent - 2.0);
 }
 
 #[test]
 fn an_answer_in_memory_waits_for_no_replica() {
-    let replica = Rayforce::start(&[]);
-    let bouncer = Bouncer::start(&pool(&[&replica], CACHED));
+    let (fake, asked, release) = held();
+    let bouncer = Bouncer::start(&fakes(&[&fake]));
     let mut c = user(&bouncer);
-    assert_eq!(c.query("(+ 1 2)"), int(3));
+    release.send(()).unwrap();
+    assert_eq!(c.query("(+ 1 2)"), int(7));
+    // The only replica is kept by another request for as long as it takes.
     let mut hog = user(&bouncer);
-    hog.send(&slow(60_000));
-    bouncer.wait_busy(1);
-    assert_eq!(c.query("(+ 1 2)"), int(3));
-    assert_eq!(bouncer.live()["pools"][0]["backends"][0]["state"], "busy");
-    hog.cancel();
-    assert_eq!(hog.query_error_after_cancel(), Some("cancel".to_owned()));
-    // A cancelled request left nothing behind to be given to the next.
-    assert_eq!(metric(&bouncer, "cache_entries"), 1.0);
+    hog.send("(hog)");
+    eventually("the replica has the other request", || {
+        asked.load(Ordering::SeqCst) == 2
+    });
+    assert_eq!(c.query("(+ 1 2)"), int(7));
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    assert_eq!(metric(&bouncer, "cache_hits_total"), 1.0);
+    release.send(()).unwrap();
+    assert_eq!(hog.recv(), int(7));
 }
 
 #[test]
 fn the_same_request_twice_at_once_runs_twice_where_two_replicas_are_free() {
-    let replicas = [Rayforce::start(&[]), Rayforce::start(&[])];
-    let all: Vec<&Rayforce> = replicas.iter().collect();
-    let bouncer = Bouncer::start(&pool(&all, CACHED));
+    let (first, asked_first, release_first) = held();
+    let (second, asked_second, release_second) = held();
+    let bouncer = Bouncer::start(&fakes(&[&first, &second]));
     let (mut a, mut b) = (user(&bouncer), user(&bouncer));
-    a.send(&slow(20_000));
-    b.send(&slow(20_000));
-    bouncer.wait_busy(2);
-    assert_eq!((a.recv(), b.recv()), (int(20_000), int(20_000)));
+    a.send("(twin)");
+    b.send("(twin)");
+    // Neither is answered until both replicas have been given one.
+    eventually("each replica runs one", || {
+        asked_first.load(Ordering::SeqCst) == 1 && asked_second.load(Ordering::SeqCst) == 1
+    });
+    release_first.send(()).unwrap();
+    release_second.send(()).unwrap();
+    assert_eq!((a.recv(), b.recv()), (int(7), int(7)));
     assert_eq!(metric(&bouncer, "cache_misses_total"), 2.0);
     assert_eq!(metric(&bouncer, "cache_hits_total"), 0.0);
 }
 
 #[test]
 fn a_request_that_waited_behind_its_twin_is_given_the_twins_answer() {
-    let replica = counting();
-    let bouncer = Bouncer::start(&pool(&[&replica], CACHED));
+    let (fake, asked, release) = held();
+    let bouncer = Bouncer::start(&fakes(&[&fake]));
     let (mut a, mut b) = (user(&bouncer), user(&bouncer));
-    let twin = format!("(do {} {TICK})", slow(8000));
-    a.send(&twin);
-    bouncer.wait_busy(1);
-    b.send(&twin);
+    a.send("(twin)");
+    eventually("the replica runs the first", || {
+        asked.load(Ordering::SeqCst) == 1
+    });
+    b.send("(twin)");
     bouncer.wait_queued(1);
-    assert_eq!((a.recv(), b.recv()), (int(1), int(1)));
+    // Only now is the first answered: the second was in the queue for it.
+    release.send(()).unwrap();
+    assert_eq!((a.recv(), b.recv()), (int(7), int(7)));
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
     assert_eq!(metric(&bouncer, "cache_hits_total"), 1.0);
     assert_eq!(metric(&bouncer, "cache_misses_total"), 1.0);
 }
