@@ -23,6 +23,12 @@ const HTTP_RESERVE: usize = 16;
 /// Connections the system holds for us between two accepts.
 const BACKLOG: u32 = 1024;
 
+/// How long a stop waits for connections still on their way into the
+/// port's queue. A client's `connect` returns one packet before the system
+/// lists the connection here: on loopback that is microseconds, and across
+/// a network it is the way from the client.
+const STOP_GRACE: Duration = Duration::from_millis(50);
+
 /// The first byte of a TLS connection: the record type of a handshake.
 const TLS_HANDSHAKE: u8 = 0x16;
 
@@ -68,13 +74,21 @@ pub async fn run(listener: TcpListener, scope: Scope, core: Arc<Core>) {
     let open = Arc::new(AtomicUsize::new(0));
     let mut shutdown = core.shutdown.subscribe();
     let mut stopping = false;
+    let mut looked_again = false;
     loop {
         let accepted = if stopping {
             // Whoever finished connecting before the stop is still served:
-            // closing the port with them on it would reset them.
+            // closing the port with them on it would reset them. An empty
+            // queue is looked at once more a moment later, for the ones
+            // whose last packet of the handshake had not arrived.
             match waiting(&listener) {
                 Some(pair) => Ok(pair),
-                None => return,
+                None if looked_again => return,
+                None => {
+                    looked_again = true;
+                    tokio::time::sleep(STOP_GRACE).await;
+                    continue;
+                }
             }
         } else {
             tokio::select! {
@@ -230,6 +244,32 @@ mod tests {
             let greeted = timeout(Duration::from_secs(10), client.read_exact(&mut hello)).await;
             assert!(matches!(greeted, Ok(Ok(_))), "{greeted:?}");
             assert_eq!(hello, [4, 0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_made_the_instant_before_the_stop_is_taken_too() {
+        // `connect` returns to the client one packet before the system puts
+        // the connection in the port's queue; on macOS loopback nearly half
+        // of them are not there yet when the very next call looks. Each
+        // round stops the listener right behind such a connect.
+        let text = "listen = \"127.0.0.1:0\"\n[[pool]]\nname = \"p\"\nbackends = [\"127.0.0.1:1\"]";
+        let config: Config = toml::from_str(text).unwrap();
+        let core = Core::new("unused".into(), config.clone(), Arc::new(Stats::default()));
+        core.shutdown.send_replace(true);
+        for round in 0..20 {
+            let listener = bind(config.listen, false).unwrap();
+            let addr = listener.local_addr().unwrap();
+            // A blocking connect, so that nothing runs between its return
+            // and the listener's look at its queue.
+            let client = std::net::TcpStream::connect(addr).unwrap();
+            run(listener, Scope::All, core.clone()).await;
+            client.set_nonblocking(true).unwrap();
+            let mut client = TcpStream::from_std(client).unwrap();
+            client.write_all(&[4, 0]).await.unwrap();
+            let mut hello = [0u8; 2];
+            let greeted = timeout(Duration::from_secs(10), client.read_exact(&mut hello)).await;
+            assert!(matches!(greeted, Ok(Ok(_))), "round {round}: {greeted:?}");
         }
     }
 }
