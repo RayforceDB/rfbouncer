@@ -38,4 +38,5 @@ lto = "thin"
 codegen-units = 1
 
 [dev-dependencies]
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
