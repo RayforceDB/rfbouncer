@@ -129,12 +129,14 @@ async fn show_pools(core: &Core) -> Vec<u8> {
         (vec![], vec![], vec![], vec![], vec![]);
     let (mut refused, mut failed, mut retries, mut wait, mut exec) =
         (vec![], vec![], vec![], vec![], vec![]);
+    let mut cached = vec![];
     for pool in core.pools() {
         let Some(s) = pool.snapshot().await else {
             continue;
         };
         let c = &pool.shared.counters;
         let n = c.requests.load(Relaxed);
+        cached.push(c.cached.load(Relaxed) as i64);
         name.push(s.name.to_string());
         paused.push(i64::from(s.paused));
         queue.push(s.queue.len() as i64);
@@ -161,6 +163,7 @@ async fn show_pools(core: &Core) -> Vec<u8> {
         ("busy", Column::I64(busy)),
         ("requests", Column::I64(requests)),
         ("ok", Column::I64(ok)),
+        ("cached", Column::I64(cached)),
         ("errors", Column::I64(errors)),
         ("cancelled", Column::I64(cancelled)),
         ("timeouts", Column::I64(timeouts)),

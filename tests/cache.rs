@@ -77,6 +77,10 @@ fn the_same_request_is_answered_from_memory() {
     admin.query("resume");
     assert_eq!(c.recv(), int(1));
 
+    // The console's counts add up: every request is under one outcome.
+    let pools = String::from_utf8_lossy(&admin.query("show pools")).into_owned();
+    assert!(pools.contains("cached"), "{pools}");
+
     // Emptied, it asks a replica again.
     assert_eq!(admin.query_error("flush main"), None);
     assert_eq!(metric(&bouncer, "cache_entries"), 0.0);

@@ -354,8 +354,10 @@ whose address is not loopback (`127.0.0.0/8`, `::1`).
   to answer, `transfer_timeout` from then until the client has it all, which
   now includes taking it from the replica and compressing it. Nothing
   reaches the client until that is done.
-- If the replica's connection breaks in the middle of such an answer, the
-  client's connection is closed, as it is for an answer passed on plain.
+- If the replica's connection breaks in the middle of such an answer,
+  nothing of it has reached the client, and the request is run again as
+  `retry` says. An answer passed on plain is half sent by then, and its
+  client's connection is closed.
 
 What it buys depends on the data: Rayforce's scheme is run lengths of byte
 differences, which finds the zero bytes of small integers and little else.

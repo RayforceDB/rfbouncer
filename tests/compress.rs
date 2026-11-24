@@ -4,11 +4,14 @@
 
 mod support;
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use rfbouncer::wire::compress::{compress, decompress};
-use rfbouncer::wire::frame::{FLAG_COMPRESSED, HEADER_LEN, Header, PAYLOAD_MAX};
+use rfbouncer::wire::frame::{
+    self, FLAG_COMPRESSED, HEADER_LEN, Header, MSG_RESPONSE, PAYLOAD_MAX,
+};
+use support::fake::{Fake, read_request};
 use support::{Bouncer, Client, Rayforce, eventually, int, pool, rayforce_eval};
 
 /// The tests' clients are on loopback, where nothing is compressed unless
@@ -136,6 +139,28 @@ fn a_slow_reader_of_a_compressed_answer_is_cut_off_too() {
     assert_eq!(header.flags & FLAG_COMPRESSED, FLAG_COMPRESSED);
     assert!(header.size < 32_000_000, "{}", header.size);
     assert!(sink.len() < HEADER_LEN + header.size, "got a whole answer");
+}
+
+#[test]
+fn an_answer_that_breaks_off_before_it_is_compressed_is_run_again() {
+    let fake = Fake::start(|mut stream, _| {
+        if read_request(&mut stream) {
+            let whole = frame::frame(support::wire(), MSG_RESPONSE, &[0u8; 5000]);
+            let _ = stream.write_all(&whole[..2500]);
+        }
+    });
+    let good = Rayforce::start(&[]);
+    let bouncer = Bouncer::start(&format!(
+        "[[pool]]\nname = \"main\"\n{ALWAYS}\nbackends = [\"{}\", \"{}\"]\n",
+        fake.addr(),
+        good.addr()
+    ));
+    // Half the answer is in the bouncer and none of it with the client.
+    assert_eq!(Client::connect(bouncer.port).query("(+ 1 1)"), int(2));
+    assert_eq!(
+        bouncer.metric("rfbouncer_retries_total{pool=\"main\"}"),
+        1.0
+    );
 }
 
 /// Not a test: prints what compressing costs and saves on a few results.

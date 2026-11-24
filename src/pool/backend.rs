@@ -508,6 +508,14 @@ async fn exchange(
             }
         }
     }
+    // Taken whole before any of it is sent, an answer that broke off on its
+    // way from the replica has not reached the client: another may try.
+    if squeeze
+        && !slow
+        && let Some(reason) = broken
+    {
+        return Exchange::Retry(job, reason);
+    }
     if let Some(reason) = broken {
         // `try_send`: a client that is not taking the answer is not waited
         // for again; dropping the channel closes its connection just as well.
