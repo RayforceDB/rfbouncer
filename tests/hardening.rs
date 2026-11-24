@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use rfbouncer::wire::frame::{self, FLAG_COMPRESSED, Header, MSG_RESPONSE};
 use rfbouncer::wire::value::error_code;
-use support::fake::{Fake, answer_forever, gate, read_request};
+use support::fake::{Fake, gate, read_request};
 use support::{
     Bouncer, Client, Rayforce, Refused, eventually, http_get, http_json, int, pool, signal, slow,
 };
@@ -94,9 +94,9 @@ fn a_request_given_back_by_a_dead_replica_waits_afresh_for_another() {
         if n == 0 {
             read_request(&mut stream);
             alive.wait();
-        } else {
-            answer_forever(stream, 42);
         }
+        // Once dead it stays dead: a connection made afterwards is hung up
+        // on, so the request it gave back can only go to the other replica.
     });
     let slow_one = Fake::start(move |mut stream, _| {
         while read_request(&mut stream) && held.wait() {
