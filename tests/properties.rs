@@ -224,9 +224,10 @@ proptest! {
     }
 
     #[test]
-    fn what_repeats_is_made_smaller(byte in any::<u8>(), step in any::<u8>(), len in 8usize..3000) {
+    fn what_repeats_is_made_smaller(byte in any::<u8>(), step in any::<u8>(), len in 16usize..3000) {
         // A constant stretch and an evenly climbing one are both runs of
-        // one delta: about two bytes for every 127.
+        // one delta: about two bytes for every 127. Eight bytes come out
+        // as eight and are declined, so the stretch starts longer.
         let plain: Vec<u8> = (0..len).map(|i| byte.wrapping_add(step.wrapping_mul(i as u8))).collect();
         let wire = compress(&plain).expect("runs compress");
         prop_assert!(wire.len() <= 4 + 2 + 2 * len.div_ceil(127), "{} bytes for {}", wire.len(), len);
