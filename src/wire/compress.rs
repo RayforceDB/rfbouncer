@@ -46,6 +46,34 @@ pub fn decompress(body: &[u8], max: usize) -> Result<Vec<u8>, CompressError> {
     Ok(out)
 }
 
+/// As much of the start of a compressed payload as `limit` bytes hold, for
+/// when only the start is wanted: nothing past it is decoded or allocated,
+/// whatever size the payload claims. A stream that breaks off gives what
+/// came before the break.
+pub fn decompress_prefix(body: &[u8], limit: usize) -> Vec<u8> {
+    let stream = body.get(4..).unwrap_or_default();
+    let mut out: Vec<u8> = Vec::with_capacity(limit.min(4096));
+    let mut at = 0;
+    while at < stream.len() && out.len() < limit {
+        let count = stream[at] as i8;
+        at += 1;
+        let len = usize::from(count.unsigned_abs()).min(limit - out.len());
+        if count > 0 {
+            let Some(value) = stream.get(at) else { break };
+            at += 1;
+            out.resize(out.len() + len, *value);
+        } else {
+            let literal = stream.get(at..).unwrap_or_default();
+            out.extend_from_slice(&literal[..len.min(literal.len())]);
+            at += usize::from(count.unsigned_abs());
+        }
+    }
+    for i in 1..out.len() {
+        out[i] = out[i].wrapping_add(out[i - 1]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +100,29 @@ mod tests {
         assert!(decompress(&[4, 0, 0, 0, 3], 100).is_err()); // run without value
         assert!(decompress(&[4, 0, 0, 0, 0xfc, 1, 2], 100).is_err()); // short literal
         assert!(decompress(&[4, 0, 0, 0, 2, 1], 100).is_err()); // too short
+    }
+
+    #[test]
+    fn a_prefix_is_the_start_of_the_whole() {
+        let mut wire = vec![
+            0x6a, 0x09, 0, 0, 0xfb, 0x05, 0xfb, 0x2c, 0xd5, 0xff, 0x05, 0x00,
+        ];
+        wire.extend(std::iter::repeat_n([0xfe, 0x05, 0xfb, 0x06, 0x00], 300).flatten());
+        let whole = decompress(&wire, 1 << 20).unwrap();
+        for limit in [0, 1, 4, 5, 9, 10, 11, 17, 100, 2410, 5000] {
+            assert_eq!(
+                decompress_prefix(&wire, limit),
+                whole[..limit.min(whole.len())],
+                "limit {limit}"
+            );
+        }
+        // Cut anywhere, it gives a start of the whole and never panics.
+        for cut in 0..60 {
+            let part = decompress_prefix(&wire[..cut], 64);
+            assert_eq!(part, whole[..part.len()], "cut {cut}");
+        }
+        // A payload that claims gigabytes costs what was asked for.
+        let huge = [0xff, 0xff, 0xff, 0x7f, 0x7f, 0x01, 0x7f, 0x00, 0x7f, 0x00];
+        assert_eq!(decompress_prefix(&huge, 8).len(), 8);
     }
 }

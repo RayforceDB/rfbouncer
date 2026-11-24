@@ -1,6 +1,6 @@
 //! The report pages and the metrics, over HTTP on the bouncer's own port.
 //!
-//! Everything here is read-only and behind the admin password. The page is
+//! Everything here is read-only and behind a password, but for `/healthz`. The page is
 //! built into the binary and asks for JSON; nothing is fetched from anywhere
 //! else.
 
@@ -28,6 +28,7 @@ use tokio::net::TcpStream;
 
 use crate::core::Core;
 use crate::metrics;
+use crate::pool::request_text;
 use api::Filter;
 
 const INDEX: &str = include_str!("../../web/index.html");
@@ -90,19 +91,37 @@ fn authorized(request: &Request<Incoming>, password: &str) -> bool {
 }
 
 async fn handle(request: Request<Incoming>, core: &Arc<Core>) -> Reply {
-    let Some(password) = core.config().admin_password.clone() else {
-        return reply(
-            StatusCode::FORBIDDEN,
-            TEXT,
-            "the reports are off: set admin_password to turn them on\n",
-        );
-    };
-    if !authorized(&request, &password) {
-        let mut response = reply(
-            StatusCode::UNAUTHORIZED,
-            TEXT,
-            "the admin password is required\n",
-        );
+    // What a load balancer asks, with no password: is there a replica to
+    // send a request to. It says nothing else.
+    if request.uri().path() == "/healthz" {
+        return if healthy(core).await {
+            reply(StatusCode::OK, TEXT, "ok\n")
+        } else {
+            reply(StatusCode::SERVICE_UNAVAILABLE, TEXT, "no replica is up\n")
+        };
+    }
+    let config = core.config();
+    let passwords: Vec<&str> = [&config.report_password, &config.admin_password]
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    if passwords.is_empty() {
+        let why = "the reports are off: set admin_password or report_password to turn them on\n";
+        return reply(StatusCode::FORBIDDEN, TEXT, why);
+    }
+    if !passwords
+        .iter()
+        .any(|password| authorized(&request, password))
+    {
+        // A browser asks once without credentials to learn that it needs
+        // them; only a wrong password is a refusal worth a line.
+        if request.headers().contains_key(AUTHORIZATION) {
+            core.auth_failures.fetch_add(1, Relaxed);
+            tracing::warn!(path = request.uri().path(), "credentials refused over HTTP");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let mut response = reply(StatusCode::UNAUTHORIZED, TEXT, "a password is required\n");
         let challenge = hyper::header::HeaderValue::from_static("Basic realm=\"rfbouncer\"");
         response.headers_mut().insert(WWW_AUTHENTICATE, challenge);
         return response;
@@ -158,6 +177,18 @@ async fn report(core: &Arc<Core>, what: String, filter: Filter) -> Reply {
     }
 }
 
+/// Whether any pool has a replica connected.
+async fn healthy(core: &Core) -> bool {
+    for pool in core.pools() {
+        if let Some(snapshot) = pool.snapshot().await
+            && snapshot.backends.iter().any(|b| b.connected && !b.draining)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// What the bouncer is doing this instant: every pool's replicas and queue.
 async fn live(core: &Core) -> Value {
     let mut pools = Vec::new();
@@ -172,15 +203,15 @@ async fn live(core: &Core) -> Value {
             .map(|b| {
                 json!({
                     "addr": &*b.addr,
-                    "state": b.state,
+                    "state": b.state(),
                     "draining": b.draining,
                     "last_error": b.last_error,
                     "served": b.served,
                     "failures": b.failures,
-                    "running": b.running.as_ref().map(|(client, since, text)| json!({
+                    "running": b.running.as_ref().map(|(client, since, frame)| json!({
                         "client": client.to_string(),
                         "ms": since.as_millis() as u64,
-                        "text": text,
+                        "text": request_text(frame),
                     })),
                 })
             })
@@ -188,7 +219,7 @@ async fn live(core: &Core) -> Value {
         let queue: Vec<Value> = s
             .queue
             .iter()
-            .map(|q| json!({ "client": q.client.to_string(), "waited_ms": q.waited.as_millis() as u64, "text": q.text }))
+            .map(|q| json!({ "client": q.client.to_string(), "waited_ms": q.waited.as_millis() as u64, "text": request_text(&q.frame) }))
             .collect();
         pools.push(json!({
             "name": &*s.name,

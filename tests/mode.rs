@@ -21,7 +21,7 @@ fn pair() -> [Rayforce; 2] {
 fn four_behind_a_slow_one(bouncer: &Bouncer) -> (Client, Vec<Client>) {
     let mut hog = Client::connect(bouncer.port);
     hog.send(&slow(60_000));
-    std::thread::sleep(Duration::from_millis(200));
+    bouncer.wait_busy(1);
     let clients = (0..4)
         .map(|_| {
             let mut c = Client::connect(bouncer.port);

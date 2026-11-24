@@ -42,7 +42,7 @@ fn a_slow_query_on_one_replica_does_not_hold_the_others() {
     let bouncer = Bouncer::start(&pool(&all, "require_restricted = false"));
     let mut hog = Client::connect(bouncer.port);
     hog.send(&slow(60_000));
-    std::thread::sleep(Duration::from_millis(200));
+    bouncer.wait_busy(1);
 
     // A connection per query, as a client without a pool of its own does it.
     let started = Instant::now();

@@ -5,24 +5,33 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
-use tokio::time::{sleep, sleep_until, timeout};
+use tokio::time::{sleep, sleep_until, timeout, timeout_at};
 
 use super::{Cmd, Ending, Job, Reply, Shared};
 use crate::config::PoolConfig;
 use crate::stats::event::Outcome;
-use crate::wire::frame::{self, HEADER_LEN, Header, MSG_RESPONSE, MSG_SYNC, PAYLOAD_MAX};
+use crate::wire::frame::{
+    self, FLAG_COMPRESSED, HEADER_LEN, Header, MSG_RESPONSE, MSG_SYNC, PAYLOAD_MAX,
+};
 use crate::wire::{greeting, oob, value};
 
 /// A replica answers the greeting from its evaluating thread, so this is how
 /// long a replica busy with someone else's query may keep a new connection.
 const GREET_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long a replica may go silent in the middle of an answer.
-const TRANSFER_STALL: Duration = Duration::from_secs(60);
+/// How long a replica may go silent in the middle of an answer, or refuse
+/// to take more of a request.
+const STALL: Duration = Duration::from_secs(60);
 const RETRY_MIN: Duration = Duration::from_millis(100);
 const RETRY_MAX: Duration = Duration::from_secs(5);
+/// A connection that lasted this long was a working one: the next attempt
+/// after it is made at once.
+const SETTLED: Duration = Duration::from_secs(1);
+/// A peer that has vanished without closing is noticed within about this.
+const KEEPALIVE: Duration = Duration::from_secs(30);
 const CHUNK: usize = 64 * 1024;
 /// An answer nobody waits for is read off the wire up to this size; past it
 /// a new connection is cheaper.
@@ -52,10 +61,15 @@ enum Next {
 }
 
 pub async fn run(ctx: Ctx, mut rx: mpsc::UnboundedReceiver<Msg>) {
+    // How long to wait before the next attempt. It grows while attempts
+    // fail, and also while they succeed only to be dropped at once: a
+    // replica that greets and hangs up is not hammered.
+    let mut delay = Duration::ZERO;
     loop {
-        let Some(mut stream) = connect(&ctx, &mut rx).await else {
+        let Some(mut stream) = connect(&ctx, &mut rx, &mut delay).await else {
             break;
         };
+        let born = Instant::now();
         let _ = ctx.events.send(Cmd::Up(ctx.idx));
         match serve(&ctx, &mut stream, &mut rx).await {
             Next::Reconnect(reason) => {
@@ -63,16 +77,24 @@ pub async fn run(ctx: Ctx, mut rx: mpsc::UnboundedReceiver<Msg>) {
             }
             Next::Stop => break,
         }
+        delay = if born.elapsed() >= SETTLED {
+            Duration::ZERO
+        } else {
+            (delay * 2).clamp(RETRY_MIN, RETRY_MAX)
+        };
     }
     let _ = ctx.events.send(Cmd::Gone(ctx.idx));
 }
 
 /// Tries until a connection is open, backing off between attempts. `None`
 /// when told to stop meanwhile.
-async fn connect(ctx: &Ctx, rx: &mut mpsc::UnboundedReceiver<Msg>) -> Option<TcpStream> {
-    let mut delay = Duration::ZERO;
+async fn connect(
+    ctx: &Ctx,
+    rx: &mut mpsc::UnboundedReceiver<Msg>,
+    delay: &mut Duration,
+) -> Option<TcpStream> {
     loop {
-        let pause = delay;
+        let pause = *delay;
         let attempt = async move {
             sleep(pause).await;
             open(ctx).await
@@ -88,6 +110,8 @@ async fn connect(ctx: &Ctx, rx: &mut mpsc::UnboundedReceiver<Msg>) -> Option<Tcp
                         let reason = "replica not connected".to_owned();
                         let _ = ctx.events.send(Cmd::Failed { idx: ctx.idx, job, sent: false, reason });
                     }
+                    // A cancel for a request this replica no longer has: the
+                    // pool remembers it and deals with the request itself.
                     Some(Msg::Cancel(_) | Msg::Reconnect) => {}
                 },
             }
@@ -96,7 +120,7 @@ async fn connect(ctx: &Ctx, rx: &mut mpsc::UnboundedReceiver<Msg>) -> Option<Tcp
             Ok(stream) => return Some(stream),
             Err(reason) => {
                 let _ = ctx.events.send(Cmd::Down(ctx.idx, reason));
-                delay = (delay * 2).clamp(RETRY_MIN, RETRY_MAX);
+                *delay = (*delay * 2).clamp(RETRY_MIN, RETRY_MAX);
             }
         }
     }
@@ -109,6 +133,12 @@ async fn open(ctx: &Ctx) -> Result<TcpStream, String> {
         .map_err(|_| "connect timed out".to_owned())?
         .map_err(|e| format!("connect: {e}"))?;
     let _ = stream.set_nodelay(true);
+    // Without this a replica whose host vanished mid-query, with nothing of
+    // ours unacknowledged, would never be seen to be gone.
+    let keepalive = TcpKeepalive::new()
+        .with_time(KEEPALIVE)
+        .with_interval(KEEPALIVE / 3);
+    let _ = SockRef::from(&stream).set_tcp_keepalive(&keepalive);
     timeout(GREET_TIMEOUT, async {
         greeting::connect(
             &mut stream,
@@ -159,19 +189,31 @@ async fn serve(ctx: &Ctx, stream: &mut TcpStream, rx: &mut mpsc::UnboundedReceiv
                 Some(Msg::Cancel(_)) => {}
                 Some(Msg::Run(job)) => {
                     let mut after = None;
-                    match exchange(ctx, stream, job, rx, &mut after).await {
+                    // A connection that did not survive the request is said
+                    // to be down before the request is said to be over, so
+                    // the pool does not hand this replica the next one in
+                    // between.
+                    let broken = match exchange(ctx, stream, job, rx, &mut after).await {
                         Exchange::Clean => {
                             let _ = ctx.events.send(Cmd::Finished(ctx.idx));
+                            None
                         }
-                        Exchange::Broken(reason) => return after.unwrap_or(Next::Reconnect(reason)),
+                        Exchange::Broken(reason) => {
+                            let _ = ctx.events.send(Cmd::Down(ctx.idx, reason.clone()));
+                            let _ = ctx.events.send(Cmd::Finished(ctx.idx));
+                            Some(reason)
+                        }
                         Exchange::Retry(job, reason) => {
+                            let _ = ctx.events.send(Cmd::Down(ctx.idx, reason.clone()));
                             let failed = Cmd::Failed { idx: ctx.idx, job, sent: true, reason: reason.clone() };
                             let _ = ctx.events.send(failed);
-                            return after.unwrap_or(Next::Reconnect(reason));
+                            Some(reason)
                         }
-                    }
-                    if let Some(next) = after {
-                        return next;
+                    };
+                    match (after, broken) {
+                        (Some(next), _) => return next,
+                        (None, Some(reason)) => return Next::Reconnect(reason),
+                        (None, None) => {}
                     }
                 }
             },
@@ -224,14 +266,34 @@ async fn exchange(
         bytes_out,
         outcome,
     };
+    let deadline = (!cfg.query_timeout.is_zero()).then(|| started + cfg.query_timeout);
 
-    if let Err(e) = stream.write_all(&job.frame).await {
-        return Exchange::Retry(job, format!("send: {e}"));
+    // A replica that does not read, with a request too large for the socket
+    // to swallow, would hold this write for good: it is given the request's
+    // own budget, and no longer than a stalled transfer is given.
+    let stalled = started + STALL;
+    let written = tokio::select! {
+        written = stream.write_all(&job.frame) => written.map_err(|e| format!("send: {e}")),
+        () = sleep_until(deadline.unwrap_or(stalled).min(stalled).into()) => Err(String::new()),
+        () = job.reply.closed() => {
+            ctx.shared.report(&job, end(Outcome::Cancelled, 0));
+            return Exchange::Broken("client left before its request was sent".into());
+        }
+    };
+    match written {
+        Ok(()) => {}
+        Err(reason) if !reason.is_empty() => return Exchange::Retry(job, reason),
+        Err(_) if deadline.is_some_and(|d| Instant::now() >= d) => {
+            job.refuse("timeout", &timeout_message(&cfg)).await;
+            ctx.shared.report(&job, end(Outcome::Timeout, 0));
+            return Exchange::Broken("did not take the request within its budget".into());
+        }
+        Err(_) => return Exchange::Retry(job, "did not take the request".into()),
     }
 
-    let deadline = (!cfg.query_timeout.is_zero()).then(|| started + cfg.query_timeout);
     let mut cancel: Option<Why> = None;
     let mut grace: Option<Instant> = None;
+    let mut closed = false;
     let mut raw = [0u8; HEADER_LEN];
     let mut filled = 0;
     let failure = loop {
@@ -247,7 +309,9 @@ async fn exchange(
                 }
                 Err(e) => break Some(format!("receive: {e}")),
             },
-            msg = rx.recv(), if after.is_none() => match msg {
+            // Read on whatever is pending: a reconnect asked for meanwhile
+            // must not make this request deaf to its client's cancel.
+            msg = rx.recv(), if !closed => match msg {
                 Some(Msg::Cancel(id)) if id == job.id && cancel.is_none() => Why::Client,
                 Some(Msg::Cancel(_)) => continue,
                 Some(Msg::Run(other)) => {
@@ -256,10 +320,15 @@ async fn exchange(
                     continue;
                 }
                 Some(Msg::Reconnect) => {
-                    *after = Some(Next::Reconnect("reconnect requested".into()));
+                    after.get_or_insert(Next::Reconnect("reconnect requested".into()));
                     continue;
                 }
-                None | Some(Msg::Stop) => {
+                Some(Msg::Stop) => {
+                    *after = Some(Next::Stop);
+                    continue;
+                }
+                None => {
+                    closed = true;
                     *after = Some(Next::Stop);
                     continue;
                 }
@@ -324,6 +393,13 @@ async fn exchange(
         };
     }
 
+    // From here the replica's thread is free again but its connection is
+    // not, until the client has taken the whole answer. A client that takes
+    // it too slowly is cut off, so it cannot hold the replica as long as it
+    // likes.
+    let due = (!cfg.transfer_timeout.is_zero())
+        .then(|| tokio::time::Instant::now() + cfg.transfer_timeout);
+    let far = tokio::time::Instant::now() + Duration::from_secs(86_400 * 365);
     let mut client_gone = job
         .reply
         .send(Reply::Data(Bytes::copy_from_slice(&raw)))
@@ -332,6 +408,7 @@ async fn exchange(
     let mut remaining = header.size;
     let mut head: Vec<u8> = Vec::with_capacity(9);
     let mut broken = None;
+    let mut slow = false;
     while remaining > 0 {
         if client_gone && remaining > DRAIN_MAX {
             broken = Some("client left in the middle of a large answer".to_owned());
@@ -339,14 +416,25 @@ async fn exchange(
         }
         let mut chunk = BytesMut::with_capacity(remaining.min(CHUNK));
         let mut limited = (&mut *stream).take(remaining as u64);
-        match timeout(TRANSFER_STALL, limited.read_buf(&mut chunk)).await {
+        match timeout(STALL, limited.read_buf(&mut chunk)).await {
             Ok(Ok(n)) if n > 0 => {
                 remaining -= n;
                 if head.len() < 9 {
                     head.extend_from_slice(&chunk[..n.min(9 - head.len())]);
                 }
                 if !client_gone {
-                    client_gone = job.reply.send(Reply::Data(chunk.freeze())).await.is_err();
+                    match timeout_at(
+                        due.unwrap_or(far),
+                        job.reply.send(Reply::Data(chunk.freeze())),
+                    )
+                    .await
+                    {
+                        Ok(sent) => client_gone = sent.is_err(),
+                        Err(_) => {
+                            slow = true;
+                            broken = Some("client took the answer too slowly".to_owned());
+                        }
+                    }
                 }
             }
             Ok(Ok(_)) => {
@@ -361,12 +449,27 @@ async fn exchange(
     }
     let sent = (HEADER_LEN + header.size - remaining) as u64;
     if let Some(reason) = broken {
-        let _ = job.reply.send(Reply::Abort).await;
-        ctx.shared.report(&job, end(Outcome::Failed, sent));
+        // `try_send`: a client that is not taking the answer is not waited
+        // for again; dropping the channel closes its connection just as well.
+        let _ = job.reply.try_send(Reply::Abort);
+        let outcome = if slow {
+            Outcome::Timeout
+        } else {
+            Outcome::Failed
+        };
+        ctx.shared.report(&job, end(outcome, sent));
         return Exchange::Broken(reason);
     }
     let _ = job.reply.send(Reply::Done).await;
-    let outcome = match value::error_code(&head) {
+    // A compressed payload opens with its size, not with a type: only a
+    // plain one can be told for an error by its first byte. Errors are far
+    // too short to be compressed.
+    let code = if header.flags & FLAG_COMPRESSED == 0 {
+        value::error_code(&head)
+    } else {
+        None
+    };
+    let outcome = match code {
         _ if client_gone => Outcome::Cancelled,
         Some(code) if code == "cancel" && cancel.is_some() => Outcome::Cancelled,
         Some(code) => Outcome::ServerError(code),
@@ -377,10 +480,7 @@ async fn exchange(
 }
 
 fn timeout_message(cfg: &PoolConfig) -> String {
-    format!(
-        "query ran past its {} s budget",
-        cfg.query_timeout.as_secs()
-    )
+    format!("query ran past its budget of {:?}", cfg.query_timeout)
 }
 
 /// Reads an answer nobody waits for off the wire, so the connection is on a
@@ -390,7 +490,7 @@ async fn drain(stream: &mut TcpStream, size: usize) -> Result<(), String> {
         return Err("abandoned a large answer".to_owned());
     }
     let mut sink = vec![0u8; size];
-    match timeout(TRANSFER_STALL, stream.read_exact(&mut sink)).await {
+    match timeout(STALL, stream.read_exact(&mut sink)).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(format!("receive: {e}")),
         Err(_) => Err("replica stalled in the middle of an answer".to_owned()),

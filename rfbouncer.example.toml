@@ -1,4 +1,5 @@
 # rfbouncer: one port in front of a pool of read-only Rayforce replicas.
+# Every setting is shown with its default, except where a line says otherwise.
 # Durations are written 500ms, 10s, 5m, 2h, 30d; sizes 4096, 64KiB, 16MiB.
 
 # Clients, the admin console and the report pages all use this one port.
@@ -7,6 +8,9 @@ listen = "0.0.0.0:5000"
 # Opens the admin console (user "rfbouncer") and the report pages (HTTP Basic,
 # any user name). Without it there is neither.
 admin_password = "change-me"
+# Opens the report pages and /metrics only: for dashboards and scrapers that
+# should not be able to pause a pool or stop the bouncer. Optional.
+# report_password = "read-only"
 
 max_client_conn = 10000
 max_request_bytes = "16MiB"
@@ -79,9 +83,14 @@ affinity = false
 # the client is answered with the error "busy".
 queue_max = 1000
 query_wait_timeout = "10s"
-# A request running longer is cancelled and answered with "timeout"; 0 is no
-# limit.
+# How long a replica may take to start answering. Past it the request is
+# cancelled and answered with "timeout"; 0 is no limit, and then a replica
+# that hangs holds its request for good.
 query_timeout = "30s"
+# How long a client may take to receive an answer once it has begun. A
+# client that reads slower than that is cut off, so it cannot hold a replica
+# as long as it likes; 0 is no limit.
+transfer_timeout = "60s"
 # How long a replica has to answer a cancel before its connection is dropped
 # and opened again.
 cancel_grace = "5s"

@@ -3,7 +3,7 @@
 //! as bytes. Every layout here is pinned by bytes read off a real server.
 
 use super::compress;
-use super::frame::{FLAG_COMPRESSED, PAYLOAD_MAX};
+use super::frame::FLAG_COMPRESSED;
 
 /// A string atom: `RAY_STR` (13) negated, a flags byte, an i64 length, bytes.
 const TYPE_STR_ATOM: u8 = 0xF3;
@@ -26,12 +26,18 @@ pub fn str_atom(text: &str) -> Vec<u8> {
     out
 }
 
+/// The most of a request's text that is ever read out of its payload.
+pub const TEXT_CAP: usize = 16 * 1024;
+
 /// The text of a request payload when it is a string atom, which is how a
-/// client sends source to be parsed and evaluated. `None` for anything else.
+/// client sends source to be parsed and evaluated; `None` for anything else.
+/// At most `TEXT_CAP` bytes of it, read out of at most that much of the
+/// payload: a request is looked at this way on every snapshot of a pool and
+/// by the statistics, and its size is the client's to choose.
 pub fn request_text(flags: u8, payload: &[u8]) -> Option<String> {
     let plain;
     let payload = if flags & FLAG_COMPRESSED != 0 {
-        plain = compress::decompress(payload, PAYLOAD_MAX).ok()?;
+        plain = compress::decompress_prefix(payload, 10 + TEXT_CAP);
         &plain[..]
     } else {
         payload
@@ -43,7 +49,7 @@ pub fn request_text(flags: u8, payload: &[u8]) -> Option<String> {
     let mut len = [0u8; 8];
     len.copy_from_slice(&head[2..]);
     let len = usize::try_from(i64::from_le_bytes(len)).ok()?;
-    let text = rest.get(..len)?;
+    let text = &rest[..len.min(rest.len()).min(TEXT_CAP)];
     Some(String::from_utf8_lossy(text).into_owned())
 }
 
@@ -324,7 +330,11 @@ mod tests {
         assert_eq!(str_atom("hi"), hex("f30002000000000000006869"));
         assert_eq!(request_text(0, &str_atom("(+ 1 2)")).unwrap(), "(+ 1 2)");
         assert_eq!(request_text(0, &hex("fb000300000000000000")), None);
-        assert_eq!(request_text(0, &hex("f300ff00000000000000")), None);
+        // A length past the end gives what there is: the frame may be a clipped copy.
+        assert_eq!(
+            request_text(0, &hex("f300ff000000000000006869")).unwrap(),
+            "hi"
+        );
     }
 
     #[test]

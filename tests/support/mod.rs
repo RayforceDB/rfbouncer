@@ -53,7 +53,12 @@ fn spawn(command: &mut Command) -> Child {
 pub fn free_port() -> u16 {
     static NEXT_PORT: AtomicUsize = AtomicUsize::new(0);
     let stretch = (std::process::id() as usize % 100) * 120;
-    (20_000 + stretch + NEXT_PORT.fetch_add(1, Ordering::Relaxed) % 120) as u16
+    let n = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        n < 120,
+        "a test process may take 120 ports; give it a longer stretch"
+    );
+    (20_000 + stretch + n) as u16
 }
 
 fn wait_for_port(port: u16, what: &str) {
@@ -223,6 +228,51 @@ impl Bouncer {
         };
         wait_for_port(port, "rfbouncer");
         bouncer
+    }
+
+    /// What `/api/live` says, read with the admin password `root`.
+    pub fn live(&self) -> serde_json::Value {
+        http_json(self.port, "/api/live", "root")
+    }
+
+    /// Waits until `n` replica connections are running a request: the
+    /// condition a test means when it says "the slow query is running".
+    pub fn wait_busy(&self, n: usize) {
+        eventually(&format!("{n} replicas busy"), || {
+            let live = self.live();
+            let busy = live["pools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|p| p["backends"].as_array().unwrap().iter());
+            busy.filter(|b| b["state"] == "busy").count() >= n
+        });
+    }
+
+    /// Waits until `n` requests are waiting for a replica.
+    pub fn wait_queued(&self, n: usize) {
+        eventually(&format!("{n} requests queued"), || {
+            let live = self.live();
+            live["pools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["queue"].as_array().unwrap().len())
+                .sum::<usize>()
+                >= n
+        });
+    }
+
+    /// The value of the metric line that starts with `line`, e.g.
+    /// `rfbouncer_requests_total{pool="main",outcome="ok"}`.
+    pub fn metric(&self, line: &str) -> f64 {
+        let (status, body) = http_get(self.port, "/metrics", Some("root"));
+        assert_eq!(status, 200);
+        let found = body
+            .lines()
+            .find(|l| l.starts_with(line))
+            .unwrap_or_else(|| panic!("no metric {line} in:\n{body}"));
+        found.rsplit(' ').next().unwrap().parse().unwrap()
     }
 
     /// Replaces the configuration and has the bouncer read it again.

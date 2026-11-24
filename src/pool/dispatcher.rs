@@ -2,42 +2,43 @@
 //! Everything else talks to it through its channel, so nothing here is
 //! shared and nothing needs a lock.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 
 use super::backend::{self, Msg};
-use super::{
-    BackendInfo, Cmd, Counters, Ending, Job, PoolHandle, QueuedInfo, Shared, Snapshot, request_text,
-};
+use super::{BackendInfo, Cmd, Counters, Ending, Job, PoolHandle, QueuedInfo, Shared, Snapshot};
 use crate::config::{Mode, PoolConfig};
 use crate::stats::Stats;
 use crate::stats::event::Outcome;
 
-/// How often the head of the queue is checked for having waited too long.
+/// How often the queue is checked for requests that have waited too long.
 const TICK: Duration = Duration::from_millis(100);
 /// Clients remembered for `affinity` before the memory is started over.
 const AFFINITY_MAX: usize = 100_000;
 
-enum State {
-    Down,
-    Idle,
-    Busy {
-        id: u64,
-        client: SocketAddr,
-        since: Instant,
-        frame: Bytes,
-    },
+/// The request a replica is running.
+struct Running {
+    id: u64,
+    client: SocketAddr,
+    since: Instant,
+    frame: Bytes,
 }
 
+/// A replica as the pool knows it. Whether its connection is open and
+/// whether it runs a request are told by different messages, which may
+/// arrive in any order, so they are kept apart: a connection that drops and
+/// comes back never makes a running replica look free.
 struct Replica {
     addr: Arc<str>,
     tx: mpsc::UnboundedSender<Msg>,
-    state: State,
+    connected: bool,
+    running: Option<Running>,
     draining: bool,
     /// Left the configuration: stopped as soon as it is not busy.
     removed: bool,
@@ -45,6 +46,17 @@ struct Replica {
     last_error: String,
     served: u64,
     failures: u64,
+}
+
+impl Replica {
+    /// May be given requests at all.
+    fn usable(&self) -> bool {
+        self.connected && !self.draining && !self.removed && !self.gone
+    }
+
+    fn free(&self) -> bool {
+        self.usable() && self.running.is_none()
+    }
 }
 
 struct Dispatcher {
@@ -58,6 +70,9 @@ struct Dispatcher {
     paused: bool,
     closing: bool,
     affinity: HashMap<IpAddr, usize>,
+    /// Running requests whose client asked for a cancel. One that its
+    /// replica hands back is answered `cancel`, not run again.
+    cancelled: HashSet<u64>,
 }
 
 pub fn spawn(cfg: Arc<PoolConfig>, stats: Arc<Stats>) -> PoolHandle {
@@ -80,6 +95,7 @@ pub fn spawn(cfg: Arc<PoolConfig>, stats: Arc<Stats>) -> PoolHandle {
         paused: false,
         closing: false,
         affinity: HashMap::new(),
+        cancelled: HashSet::new(),
     };
     for addr in &cfg.backends {
         d.add(addr, cfg.slots);
@@ -107,25 +123,38 @@ impl Dispatcher {
         let addr: Arc<str> = addr.into();
         for _ in 0..slots {
             let (tx, rx) = mpsc::unbounded_channel();
+            // The place of a replica that is gone is taken again: its task
+            // said so as the last thing it did, and will say nothing more.
+            let idx = self
+                .replicas
+                .iter()
+                .position(|r| r.gone)
+                .unwrap_or(self.replicas.len());
             let ctx = backend::Ctx {
-                idx: self.replicas.len(),
+                idx,
                 addr: addr.clone(),
                 cfg: self.cfg_tx.subscribe(),
                 events: self.events.clone(),
                 shared: self.shared.clone(),
             };
             tokio::spawn(backend::run(ctx, rx));
-            self.replicas.push(Replica {
+            let replica = Replica {
                 addr: addr.clone(),
                 tx,
-                state: State::Down,
+                connected: false,
+                running: None,
                 draining: false,
                 removed: false,
                 gone: false,
                 last_error: "connecting".into(),
                 served: 0,
                 failures: 0,
-            });
+            };
+            if idx == self.replicas.len() {
+                self.replicas.push(replica);
+            } else {
+                self.replicas[idx] = replica;
+            }
         }
     }
 
@@ -135,22 +164,24 @@ impl Dispatcher {
             Cmd::Cancel(id) => self.cancel(id).await,
             Cmd::Up(idx) => {
                 let r = &mut self.replicas[idx];
-                r.state = State::Idle;
+                r.connected = true;
                 r.last_error.clear();
                 tracing::info!(pool = %self.shared.name, replica = %r.addr, "replica up");
             }
             Cmd::Down(idx, reason) => {
                 let r = &mut self.replicas[idx];
-                if !matches!(r.state, State::Down) || r.last_error != reason {
+                if r.connected || r.last_error != reason {
                     tracing::warn!(pool = %self.shared.name, replica = %r.addr, %reason, "replica down");
                 }
-                r.state = State::Down;
+                r.connected = false;
                 r.last_error = reason;
             }
             Cmd::Finished(idx) => {
                 let r = &mut self.replicas[idx];
-                r.state = State::Idle;
-                r.served += 1;
+                if let Some(run) = r.running.take() {
+                    self.cancelled.remove(&run.id);
+                    r.served += 1;
+                }
             }
             Cmd::Failed {
                 idx,
@@ -158,17 +189,29 @@ impl Dispatcher {
                 sent,
                 reason,
             } => self.failed(idx, job, sent, reason).await,
-            Cmd::Gone(idx) => self.replicas[idx].gone = true,
+            Cmd::Gone(idx) => {
+                let r = &mut self.replicas[idx];
+                r.gone = true;
+                r.connected = false;
+                r.running = None;
+            }
             Cmd::Snapshot(reply) => {
                 let _ = reply.send(self.snapshot());
             }
-            Cmd::Pause(on) => self.paused = on,
+            Cmd::Pause(on) => {
+                // What waited through a pause has not waited for a replica.
+                if self.paused && !on {
+                    let now = Instant::now();
+                    self.queue.iter_mut().for_each(|j| j.queued_at = now);
+                }
+                self.paused = on;
+            }
             Cmd::Drain(addr, on, reply) => {
                 let mut found = false;
                 for r in self
                     .replicas
                     .iter_mut()
-                    .filter(|r| *r.addr == *addr && !r.removed)
+                    .filter(|r| *r.addr == *addr && !r.removed && !r.gone)
                 {
                     r.draining = on;
                     found = true;
@@ -194,7 +237,7 @@ impl Dispatcher {
             }
         }
         self.retire();
-        self.pump().await;
+        self.pump();
     }
 
     async fn submit(&mut self, job: Job) {
@@ -219,24 +262,36 @@ impl Dispatcher {
             return;
         }
         for r in &self.replicas {
-            if matches!(r.state, State::Busy { id: running, .. } if running == id) {
+            if r.running.as_ref().is_some_and(|run| run.id == id) {
+                self.cancelled.insert(id);
                 let _ = r.tx.send(Msg::Cancel(id));
             }
         }
     }
 
+    /// A replica gave a request back.
     async fn failed(&mut self, idx: usize, mut job: Job, sent: bool, reason: String) {
         let r = &mut self.replicas[idx];
-        r.state = State::Down;
+        if r.running.as_ref().is_some_and(|run| run.id == job.id) {
+            r.running = None;
+        }
         if sent {
             r.failures += 1;
             r.last_error.clone_from(&reason);
             tracing::warn!(pool = %self.shared.name, replica = %r.addr, %reason, "request failed");
         }
-        // A request that never left may always go again; one that did is run
-        // a second time only once, and only where that is known to be safe.
-        if !sent || (self.cfg.retry && job.retries == 0) {
+        if self.cancelled.remove(&job.id) {
+            // Its client asked for it to stop while it was on its way back.
+            job.refuse("cancel", "interrupted").await;
+            self.end(&job, Outcome::Cancelled);
+        } else if !sent || (self.cfg.retry && job.retries == 0) {
+            // A request that never left may always go again; one that did
+            // is run a second time only once, and only where that is known
+            // to be safe.
             job.retries += u8::from(sent);
+            job.queued_at = Instant::now();
+            job.avoid = sent.then_some(idx);
+            job.target = None;
             self.queue.push_front(job);
         } else {
             job.refuse("io", &format!("replica failed: {reason}")).await;
@@ -256,23 +311,26 @@ impl Dispatcher {
         self.shared.report(job, ending);
     }
 
-    /// Turns away whoever has waited at the head of the queue too long.
+    /// Turns away whoever has waited for a replica too long. A paused pool
+    /// holds its requests for as long as it is paused.
     async fn expire(&mut self) {
-        while self
-            .queue
-            .front()
-            .is_some_and(|j| j.arrived.elapsed() > self.cfg.query_wait_timeout)
-        {
-            if let Some(job) = self.queue.pop_front() {
-                job.refuse("busy", "no replica became free in time").await;
-                self.end(&job, Outcome::Busy);
+        let limit = self.cfg.query_wait_timeout;
+        let mut at = 0;
+        while !self.paused && at < self.queue.len() {
+            if self.queue[at].queued_at.elapsed() > limit {
+                if let Some(job) = self.queue.remove(at) {
+                    job.refuse("busy", "no replica became free in time").await;
+                    self.end(&job, Outcome::Busy);
+                }
+            } else {
+                at += 1;
             }
         }
-        self.pump().await;
+        self.pump();
     }
 
     /// Hands queued requests to replicas, as the pool's mode says.
-    async fn pump(&mut self) {
+    fn pump(&mut self) {
         if self.paused {
             return;
         }
@@ -296,8 +354,8 @@ impl Dispatcher {
     /// The head of the queue goes to a free replica, until one of the two
     /// runs out.
     fn pump_free(&mut self) {
-        while let Some(client) = self.queue.front().map(|j| j.client) {
-            let Some(idx) = self.pick(client.ip()) else {
+        while let Some((client, avoid)) = self.queue.front().map(|j| (j.client.ip(), j.avoid)) {
+            let Some(idx) = self.pick(client, avoid) else {
                 return;
             };
             if let Some(job) = self.queue.pop_front() {
@@ -311,25 +369,23 @@ impl Dispatcher {
     /// another, so a dead replica holds nothing back.
     fn pump_in_turn(&mut self) {
         let n = self.replicas.len();
-        let usable =
-            |r: &Replica| !matches!(r.state, State::Down) && !r.draining && !r.removed && !r.gone;
         for at in 0..self.queue.len() {
             if self.queue[at]
                 .target
-                .is_some_and(|t| usable(&self.replicas[t]))
+                .is_some_and(|t| self.replicas[t].usable())
             {
                 continue;
             }
             let next = (0..n)
                 .map(|k| (self.cursor + k) % n)
-                .find(|i| usable(&self.replicas[*i]));
+                .find(|i| self.replicas[*i].usable());
             self.queue[at].target = next;
             if let Some(idx) = next {
                 self.cursor = (idx + 1) % n;
             }
         }
         for idx in 0..n {
-            if !matches!(self.replicas[idx].state, State::Idle) || !usable(&self.replicas[idx]) {
+            if !self.replicas[idx].free() {
                 continue;
             }
             let waiting = self.queue.iter().position(|j| j.target == Some(idx));
@@ -341,37 +397,36 @@ impl Dispatcher {
 
     fn start(&mut self, idx: usize, job: Job) {
         let r = &mut self.replicas[idx];
-        r.state = State::Busy {
+        r.running = Some(Running {
             id: job.id,
             client: job.client,
             since: Instant::now(),
             frame: job.frame.clone(),
-        };
+        });
         if let Err(mpsc::error::SendError(Msg::Run(job))) = r.tx.send(Msg::Run(job)) {
-            r.state = State::Down;
+            r.running = None;
+            r.connected = false;
             r.gone = true;
             self.queue.push_front(job);
         }
     }
 
     /// A free replica: the client's last one under `affinity`, else the next
-    /// in turn.
-    fn pick(&mut self, client: IpAddr) -> Option<usize> {
-        let free =
-            |r: &Replica| matches!(r.state, State::Idle) && !r.draining && !r.removed && !r.gone;
+    /// in turn, and not the one that just failed under this request while
+    /// another is free.
+    fn pick(&mut self, client: IpAddr, avoid: Option<usize>) -> Option<usize> {
         let n = self.replicas.len();
+        let free = |i: &usize| self.replicas.get(*i).is_some_and(Replica::free);
         let sticky = self
             .cfg
             .affinity
             .then(|| self.affinity.get(&client).copied())
             .flatten();
+        let in_turn = || (0..n).map(|k| (self.cursor + k) % n);
         let idx = sticky
-            .filter(|i| self.replicas.get(*i).is_some_and(free))
-            .or_else(|| {
-                (0..n)
-                    .map(|k| (self.cursor + k) % n)
-                    .find(|i| free(&self.replicas[*i]))
-            })?;
+            .filter(|i| free(i) && Some(*i) != avoid)
+            .or_else(|| in_turn().find(|i| free(i) && Some(*i) != avoid))
+            .or_else(|| in_turn().find(free))?;
         if sticky != Some(idx) {
             self.cursor = (idx + 1) % n;
         }
@@ -387,7 +442,7 @@ impl Dispatcher {
     /// Stops the replicas that left the configuration, once they are free.
     fn retire(&mut self) {
         for r in &mut self.replicas {
-            if r.removed && !r.gone && !matches!(r.state, State::Busy { .. }) {
+            if r.removed && !r.gone && r.running.is_none() {
                 let _ = r.tx.send(Msg::Stop);
             }
         }
@@ -409,7 +464,7 @@ impl Dispatcher {
             for r in self
                 .replicas
                 .iter_mut()
-                .filter(|r| *r.addr == **addr && !r.removed)
+                .filter(|r| *r.addr == **addr && !r.removed && !r.gone)
             {
                 have += 1;
                 r.removed = have > cfg.slots;
@@ -418,9 +473,7 @@ impl Dispatcher {
                 self.add(addr, cfg.slots - have);
             }
         }
-        self.shared
-            .queue_max
-            .store(cfg.queue_max as u64, std::sync::atomic::Ordering::Relaxed);
+        self.shared.queue_max.store(cfg.queue_max as u64, Relaxed);
         self.cfg = cfg.clone();
         self.cfg_tx.send_replace(cfg);
         if reconnect {
@@ -430,6 +483,8 @@ impl Dispatcher {
         }
     }
 
+    /// The pool at this instant. Frames are handed out as they are, a
+    /// reference each: nothing is decoded on this task.
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             name: self.shared.name.clone(),
@@ -440,7 +495,7 @@ impl Dispatcher {
                 .map(|j| QueuedInfo {
                     client: j.client,
                     waited: j.arrived.elapsed(),
-                    text: j.text(),
+                    frame: j.frame.clone(),
                 })
                 .collect(),
             backends: self
@@ -449,24 +504,15 @@ impl Dispatcher {
                 .filter(|r| !r.gone)
                 .map(|r| BackendInfo {
                     addr: r.addr.clone(),
-                    state: match r.state {
-                        State::Down => "down",
-                        State::Idle => "idle",
-                        State::Busy { .. } => "busy",
-                    },
+                    connected: r.connected,
                     draining: r.draining || r.removed,
                     last_error: r.last_error.clone(),
                     served: r.served,
                     failures: r.failures,
-                    running: match &r.state {
-                        State::Busy {
-                            client,
-                            since,
-                            frame,
-                            ..
-                        } => Some((*client, since.elapsed(), request_text(frame))),
-                        _ => None,
-                    },
+                    running: r
+                        .running
+                        .as_ref()
+                        .map(|run| (run.client, run.since.elapsed(), run.frame.clone())),
                 })
                 .collect(),
         }

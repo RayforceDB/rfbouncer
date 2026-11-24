@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 use crate::stats::Stats;
 use crate::stats::store::{BUCKETS, COUNTERS, Rows, quantile};
 
+/// The year 2100, in Unix seconds.
+const MAX_TIME: i64 = 4_102_444_800;
 /// Points a time series is thinned to, whatever the range.
 const POINTS: i64 = 120;
 
@@ -60,6 +62,10 @@ impl Filter {
                 _ => {}
             }
         }
+        // Times are held to this century and put in order: they are
+        // multiplied and subtracted on the way to a query.
+        f.to = f.to.clamp(0, MAX_TIME);
+        f.from = f.from.clamp(0, f.to);
         f
     }
 
@@ -372,4 +378,47 @@ pub async fn grouped(stats: &Stats, f: &Filter, table: &str) -> Result<Value, St
         })
         .collect();
     Ok(json!({ "rows": listed }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_filter_takes_only_what_is_safe_to_put_in_a_query() {
+        let f = Filter::parse("pool=main&from=100&to=200&fp=ff&sort=count&limit=7");
+        assert_eq!(
+            (f.pool.as_str(), f.from, f.to, f.fp, f.limit),
+            ("main", 100, 200, Some(255), 7)
+        );
+        assert_eq!(
+            f.minutes(true),
+            "(and (>= minute 1) (<= minute 3) (== pool (as 'SYMBOL \"main\")) (== fp 255))"
+        );
+        // A name that could not be a pool's never reaches a query.
+        for pool in ["a\")(exit", "a b", "x'y", "%22"] {
+            assert_eq!(Filter::parse(&format!("pool={pool}")).pool, "");
+        }
+        assert_eq!(Filter::parse("fp=zz").fp, None);
+        assert_eq!(Filter::parse("limit=999999").limit, 500);
+        assert_eq!(Filter::parse("limit=0").limit, 1);
+    }
+
+    #[test]
+    fn a_wild_range_is_brought_into_one_that_can_be_computed_with() {
+        for query in [
+            "to=9223372036854775807",
+            "from=-9223372036854775808",
+            "from=500&to=100",
+            "to=-5",
+        ] {
+            let f = Filter::parse(query);
+            assert!(
+                0 <= f.from && f.from <= f.to && f.to <= MAX_TIME,
+                "{query}: {f:?}"
+            );
+            // What the reports compute from it.
+            let _ = (f.to * 1000 + 999, ((f.to - f.from) / 60 + POINTS) / POINTS);
+        }
+    }
 }

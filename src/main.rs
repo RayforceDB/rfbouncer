@@ -13,6 +13,9 @@ struct Args {
     /// Check the configuration and exit.
     #[arg(long)]
     check: bool,
+    /// The least severe messages to log: error, warn, info, debug or trace.
+    #[arg(long, default_value = "info")]
+    log_level: tracing::Level,
 }
 
 fn main() -> ExitCode {
@@ -20,6 +23,7 @@ fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_max_level(args.log_level)
         .init();
     if args.check {
         return match rfbouncer::config::Config::load(&args.config) {

@@ -20,6 +20,8 @@ use crate::wire::{greeting, oob};
 
 /// How long a client may take over its greeting and credentials.
 const GREET_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a peer with the wrong credentials waits to be told so.
+const REFUSAL_DELAY: Duration = Duration::from_millis(500);
 /// How long a client may refuse to take bytes of its answer. A client that
 /// stops reading would otherwise hold a replica for as long as it liked.
 const WRITE_STALL: Duration = Duration::from_secs(30);
@@ -68,6 +70,17 @@ async fn greet(
         Target::Pool(pool) => Some(Some(pool.name.clone())),
         Target::Rejected => None,
     };
+    if target.is_none() {
+        // Said, counted, and answered late: guessing a password is then
+        // neither silent nor fast.
+        core.auth_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let peer = stream
+            .peer_addr()
+            .map_or_else(|_| "?".to_owned(), |a| a.to_string());
+        tracing::warn!(%peer, user = %credentials.user, "credentials refused");
+        tokio::time::sleep(REFUSAL_DELAY).await;
+    }
     greeting::write_verdict(stream, target.is_some()).await?;
     Ok(target.map(|pool| (version, credentials.user, pool)))
 }
@@ -122,8 +135,10 @@ async fn proxy(
             user: user.clone(),
             arrived: Instant::now(),
             arrived_at: SystemTime::now(),
+            queued_at: Instant::now(),
             retries: 0,
             target: None,
+            avoid: None,
         }));
 
         let limit = HEADER_LEN + config.max_request_bytes;

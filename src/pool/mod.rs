@@ -14,6 +14,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::config::PoolConfig;
 use crate::stats::Stats;
 use crate::stats::event::{Event, Outcome};
+use crate::stats::normalize::fnv1a;
+use crate::stats::store::{BUCKETS, bucket};
+use crate::wire::frame::HEADER_LEN;
 use crate::wire::{frame, value};
 
 /// One request on its way through the bouncer.
@@ -26,10 +29,18 @@ pub struct Job {
     pub user: Arc<str>,
     pub arrived: Instant,
     pub arrived_at: SystemTime,
+    /// When it last joined the queue: on arrival, and again when a replica
+    /// failed under it. How long it may wait is counted from here, so a
+    /// request that ran for a while is not turned away the moment it needs
+    /// another replica.
+    pub queued_at: Instant,
     pub retries: u8,
     /// The replica this request waits for, where the pool hands requests
     /// out in turn.
     pub target: Option<usize>,
+    /// The replica that failed under it, not to be given it again while
+    /// there is another.
+    pub avoid: Option<usize>,
 }
 
 /// What a client session writes to its socket, in order.
@@ -46,30 +57,51 @@ impl Job {
         self.frame[4]
     }
 
-    pub fn text(&self) -> String {
-        request_text(&self.frame)
-    }
-
     /// Answers the client with an error of the bouncer's own.
     pub async fn refuse(&self, code: &str, msg: &str) {
         let payload = value::error(self.version(), code, msg);
-        let _ = self
-            .reply
-            .send(Reply::Data(frame::frame(
-                self.version(),
-                frame::MSG_RESPONSE,
-                &payload,
-            )))
-            .await;
+        let answer = frame::frame(self.version(), frame::MSG_RESPONSE, &payload);
+        let _ = self.reply.send(Reply::Data(answer)).await;
         let _ = self.reply.send(Reply::Done).await;
     }
 }
 
+/// A request frame's source text when it was sent as text, at most
+/// `value::TEXT_CAP` bytes of it.
+pub fn request_source(frame: &[u8]) -> Option<String> {
+    let payload = frame.get(HEADER_LEN..).unwrap_or_default();
+    value::request_text(frame.get(5).copied().unwrap_or(0), payload)
+}
+
+/// The size a frame's header declares for its payload.
+fn declared_size(frame: &[u8]) -> u64 {
+    let mut size = [0u8; 8];
+    if let Some(raw) = frame.get(8..HEADER_LEN) {
+        size.copy_from_slice(raw);
+    }
+    u64::from_le_bytes(size)
+}
+
 /// A request frame's source text, or a placeholder for one that is not text.
 pub fn request_text(frame: &[u8]) -> String {
-    let payload = frame.get(frame::HEADER_LEN..).unwrap_or_default();
-    value::request_text(frame.get(5).copied().unwrap_or(0), payload)
-        .unwrap_or_else(|| format!("<binary {} bytes>", payload.len()))
+    request_source(frame).unwrap_or_else(|| format!("<binary {} bytes>", declared_size(frame)))
+}
+
+/// What tells a request that is not text from another: a hash of the start
+/// of its payload.
+pub fn binary_fingerprint(frame: &[u8]) -> u64 {
+    fnv1a(frame.get(HEADER_LEN..).unwrap_or_default())
+}
+
+/// The frame as the statistics keep it: the start of it, which is all they
+/// read. A waiting event then holds kilobytes, whatever the request's size.
+fn clipped(frame: &Bytes) -> Bytes {
+    let keep = HEADER_LEN + value::TEXT_CAP + 64;
+    if frame.len() <= keep {
+        frame.clone()
+    } else {
+        Bytes::copy_from_slice(&frame[..keep])
+    }
 }
 
 #[derive(Default)]
@@ -86,6 +118,10 @@ pub struct Counters {
     pub bytes_out: AtomicU64,
     pub wait_us: AtomicU64,
     pub exec_us: AtomicU64,
+    /// Requests by time in the replica and by time in the queue, in the
+    /// statistics' buckets: bucket `i` counts those under 2^i µs.
+    pub exec_hist: [AtomicU64; BUCKETS],
+    pub wait_hist: [AtomicU64; BUCKETS],
 }
 
 /// What a pool's tasks share: its name, its counters, the statistics sink.
@@ -109,6 +145,7 @@ pub struct Ending {
 impl Shared {
     pub fn report(&self, job: &Job, end: Ending) {
         let c = &self.counters;
+        let (wait, exec) = (end.wait.as_micros() as u64, end.exec.as_micros() as u64);
         c.requests.fetch_add(1, Relaxed);
         match &end.outcome {
             Outcome::Ok => &c.ok,
@@ -122,8 +159,13 @@ impl Shared {
         c.retries.fetch_add(u64::from(job.retries), Relaxed);
         c.bytes_in.fetch_add(job.frame.len() as u64, Relaxed);
         c.bytes_out.fetch_add(end.bytes_out, Relaxed);
-        c.wait_us.fetch_add(end.wait.as_micros() as u64, Relaxed);
-        c.exec_us.fetch_add(end.exec.as_micros() as u64, Relaxed);
+        c.wait_us.fetch_add(wait, Relaxed);
+        c.exec_us.fetch_add(exec, Relaxed);
+        c.wait_hist[bucket(wait)].fetch_add(1, Relaxed);
+        c.exec_hist[bucket(exec)].fetch_add(1, Relaxed);
+        if !self.stats.enabled() {
+            return;
+        }
         self.stats.record(Event {
             at: job.arrived_at,
             pool: self.name.clone(),
@@ -136,7 +178,7 @@ impl Shared {
             bytes_out: end.bytes_out,
             retries: job.retries,
             outcome: end.outcome,
-            frame: job.frame.clone(),
+            frame: clipped(&job.frame),
         });
     }
 }
@@ -145,12 +187,15 @@ pub enum Cmd {
     Submit(Job),
     /// The client of this job sent its cancel byte.
     Cancel(u64),
+    /// The replica's connection is open.
     Up(usize),
+    /// The replica's connection is gone, and why.
     Down(usize, String),
-    /// The replica answered and is free again.
+    /// The replica's request is over, whatever became of it.
     Finished(usize),
-    /// The replica failed before any of the answer reached the client.
-    /// `sent` is false when the request never left the bouncer.
+    /// The replica gives a request back: it failed before any of the answer
+    /// reached the client. `sent` is false when the request never left the
+    /// bouncer.
     Failed {
         idx: usize,
         job: Job,
@@ -188,6 +233,8 @@ impl PoolHandle {
     }
 }
 
+/// A pool at one instant. It carries the requests' frames, not their text:
+/// reading text out of a frame is the asker's to do, off the pool's task.
 pub struct Snapshot {
     pub name: Arc<str>,
     pub paused: bool,
@@ -198,17 +245,27 @@ pub struct Snapshot {
 pub struct QueuedInfo {
     pub client: SocketAddr,
     pub waited: Duration,
-    pub text: String,
+    pub frame: Bytes,
 }
 
 pub struct BackendInfo {
     pub addr: Arc<str>,
-    /// `down`, `idle` or `busy`.
-    pub state: &'static str,
+    pub connected: bool,
     pub draining: bool,
     pub last_error: String,
     pub served: u64,
     pub failures: u64,
-    /// The request it is running: who sent it, for how long, and its text.
-    pub running: Option<(SocketAddr, Duration, String)>,
+    /// The request it is running: who sent it, for how long, and its frame.
+    pub running: Option<(SocketAddr, Duration, Bytes)>,
+}
+
+impl BackendInfo {
+    /// `busy` while it runs a request, else `idle` or `down`.
+    pub fn state(&self) -> &'static str {
+        match (&self.running, self.connected) {
+            (Some(_), _) => "busy",
+            (None, true) => "idle",
+            (None, false) => "down",
+        }
+    }
 }

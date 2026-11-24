@@ -4,10 +4,17 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# A configuration that cannot work stops the start, and a reload, here,
+# where systemctl shows it.
+ExecStartPre=/usr/local/bin/rfbouncer --config /etc/rfbouncer/rfbouncer.toml --check
 ExecStart=/usr/local/bin/rfbouncer --config /etc/rfbouncer/rfbouncer.toml
+ExecReload=/usr/local/bin/rfbouncer --config /etc/rfbouncer/rfbouncer.toml --check
 ExecReload=/bin/kill -HUP $MAINPID
 User=rfbouncer
-StateDirectory=rfbouncer
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
 Restart=on-failure
 # One descriptor per client and per replica connection.
 LimitNOFILE=65536

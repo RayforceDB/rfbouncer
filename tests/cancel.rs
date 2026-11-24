@@ -23,7 +23,7 @@ fn a_cancel_stops_the_running_request_and_frees_the_replica() {
     let bouncer = Bouncer::start(&pool(&[&replica], OPEN));
     let mut c = Client::connect(bouncer.port);
     c.send(&hog());
-    std::thread::sleep(Duration::from_millis(200));
+    bouncer.wait_busy(1);
     let started = Instant::now();
     c.cancel();
     assert_eq!(c.query_error_after_cancel(), Some("cancel".to_owned()));
@@ -37,7 +37,7 @@ fn a_cancel_takes_a_waiting_request_out_of_the_queue() {
     let bouncer = Bouncer::start(&pool(&[&replica], OPEN));
     let mut first = Client::connect(bouncer.port);
     first.send(&hog());
-    std::thread::sleep(Duration::from_millis(200));
+    bouncer.wait_busy(1);
     let mut waiting = Client::connect(bouncer.port);
     waiting.send("(+ 1 1)");
     std::thread::sleep(Duration::from_millis(100));
@@ -63,7 +63,7 @@ fn a_client_that_leaves_gives_its_replica_back() {
     let bouncer = Bouncer::start(&pool(&[&replica], OPEN));
     let mut gone = Client::connect(bouncer.port);
     gone.send(&hog());
-    std::thread::sleep(Duration::from_millis(200));
+    bouncer.wait_busy(1);
     drop(gone);
     let started = Instant::now();
     let mut next = Client::connect(bouncer.port);
@@ -94,7 +94,7 @@ fn a_full_queue_turns_a_request_away() {
     let bouncer = Bouncer::start(&pool(&[&replica], &format!("{OPEN}\nqueue_max = 1")));
     let mut running = Client::connect(bouncer.port);
     running.send(&hog());
-    std::thread::sleep(Duration::from_millis(200));
+    bouncer.wait_busy(1);
     let mut queued = Client::connect(bouncer.port);
     queued.send("(+ 1 1)");
     std::thread::sleep(Duration::from_millis(100));
@@ -113,7 +113,7 @@ fn a_request_that_waits_too_long_is_turned_away() {
     ));
     let mut running = Client::connect(bouncer.port);
     running.send(&hog());
-    std::thread::sleep(Duration::from_millis(200));
+    bouncer.wait_busy(1);
     let mut waiting = Client::connect(bouncer.port);
     let started = Instant::now();
     assert_eq!(waiting.query_error("(+ 1 1)"), Some("busy".to_owned()));

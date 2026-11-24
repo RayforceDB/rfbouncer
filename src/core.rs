@@ -31,6 +31,13 @@ pub struct Core {
     next_id: AtomicU64,
     pub shutdown: watch::Sender<bool>,
     pub started: Instant,
+    /// Credentials refused, over IPC or HTTP.
+    pub auth_failures: AtomicU64,
+    /// Connections turned away at `max_client_conn`.
+    pub refused: AtomicU64,
+    /// One reload at a time: two at once would each compare against the
+    /// same old configuration.
+    reloading: Mutex<()>,
 }
 
 /// A lock is only ever held for a few field accesses, so a panic inside one
@@ -61,6 +68,9 @@ impl Core {
             next_id: AtomicU64::new(1),
             shutdown: watch::channel(false).0,
             started: Instant::now(),
+            auth_failures: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+            reloading: Mutex::new(()),
         })
     }
 
@@ -96,6 +106,7 @@ impl Core {
     /// Reads the file again and brings the pools to what it says. The listen
     /// address is the one thing that needs a restart.
     pub fn reload(&self) -> Result<(), ConfigError> {
+        let _one_at_a_time = lock(&self.reloading);
         let new = Config::load(&self.config_path)?;
         let old = self.config();
         if new.listen != old.listen {

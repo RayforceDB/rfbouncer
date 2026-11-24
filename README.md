@@ -24,8 +24,8 @@ tests against real Rayforce processes, on Linux and macOS, at wire version 4.
 
 - Wire version 3 is supported by the layout of its bytes and has not been
   run against a version 3 server.
-- A client's cancel is noticed by asking the socket every 20 ms, so it is
-  passed on up to 20 ms late.
+- On Linux a client's cancel is passed on as it arrives. Elsewhere the
+  socket is asked every 20 ms, so it is up to 20 ms late.
 - The statistics store keeps everything in memory.
 - There is no TLS: the admin password and the report pages travel in the
   clear.
@@ -44,11 +44,15 @@ tests against real Rayforce processes, on Linux and macOS, at wire version 4.
 - **Cancel.** A client's cancel byte takes its request out of the queue, or
   is passed on to the replica running it. A client that disconnects cancels
   its request the same way, so a replica never finishes a query for nobody.
-- **Budgets.** A request past `query_timeout` is cancelled and answered with
-  the error `timeout`; one that waits past `query_wait_timeout`, or finds the
-  queue full, is answered with `busy`.
+- **Budgets.** A request whose replica has not begun to answer within
+  `query_timeout` (30 s unless set) is cancelled and answered with the error
+  `timeout`; one that waits for a replica past `query_wait_timeout`, or finds
+  the queue full, is answered with `busy`. A client that takes longer than
+  `transfer_timeout` to receive an answer is cut off, so a slow reader cannot
+  hold a replica.
 - **Failing replicas.** A replica that dies before any of its answer reached
-  the client has the request run again on another. A dead replica is retried
+  the client has the request run again, once, on another replica if there is
+  one; the wait for that replica is counted afresh. A dead replica is retried
   with a backoff and used again once it answers a greeting.
 - **Pools.** Several pools on one port; the user name in a client's
   credentials picks the pool.
@@ -69,6 +73,10 @@ process that owns them.
 - `.ipc.on.*` hooks on a replica see the bouncer, not the client.
 - Connections stay on TCP; the shared-memory and RDMA transports are not
   offered.
+- A client must keep its connection whole until it has its answer. One that
+  closes its sending side after the request is taken to have left, and its
+  request is cancelled: the two cannot be told apart, and a client that left
+  must not keep a replica busy.
 - No TLS. Keep the port on a private network, or put a proxy in front.
 
 ## Running it
@@ -77,6 +85,7 @@ process that owns them.
 cargo build --release
 ./target/release/rfbouncer --config rfbouncer.toml
 ./target/release/rfbouncer --config rfbouncer.toml --check   # validate and exit
+./target/release/rfbouncer --config rfbouncer.toml --log-level debug
 ```
 
 Start each replica restricted, so it refuses writes:
@@ -119,9 +128,15 @@ cpuset.
 | One pool with `password` | any user name and that password |
 | Several pools | a user name listed in a pool's `users`, and that pool's password if it has one; an unknown name lands in the `default` pool |
 | Admin console | user `rfbouncer` and `admin_password` |
+| Report pages, `/metrics` | `report_password` or `admin_password`, over HTTP Basic |
 
 The admin console is reached through the credentials, so it needs clients to
 be asked for them: with one pool, give the pool a `password`.
+
+A refused login is logged with its address, counted in
+`rfbouncer_auth_failures_total`, and answered half a second late. A client
+that speaks another wire version than its pool is refused the same way. A
+changed password applies to new connections; the ones already open stay.
 
 ## Admin console
 
@@ -136,7 +151,7 @@ be asked for them: with one pool, give the pool a `password`.
 | `show servers` | each replica: state, what it is running and for whom, last error |
 | `show clients` | who is connected |
 | `show stats`, `show config` | the process, and the settings in force (no passwords) |
-| `pause [pool]`, `resume [pool]` | hold requests in the queue; let them go |
+| `pause [pool]`, `resume [pool]` | hold requests in the queue, for as long as it takes; let them go |
 | `drain <addr>`, `undrain <addr>` | stop handing a replica requests; start again |
 | `reconnect [pool]` | open every replica connection anew |
 | `reload`, `shutdown` | as `SIGHUP` and `SIGTERM` |
@@ -156,13 +171,24 @@ name). With `[stats] rayforce` set, the pages show:
 - **Now**: what each replica is running and what waits in the queue.
 
 Only requests sent as source text have a text to show; a request sent as a
-serialized value is grouped by its bytes. Percentiles come from a histogram
+serialized value is told from others by its bytes and shown as
+`<binary N bytes>`. Percentiles come from a histogram
 whose buckets double, so each is the upper edge of its bucket.
 
 The slowest and the failed requests are stored with their full text, values
 included. Set `store_samples = false` if those must not be kept.
 
-`/metrics` serves counters in the Prometheus format, behind the same password.
+`/metrics` serves counters in the Prometheus format, behind the same
+passwords: requests by outcome, histograms of time in the replica and of the
+wait for one, queue length, each replica's state, refused logins and
+connections.
+
+`/healthz` needs no password. It answers `200` while at least one replica is
+connected and `503` otherwise, and says nothing else: point a load balancer's
+check at it.
+
+`/api/live` and the admin's `show servers` show the text of what is running
+whatever `store_samples` says: that setting is about what is kept.
 
 ### Where the statistics live
 
@@ -190,12 +216,21 @@ the minute being filled every ten seconds. They are ordinary tables:
 | `rfb_fp` | a query shape's text |
 | `rfb_sample` | a request kept whole: the slowest of each hour and up to 20 failed a minute |
 
+Several bouncers may share one store: every row carries the process that
+wrote it (`src`), and a report sums them. A bouncer that restarts writes rows
+of its own from then on, so nothing it counted before is lost or doubled.
+
 While the store is away, requests are served as before, the reports answer
 `502`, and the minute being filled waits in memory; a store that stays away
-past the end of a minute costs that minute. Everything it holds is in memory:
-give it room for the rows you keep (a row of `rfb_agg` is about 400 bytes),
-and lower `retention_aggregates` or `max_fingerprints_per_minute` if that is
-too much.
+past the end of a minute costs that minute.
+
+Sizing. Everything the store holds is in memory, about 400 bytes a row of
+`rfb_agg`, one row a minute for each query shape seen in it. Names and
+symbols are part of a shape, so `(== sym 'AAPL)` and `(== sym 'MSFT)` are two:
+a workload with many distinct symbols has many shapes. The journal grows with
+every row written, and only rows that changed are written. Lower
+`retention_aggregates` or `max_fingerprints_per_minute` if either is too
+much.
 
 ## Development
 

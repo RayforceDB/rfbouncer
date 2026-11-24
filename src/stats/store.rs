@@ -1,9 +1,9 @@
 //! The task that writes the statistics, and the tables it writes them to.
 //!
 //! The statistics live in a Rayforce process of their own. This task holds
-//! the minute being filled in memory and, every few seconds, upserts its
-//! rows whole: a row is keyed by its leading columns, so writing it again
-//! replaces it. Nothing is ever merged on the server.
+//! the minute being filled in memory and, every few seconds, upserts the
+//! rows of it that changed: a row is keyed by its leading columns, so
+//! writing it again replaces it. Nothing is ever merged on the server.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,7 +16,7 @@ use super::event::{Event, Outcome};
 use super::normalize::normalize;
 use super::rf::Conn;
 use crate::config::StatsConfig;
-use crate::pool::request_text;
+use crate::pool::{binary_fingerprint, request_source, request_text};
 use crate::wire::value::{self, Column, Value};
 
 const FLUSH_EVERY: Duration = Duration::from_secs(10);
@@ -33,7 +33,7 @@ const ERRORS_PER_MINUTE: usize = 20;
 const OTHER: (u64, &str) = (0, "<other queries>");
 
 /// The counters of a row of `rfb_agg`, in column order, after its key
-/// (minute, pool, fp) and before its histogram (h0..h31).
+/// (minute, pool, fp, src) and before its histogram (h0..h31).
 pub const COUNTERS: [&str; 13] = [
     "count",
     "errors",
@@ -66,7 +66,10 @@ const BYTES_IN: usize = 11;
 const BYTES_OUT: usize = 12;
 
 /// Every table, with the source that makes it empty. A table's key is its
-/// leading columns, which is what `upsert` matches on.
+/// leading columns, which is what `upsert` matches on. `src` names the
+/// process that wrote a row and is part of every key: several bouncers, or
+/// one bouncer before and after a restart, each write rows of their own,
+/// and a report sums them.
 fn schema() -> Vec<(&'static str, String)> {
     let int = "(as 'I64 [])";
     let sym = "(as 'SYMBOL [])";
@@ -75,49 +78,55 @@ fn schema() -> Vec<(&'static str, String)> {
     };
     let own = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
 
-    let mut agg = own(&["minute", "pool", "fp"]);
+    let mut agg = own(&["minute", "pool", "fp", "src"]);
     agg.extend(COUNTERS.iter().map(|c| (*c).to_owned()));
     agg.extend((0..BUCKETS).map(|i| format!("h{i}")));
-    let mut agg_types = vec![int, sym, int];
+    let mut agg_types = vec![int, sym, int, sym];
     agg_types.resize(agg.len(), int);
 
-    let small = own(&["minute", "pool", "who", "count", "errors", "dur_sum"]);
+    let small = own(&["minute", "pool", "who", "src", "count", "errors", "dur_sum"]);
+    let status = own(&["minute", "pool", "status", "src", "count"]);
     let sample = own(&[
-        "kind", "pool", "bucket", "slot", "ts", "fp", "dur", "wait", "backend", "client", "status",
-        "text",
+        "kind", "pool", "bucket", "slot", "src", "ts", "fp", "dur", "wait", "backend", "client",
+        "status", "text",
     ]);
+    let sample_types = [
+        sym, sym, int, int, sym, int, int, int, int, sym, sym, sym, "(list)",
+    ];
     vec![
         ("rfb_agg", make(&agg, &agg_types)),
-        ("rfb_backend", make(&small, &[int, sym, sym, int, int, int])),
-        ("rfb_client", make(&small, &[int, sym, sym, int, int, int])),
         (
-            "rfb_status",
-            make(
-                &own(&["minute", "pool", "status", "count"]),
-                &[int, sym, sym, int],
-            ),
+            "rfb_backend",
+            make(&small, &[int, sym, sym, sym, int, int, int]),
         ),
+        (
+            "rfb_client",
+            make(&small, &[int, sym, sym, sym, int, int, int]),
+        ),
+        ("rfb_status", make(&status, &[int, sym, sym, sym, int])),
         (
             "rfb_fp",
             make(&own(&["fp", "first_seen", "text"]), &[int, int, "(list)"]),
         ),
-        (
-            "rfb_sample",
-            make(
-                &sample,
-                &[
-                    sym, sym, int, int, int, int, int, int, sym, sym, sym, "(list)",
-                ],
-            ),
-        ),
+        ("rfb_sample", make(&sample, &sample_types)),
     ]
 }
 
-/// Makes the tables that are not there yet.
+/// Makes the tables that are not there yet, and refuses a store whose
+/// tables are of another layout than this build writes.
 pub async fn ensure_schema(conn: &mut Conn) -> Result<(), String> {
     for (name, empty) in schema() {
         if conn.eval(&format!("(count {name})")).await.is_err() {
             conn.eval(&format!("(set {name} {empty})")).await?;
+        } else if name != "rfb_fp"
+            && conn
+                .eval(&format!("(count (at {name} 'src))"))
+                .await
+                .is_err()
+        {
+            return Err(format!(
+                "{name} is of an older layout: start an empty store, or delete the rfb_ tables in this one"
+            ));
         }
     }
     Ok(())
@@ -177,15 +186,19 @@ struct Sample {
     text: String,
 }
 
+type Key = (String, String);
+
 struct Writer {
     cfg: StatsConfig,
     conn: Option<Conn>,
+    /// What tells this process's rows from any other's.
+    src: String,
     /// The minute held in memory. The maps below are of this minute.
     minute: i64,
     agg: HashMap<(String, u64), Agg>,
-    backends: HashMap<(String, String), Small>,
-    clients: HashMap<(String, String), Small>,
-    statuses: HashMap<(String, String), u64>,
+    backends: HashMap<Key, Small>,
+    clients: HashMap<Key, Small>,
+    statuses: HashMap<Key, u64>,
     /// The normalized text of every fingerprint of this minute.
     texts: HashMap<u64, String>,
     /// Fingerprints whose text the store already has.
@@ -197,7 +210,12 @@ struct Writer {
     errors_this_minute: HashMap<String, usize>,
     /// Samples not written yet.
     samples: Vec<Sample>,
-    dirty: bool,
+    /// What changed since the last write. Only those rows are written: one
+    /// that did not change would only make the store's journal longer.
+    dirty_agg: HashSet<(String, u64)>,
+    dirty_backends: HashSet<Key>,
+    dirty_clients: HashSet<Key>,
+    dirty_statuses: HashSet<Key>,
 }
 
 fn unix(at: SystemTime) -> Duration {
@@ -269,6 +287,11 @@ pub async fn run(cfg: StatsConfig, mut rx: Receiver<Msg>) {
     let mut w = Writer {
         cfg,
         conn: None,
+        src: format!(
+            "{}-{}",
+            std::process::id(),
+            unix(SystemTime::now()).as_secs()
+        ),
         minute: -1,
         agg: HashMap::new(),
         backends: HashMap::new(),
@@ -280,7 +303,10 @@ pub async fn run(cfg: StatsConfig, mut rx: Receiver<Msg>) {
         slowest: HashMap::new(),
         errors_this_minute: HashMap::new(),
         samples: Vec::new(),
-        dirty: false,
+        dirty_agg: HashSet::new(),
+        dirty_backends: HashSet::new(),
+        dirty_clients: HashSet::new(),
+        dirty_statuses: HashSet::new(),
     };
     let mut next_flush = Instant::now() + FLUSH_EVERY;
     let mut next_prune = Instant::now();
@@ -310,9 +336,9 @@ pub async fn run(cfg: StatsConfig, mut rx: Receiver<Msg>) {
 }
 
 impl Writer {
-    /// The connection, opened if it is not: the tables are made, and what the
-    /// store knows is asked again, since it may be another process than
-    /// before.
+    /// The connection, opened if it is not: the tables are made, and which
+    /// query texts the store has is asked again, since it may be another
+    /// process than before.
     async fn conn(&mut self) -> Result<&mut Conn, String> {
         if self.conn.is_none() {
             let mut conn = Conn::open(&self.cfg).await?;
@@ -324,18 +350,32 @@ impl Writer {
         self.conn.as_mut().ok_or_else(|| "no connection".to_owned())
     }
 
-    /// Moves on to `minute`: what is held is written out, and whatever the
-    /// store already has of the new minute, from a process before this one,
-    /// is taken up so it is added to and not replaced.
+    fn dirty(&self) -> bool {
+        !(self.dirty_agg.is_empty()
+            && self.dirty_backends.is_empty()
+            && self.dirty_clients.is_empty()
+            && self.dirty_statuses.is_empty()
+            && self.samples.is_empty())
+    }
+
+    fn written(&mut self) {
+        self.dirty_agg.clear();
+        self.dirty_backends.clear();
+        self.dirty_clients.clear();
+        self.dirty_statuses.clear();
+        self.samples.clear();
+    }
+
+    /// Moves on to `minute`: what is held of the one before is written out
+    /// and let go.
     async fn roll(&mut self, minute: i64) {
         self.flush().await;
-        if self.dirty {
+        if self.dirty() {
             tracing::error!(
                 minute = self.minute,
                 "statistics: a minute could not be written and is lost"
             );
-            self.dirty = false;
-            self.samples.clear();
+            self.written();
         }
         self.agg.clear();
         self.backends.clear();
@@ -348,76 +388,6 @@ impl Writer {
             self.hour = minute / 60;
             self.slowest.clear();
         }
-        if let Err(e) = self.take_up().await {
-            self.conn = None;
-            tracing::error!(error = %e, "statistics: cannot read the store");
-        }
-    }
-
-    async fn take_up(&mut self) -> Result<(), String> {
-        let (minute, hour) = (self.minute, self.hour);
-        let conn = self.conn().await?;
-        let of_minute =
-            |table: &str| format!("(select {{from: {table} where: (== minute {minute})}})");
-        let of_kind = |kind: &str, bucket: i64| {
-            format!(
-                "(select {{from: rfb_sample where: (and (== kind '{kind}) (== bucket {bucket}))}})"
-            )
-        };
-        let agg = Rows::of(conn.eval(&of_minute("rfb_agg")).await?)?;
-        let backends = Rows::of(conn.eval(&of_minute("rfb_backend")).await?)?;
-        let clients = Rows::of(conn.eval(&of_minute("rfb_client")).await?)?;
-        let statuses = Rows::of(conn.eval(&of_minute("rfb_status")).await?)?;
-        let slow = Rows::of(conn.eval(&of_kind("slow", hour)).await?)?;
-        let errors = Rows::of(conn.eval(&of_kind("error", minute)).await?)?;
-
-        for row in 0..agg.len() {
-            let mut a = Agg::default();
-            for (slot, name) in a.counters.iter_mut().zip(COUNTERS) {
-                *slot = agg.int(name, row);
-            }
-            for (i, slot) in a.hist.iter_mut().enumerate() {
-                *slot = agg.int(&format!("h{i}"), row);
-            }
-            self.agg
-                .insert((agg.text("pool", row), agg.int("fp", row)), a);
-        }
-        for (rows, into) in [
-            (&backends, &mut self.backends),
-            (&clients, &mut self.clients),
-        ] {
-            for row in 0..rows.len() {
-                let s = Small {
-                    count: rows.int("count", row),
-                    errors: rows.int("errors", row),
-                    dur_sum: rows.int("dur_sum", row),
-                };
-                into.insert((rows.text("pool", row), rows.text("who", row)), s);
-            }
-        }
-        for row in 0..statuses.len() {
-            let key = (statuses.text("pool", row), statuses.text("status", row));
-            self.statuses.insert(key, statuses.int("count", row));
-        }
-        // A slot keeps what it held: the next slow request takes the place
-        // of the least slow one, as if this process had seen them all.
-        if self.slowest.is_empty() {
-            for row in 0..slow.len() {
-                let kept = self.slowest.entry(slow.text("pool", row)).or_default();
-                let slot = slow.int("slot", row) as usize;
-                if slot < SLOW_PER_HOUR {
-                    kept.resize(kept.len().max(slot + 1), 0);
-                    kept[slot] = slow.int("dur", row);
-                }
-            }
-        }
-        for row in 0..errors.len() {
-            *self
-                .errors_this_minute
-                .entry(errors.text("pool", row))
-                .or_default() += 1;
-        }
-        Ok(())
     }
 
     async fn add(&mut self, e: Event) {
@@ -428,8 +398,18 @@ impl Writer {
             self.roll(minute).await;
         }
         let pool = e.pool.to_string();
-        let text = request_text(&e.frame);
-        let (normal, mut fp) = normalize(&text);
+        // A request sent as text is known by its shape; one sent as a value
+        // has no text to normalize and is known by its bytes.
+        let (text, normal, mut fp) = match request_source(&e.frame) {
+            Some(text) => {
+                let (normal, fp) = normalize(&text);
+                (text, normal, fp)
+            }
+            None => {
+                let text = request_text(&e.frame);
+                (text.clone(), text, binary_fingerprint(&e.frame))
+            }
+        };
         if !self.agg.contains_key(&(pool.clone(), fp))
             && self.agg.len() >= self.cfg.max_fingerprints_per_minute
         {
@@ -444,6 +424,9 @@ impl Writer {
         });
         let (dur, wait) = (e.exec.as_micros() as u64, e.wait.as_micros() as u64);
         let failed = !matches!(e.outcome, Outcome::Ok);
+        let backend = e.backend.as_deref().unwrap_or_default().to_owned();
+        let client = e.client.to_string();
+        let status = e.outcome.label().to_owned();
 
         let a = self.agg.entry((pool.clone(), fp)).or_default();
         let c = &mut a.counters;
@@ -464,31 +447,23 @@ impl Writer {
         c[BYTES_IN] += e.bytes_in;
         c[BYTES_OUT] += e.bytes_out;
         a.hist[bucket(dur)] += 1;
+        self.dirty_agg.insert((pool.clone(), fp));
 
-        let backend = e.backend.as_deref().unwrap_or_default().to_owned();
-        let client = e.client.to_string();
-        let groups = [
-            (!backend.is_empty()).then(|| {
-                self.backends
-                    .entry((pool.clone(), backend.clone()))
-                    .or_default()
-            }),
-            Some(
-                self.clients
-                    .entry((pool.clone(), client.clone()))
-                    .or_default(),
-            ),
-        ];
-        for small in groups.into_iter().flatten() {
+        let count = |rows: &mut HashMap<Key, Small>, dirty: &mut HashSet<Key>, who: &str| {
+            let key = (pool.clone(), who.to_owned());
+            let small = rows.entry(key.clone()).or_default();
             small.count += 1;
             small.errors += u64::from(failed);
             small.dur_sum += dur;
+            dirty.insert(key);
+        };
+        count(&mut self.clients, &mut self.dirty_clients, &client);
+        if !backend.is_empty() {
+            count(&mut self.backends, &mut self.dirty_backends, &backend);
         }
-        *self
-            .statuses
-            .entry((pool.clone(), e.outcome.label().to_owned()))
-            .or_default() += 1;
-        self.dirty = true;
+        let key = (pool.clone(), status.clone());
+        *self.statuses.entry(key.clone()).or_default() += 1;
+        self.dirty_statuses.insert(key);
 
         if !self.cfg.store_samples {
             return;
@@ -528,21 +503,18 @@ impl Writer {
                 wait,
                 backend,
                 client,
-                status: e.outcome.label().to_owned(),
+                status,
                 text: clip(text),
             });
         }
     }
 
     async fn flush(&mut self) {
-        if !self.dirty && self.samples.is_empty() {
+        if !self.dirty() {
             return;
         }
         match self.write().await {
-            Ok(()) => {
-                self.dirty = false;
-                self.samples.clear();
-            }
+            Ok(()) => self.written(),
             Err(e) => {
                 // Kept in memory and tried again at the next flush.
                 self.conn = None;
@@ -555,6 +527,7 @@ impl Writer {
         let minute = self.minute as u64;
         self.conn().await?;
         let now = unix(SystemTime::now()).as_secs();
+        let src = |n: usize| Column::Sym(vec![self.src.clone(); n]);
 
         let new: Vec<(u64, String)> = self
             .texts
@@ -573,7 +546,11 @@ impl Writer {
             ])
         });
 
-        let rows: Vec<(&(String, u64), &Agg)> = self.agg.iter().collect();
+        let rows: Vec<(&(String, u64), &Agg)> = self
+            .dirty_agg
+            .iter()
+            .filter_map(|k| self.agg.get_key_value(k))
+            .collect();
         let mut agg: Vec<(String, Column)> = vec![
             ("minute".into(), ints(rows.iter().map(|_| minute))),
             (
@@ -581,6 +558,7 @@ impl Writer {
                 Column::Sym(rows.iter().map(|(k, _)| k.0.clone()).collect()),
             ),
             ("fp".into(), ints(rows.iter().map(|(k, _)| k.1))),
+            ("src".into(), src(rows.len())),
         ];
         for (i, name) in COUNTERS.iter().enumerate() {
             agg.push((
@@ -591,39 +569,51 @@ impl Writer {
         for i in 0..BUCKETS {
             agg.push((format!("h{i}"), ints(rows.iter().map(|(_, a)| a.hist[i]))));
         }
-        let agg = value::table(&agg);
+        let agg = (!rows.is_empty()).then(|| value::table(&agg));
 
-        let small = |rows: &HashMap<(String, String), Small>| {
-            let rows: Vec<_> = rows.iter().collect();
+        let small = |all: &HashMap<Key, Small>, dirty: &HashSet<Key>| {
+            let rows: Vec<(&Key, &Small)> =
+                dirty.iter().filter_map(|k| all.get_key_value(k)).collect();
+            (!rows.is_empty()).then(|| {
+                value::table(&[
+                    ("minute", ints(rows.iter().map(|_| minute))),
+                    (
+                        "pool",
+                        Column::Sym(rows.iter().map(|(k, _)| k.0.clone()).collect()),
+                    ),
+                    (
+                        "who",
+                        Column::Sym(rows.iter().map(|(k, _)| k.1.clone()).collect()),
+                    ),
+                    ("src", src(rows.len())),
+                    ("count", ints(rows.iter().map(|(_, s)| s.count))),
+                    ("errors", ints(rows.iter().map(|(_, s)| s.errors))),
+                    ("dur_sum", ints(rows.iter().map(|(_, s)| s.dur_sum))),
+                ])
+            })
+        };
+        let backends = small(&self.backends, &self.dirty_backends);
+        let clients = small(&self.clients, &self.dirty_clients);
+        let statuses: Vec<(&Key, &u64)> = self
+            .dirty_statuses
+            .iter()
+            .filter_map(|k| self.statuses.get_key_value(k))
+            .collect();
+        let statuses = (!statuses.is_empty()).then(|| {
             value::table(&[
-                ("minute", ints(rows.iter().map(|_| minute))),
+                ("minute", ints(statuses.iter().map(|_| minute))),
                 (
                     "pool",
-                    Column::Sym(rows.iter().map(|(k, _)| k.0.clone()).collect()),
+                    Column::Sym(statuses.iter().map(|(k, _)| k.0.clone()).collect()),
                 ),
                 (
-                    "who",
-                    Column::Sym(rows.iter().map(|(k, _)| k.1.clone()).collect()),
+                    "status",
+                    Column::Sym(statuses.iter().map(|(k, _)| k.1.clone()).collect()),
                 ),
-                ("count", ints(rows.iter().map(|(_, s)| s.count))),
-                ("errors", ints(rows.iter().map(|(_, s)| s.errors))),
-                ("dur_sum", ints(rows.iter().map(|(_, s)| s.dur_sum))),
+                ("src", src(statuses.len())),
+                ("count", ints(statuses.iter().map(|(_, n)| **n))),
             ])
-        };
-        let (backends, clients) = (small(&self.backends), small(&self.clients));
-        let statuses: Vec<_> = self.statuses.iter().collect();
-        let statuses = value::table(&[
-            ("minute", ints(statuses.iter().map(|_| minute))),
-            (
-                "pool",
-                Column::Sym(statuses.iter().map(|(k, _)| k.0.clone()).collect()),
-            ),
-            (
-                "status",
-                Column::Sym(statuses.iter().map(|(k, _)| k.1.clone()).collect()),
-            ),
-            ("count", ints(statuses.iter().map(|(_, n)| **n))),
-        ]);
+        });
         let s = &self.samples;
         let sym = |f: fn(&Sample) -> String| Column::Sym(s.iter().map(f).collect());
         let samples = (!s.is_empty()).then(|| {
@@ -632,6 +622,7 @@ impl Writer {
                 ("pool", sym(|x| x.pool.clone())),
                 ("bucket", Column::I64(s.iter().map(|x| x.bucket).collect())),
                 ("slot", ints(s.iter().map(|x| x.slot as u64))),
+                ("src", src(s.len())),
                 ("ts", Column::I64(s.iter().map(|x| x.ts_ms).collect())),
                 ("fp", ints(s.iter().map(|x| x.fp))),
                 ("dur", ints(s.iter().map(|x| x.dur))),
@@ -648,23 +639,11 @@ impl Writer {
 
         let writes = [
             ("rfb_fp", 1, fps),
-            ("rfb_agg", 3, (!self.agg.is_empty()).then_some(agg)),
-            (
-                "rfb_backend",
-                3,
-                (!self.backends.is_empty()).then_some(backends),
-            ),
-            (
-                "rfb_client",
-                3,
-                (!self.clients.is_empty()).then_some(clients),
-            ),
-            (
-                "rfb_status",
-                3,
-                (!self.statuses.is_empty()).then_some(statuses),
-            ),
-            ("rfb_sample", 4, samples),
+            ("rfb_agg", 4, agg),
+            ("rfb_backend", 4, backends),
+            ("rfb_client", 4, clients),
+            ("rfb_status", 4, statuses),
+            ("rfb_sample", 5, samples),
         ];
         let conn = self.conn().await?;
         for (table, keys, rows) in writes {

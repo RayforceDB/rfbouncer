@@ -39,6 +39,8 @@ fn requests_are_counted_by_the_shape_of_their_query() {
         assert_eq!(c.query_error("(nosuch 1)"), Some("name".to_owned()));
     }
     c.send(&slow(60_000));
+    bouncer.wait_busy(1);
+    // It is let run for a while, so there is a time to find in the reports.
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     // While that one runs, the page shows it.

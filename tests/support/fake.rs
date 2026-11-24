@@ -17,6 +17,14 @@ pub struct Fake {
 impl Fake {
     /// `behave` gets each greeted connection and its number, counted from 0.
     pub fn start(behave: impl Fn(TcpStream, usize) + Send + Sync + 'static) -> Self {
+        Self::start_speaking(4, behave)
+    }
+
+    /// As `start`, greeting with another wire version.
+    pub fn start_speaking(
+        version: u8,
+        behave: impl Fn(TcpStream, usize) + Send + Sync + 'static,
+    ) -> Self {
         let port = super::free_port();
         let listener = super::listen(port).unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -30,7 +38,9 @@ impl Fake {
                     // Closed for certain when `behave` is done, even if a
                     // process started meanwhile inherited the descriptor.
                     let closer = stream.try_clone();
-                    if stream.read_exact(&mut hello).is_ok() && stream.write_all(&[4, 0]).is_ok() {
+                    if stream.read_exact(&mut hello).is_ok()
+                        && stream.write_all(&[version, 0]).is_ok()
+                    {
                         behave(stream, n);
                     }
                     if let Ok(closer) = closer {

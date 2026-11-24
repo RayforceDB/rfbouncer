@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 
 use crate::client::read_frame;
 use crate::core::Core;
-use crate::pool::{Cmd, PoolHandle};
+use crate::pool::{Cmd, PoolHandle, request_text};
 use crate::wire::frame::{self, HEADER_LEN, MSG_RESPONSE, MSG_SYNC};
 use crate::wire::value::{self, Column};
 
@@ -130,8 +130,8 @@ async fn show_pools(core: &Core) -> Vec<u8> {
         paused.push(i64::from(s.paused));
         queue.push(s.queue.len() as i64);
         backends.push(s.backends.len() as i64);
-        up.push(s.backends.iter().filter(|b| b.state != "down").count() as i64);
-        busy.push(s.backends.iter().filter(|b| b.state == "busy").count() as i64);
+        up.push(s.backends.iter().filter(|b| b.state() != "down").count() as i64);
+        busy.push(s.backends.iter().filter(|b| b.state() == "busy").count() as i64);
         requests.push(n as i64);
         ok.push(c.ok.load(Relaxed) as i64);
         errors.push(c.server_errors.load(Relaxed) as i64);
@@ -174,15 +174,19 @@ async fn show_servers(core: &Core) -> Vec<u8> {
         for b in s.backends {
             pool.push(s.name.to_string());
             addr.push(b.addr.to_string());
-            state.push(b.state.to_owned());
+            state.push(b.state().to_owned());
             draining.push(i64::from(b.draining));
             served.push(b.served as i64);
             failures.push(b.failures as i64);
-            let (who, since, text) = b
-                .running
-                .map_or_else(Default::default, |(who, since, text)| {
-                    (who.to_string(), since.as_millis() as i64, text)
-                });
+            let (who, since, text) =
+                b.running
+                    .map_or_else(Default::default, |(who, since, frame)| {
+                        (
+                            who.to_string(),
+                            since.as_millis() as i64,
+                            request_text(&frame),
+                        )
+                    });
             running_ms.push(since);
             client.push(who);
             query.push(text);

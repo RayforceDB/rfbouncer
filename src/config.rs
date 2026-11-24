@@ -19,6 +19,9 @@ pub const ADMIN_USER: &str = "rfbouncer";
 pub struct Config {
     pub listen: SocketAddr,
     pub admin_password: Option<String>,
+    /// Opens the report pages and the metrics, and nothing else. Without
+    /// it they take the admin password.
+    pub report_password: Option<String>,
     #[serde(default = "default_max_clients")]
     pub max_client_conn: usize,
     #[serde(default = "default_max_request", deserialize_with = "size")]
@@ -113,9 +116,13 @@ pub struct PoolConfig {
     pub queue_max: usize,
     #[serde(default = "secs_10", deserialize_with = "duration")]
     pub query_wait_timeout: Duration,
-    /// Zero is no limit.
-    #[serde(default, deserialize_with = "duration")]
+    /// How long a replica may take to start answering; zero is no limit.
+    #[serde(default = "secs_30", deserialize_with = "duration")]
     pub query_timeout: Duration,
+    /// How long a client may take to receive an answer once it has begun;
+    /// zero is no limit.
+    #[serde(default = "secs_60", deserialize_with = "duration")]
+    pub transfer_timeout: Duration,
     #[serde(default = "secs_5", deserialize_with = "duration")]
     pub cancel_grace: Duration,
     #[serde(default = "secs_5", deserialize_with = "duration")]
@@ -148,6 +155,9 @@ fn secs_5() -> Duration {
 }
 fn secs_10() -> Duration {
     Duration::from_secs(10)
+}
+fn secs_60() -> Duration {
+    Duration::from_secs(60)
 }
 fn secs_30() -> Duration {
     Duration::from_secs(30)
@@ -256,6 +266,17 @@ impl Config {
         if self.max_request_bytes == 0 || self.max_request_bytes > PAYLOAD_MAX {
             return bad("max_request_bytes must be between 1 and 256MiB".into());
         }
+        if self.max_client_conn == 0 {
+            return bad("max_client_conn must be at least 1".into());
+        }
+        if !matches!(self.stats.wire_version, 3 | 4) {
+            return bad("[stats] wire_version must be 3 or 4".into());
+        }
+        if let Some(addr) = &self.stats.rayforce
+            && !is_host_port(addr)
+        {
+            return bad(format!("[stats] rayforce {addr:?}: expected host:port"));
+        }
         if self.pool.iter().filter(|p| p.default).count() > 1 {
             return bad("only one pool may be the default".into());
         }
@@ -283,6 +304,21 @@ impl Config {
             if p.backends.is_empty() || p.slots == 0 {
                 return bad(format!(
                     "pool {:?}: needs a backend and at least one slot",
+                    p.name
+                ));
+            }
+            if let Some(addr) = p.backends.iter().find(|a| !is_host_port(a)) {
+                return bad(format!(
+                    "pool {:?}: backend {addr:?}: expected host:port",
+                    p.name
+                ));
+            }
+            if p.queue_max == 0 {
+                return bad(format!("pool {:?}: queue_max must be at least 1", p.name));
+            }
+            if p.affinity && p.mode == Mode::RoundRobin {
+                return bad(format!(
+                    "pool {:?}: affinity has no effect under mode = \"round_robin\"; remove one",
                     p.name
                 ));
             }
@@ -349,6 +385,12 @@ impl Config {
     }
 }
 
+/// A name or address, a colon, and a port that is one.
+fn is_host_port(addr: &str) -> bool {
+    addr.rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0))
+}
+
 fn same(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
@@ -391,7 +433,8 @@ mod tests {
         assert!(
             config(&TWO.replace("default = true", "default = true\nmode = \"random\"")).is_err()
         );
-        assert_eq!(c.pool[1].query_timeout, Duration::ZERO);
+        assert_eq!(c.pool[1].query_timeout, Duration::from_secs(30));
+        assert_eq!(c.pool[1].transfer_timeout, Duration::from_secs(60));
         assert_eq!(c.resolve("app", b"a", 3), Target::Pool(&c.pool[0]));
         assert_eq!(c.resolve("app", b"b", 3), Target::Rejected);
         assert_eq!(c.resolve("app", b"a", 4), Target::Rejected);
@@ -418,6 +461,26 @@ mod tests {
         assert!(config(&TWO.replace("\"app\"", "\"rfbouncer\"")).is_err());
         assert!(config(&TWO.replace("wire_version = 3", "wire_version = 9")).is_err());
         assert!(config(&TWO.replace("30s", "30 parsecs")).is_err());
+        assert!(
+            config(&TWO.replace("backends = [\"127.0.0.1:1\"]", "backends = [\"localhost\"]"))
+                .is_err()
+        );
+        assert!(config(&TWO.replace("default = true", "default = true\nqueue_max = 0")).is_err());
+        assert!(
+            config(&TWO.replace(
+                "default = true",
+                "default = true\naffinity = true\nmode = \"round_robin\""
+            ))
+            .is_err()
+        );
+        assert!(config(&format!("max_client_conn = 0\n{TWO}")).is_err());
+        assert!(
+            config(&TWO.replace(
+                "[[pool]]\n        name = \"main\"",
+                "[stats]\n        wire_version = 9\n        [[pool]]\n        name = \"main\""
+            ))
+            .is_err()
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ fn a_request_whose_replica_dies_is_run_again_on_another() {
     let bouncer = Bouncer::start(&pool(&[&doomed, &other], OPEN));
     let mut c = Client::connect(bouncer.port);
     c.send(&slow(8000));
-    std::thread::sleep(Duration::from_millis(200));
+    bouncer.wait_busy(1);
     doomed.kill();
     assert_eq!(c.recv(), int(8000));
     // The pool goes on with what is left.
@@ -39,7 +39,7 @@ fn without_retry_the_client_is_told() {
     let bouncer = Bouncer::start(&pool(&[&doomed, &other], &format!("{OPEN}\nretry = false")));
     let mut c = Client::connect(bouncer.port);
     c.send(&slow(8000));
-    std::thread::sleep(Duration::from_millis(200));
+    bouncer.wait_busy(1);
     doomed.kill();
     assert_eq!(
         rfbouncer::wire::value::error_code(&c.recv()),
@@ -187,7 +187,7 @@ fn a_stop_lets_the_request_in_flight_finish() {
     let mut bouncer = Bouncer::start(&pool(&[&replica], OPEN));
     let mut c = Client::connect(bouncer.port);
     c.send(&slow(6000));
-    std::thread::sleep(Duration::from_millis(200));
+    bouncer.wait_busy(1);
     signal(bouncer.pid(), "TERM");
     assert_eq!(c.recv(), int(6000));
     eventually("the bouncer exited", || bouncer.exited().is_some());
