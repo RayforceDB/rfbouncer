@@ -33,7 +33,13 @@ impl Watch {
         use tokio::io::Interest;
         use tokio::io::unix::AsyncFd;
         let twin: std::net::TcpStream = SockRef::from(stream).try_clone()?.into();
-        Ok(Self(AsyncFd::with_interest(twin, Interest::PRIORITY)?))
+        // Deprecated because a type could close its descriptor while it is
+        // registered. This one cannot: the socket is owned here, by the
+        // registration, and closed only with it. The constructors that
+        // replace it are unsafe, which this crate forbids.
+        #[allow(deprecated)]
+        let registered = AsyncFd::with_interest(twin, Interest::PRIORITY)?;
+        Ok(Self(registered))
     }
 
     /// Resolves once the peer has sent an urgent byte.
