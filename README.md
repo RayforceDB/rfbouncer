@@ -17,6 +17,8 @@ browser ──►   │   queue      ──► replica :5002
               └─ statistics ──► a Rayforce of their own :5100
 ```
 
+![Overview page: requests, times and what each replica is running](docs/img/overview.png)
+
 ## Status
 
 Version 0.1: early, and not yet run in production. What it does is covered by
@@ -389,6 +391,14 @@ name). With `[stats] rayforce` set, the pages show:
 - **Slowest**, **Failures**: individual requests kept with their full text.
 - **Clients**, **Replicas**: who sends the work and who does it.
 - **Now**: what each replica is running and what waits in the queue.
+
+Requests grouped by the shape of their query:
+
+![Queries page](docs/img/queries.png)
+
+Requests that did not succeed, with their text:
+
+![Failed page](docs/img/failed.png)
 
 The wait for a replica has percentiles like the time in one: p50, p95 and
 p99 in the totals, in the tooltip of the wait chart, and p95 for each query
