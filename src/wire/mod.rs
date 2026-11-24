@@ -7,4 +7,5 @@ pub mod compress;
 pub mod frame;
 pub mod greeting;
 pub mod oob;
+pub mod status;
 pub mod value;
