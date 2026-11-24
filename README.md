@@ -20,10 +20,10 @@ browser ──►   │   queue      ──► replica :5002
 ## Status
 
 Version 0.1: early, and not yet run in production. What it does is covered by
-tests against real Rayforce processes, on Linux and macOS, at wire version 4.
+tests that run against real Rayforce processes, on Linux and macOS: the 3.0.2
+release, which speaks wire version 3, and the development branch, which
+speaks 4. Set `wire_version` to the one your replicas speak; the default is 4.
 
-- Wire version 3 is supported by the layout of its bytes and has not been
-  run against a version 3 server.
 - On Linux a client's cancel is passed on as it arrives. Elsewhere the
   socket is asked every 20 ms, so it is up to 20 ms late.
 - The statistics store keeps everything in memory.

@@ -146,7 +146,7 @@ async fn open(ctx: &Ctx) -> Result<TcpStream, String> {
             cfg.backend_password.as_deref(),
         )
         .await
-        .map_err(|e| format!("greeting: {e}"))?;
+        .map_err(|e| greeting_failure(&e, cfg.wire_version))?;
         if cfg.require_restricted {
             probe(&mut stream, cfg.wire_version).await?;
         }
@@ -155,6 +155,18 @@ async fn open(ctx: &Ctx) -> Result<TcpStream, String> {
     .await
     .map_err(|_| "greeting timed out".to_owned())??;
     Ok(stream)
+}
+
+/// Why a greeting failed. A server of another wire version may close
+/// without a word, which reads as nothing more than an end: say what to
+/// look at.
+fn greeting_failure(e: &greeting::GreetError, version: u8) -> String {
+    match e {
+        greeting::GreetError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => {
+            format!("greeting: closed by the replica; does it speak wire version {version}?")
+        }
+        e => format!("greeting: {e}"),
+    }
 }
 
 /// Asks the replica for something only a restricted connection is refused.

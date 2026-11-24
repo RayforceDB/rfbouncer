@@ -54,7 +54,8 @@ users = ["app"]
 password = "client-secret"
 # Takes the clients whose user names no pool.
 default = true
-# The wire version the replicas speak: 3 (Rayforce up to 2.x) or 4.
+# The wire version the replicas speak: 3 for Rayforce releases up to 3.0, 4
+# for what comes after. A replica of the other version shows as down.
 wire_version = 4
 # The password the replicas were started with (-U).
 backend_password = "replica-secret"
