@@ -42,9 +42,9 @@ test('a duration takes the unit that fits it', () => {
 test('a duration just under a unit rounds to the same amount, in either unit', () => {
   // Rounding to three figures can reach the next unit's first value; both
   // spellings say the same duration.
-  assert.match(app.dur(999.5), /^(1000 ms|1 s)$/);
+  assert.equal(app.dur(999.5), '1 s');
   assert.match(app.dur(0.9996), /^(1000 µs|1 ms)$/);
-  assert.match(app.dur(59999), /^(60 s|1 m 00 s)$/);
+  assert.equal(app.dur(59999), '1 m 00 s');
 });
 
 test('a span of seconds names its two largest units', () => {
@@ -102,4 +102,80 @@ test('the zone is named by its offset from UTC', () => {
   assert.equal(zoneIn('Asia/Kolkata'), 'UTC+5:30');
   // West of Greenwich the sign is a real minus, U+2212.
   assert.equal(zoneIn('Etc/GMT+3'), 'UTC\u22123');
+});
+
+// A number that rounds up to the next unit is written in that unit: the
+// page once said `1000 ms`, `60 s` and `1024.0 KiB`.
+test('no duration or size is written as a full unit of the one below', () => {
+  assert.equal(app.dur(0.9996), '1 ms');
+  assert.equal(app.dur(0.99949), '999 µs');
+  assert.equal(app.dur(999.4), '999 ms');
+  assert.equal(app.dur(999.6), '1 s');
+  assert.equal(app.dur(59940), '59.9 s');
+  assert.equal(app.dur(59950), '1 m 00 s');
+  assert.equal(app.dur(60000), '1 m 00 s');
+  assert.equal(app.bytes(1023), '1023 B');
+  assert.equal(app.bytes(1024 * 1024 - 1), '1.0 MiB');
+  assert.equal(app.bytes(1024 * 1023.9), '1023.9 KiB');
+  assert.equal(app.bytes(1024 ** 3 - 1), '1.0 GiB');
+  assert.equal(app.msCell(99.94), '99.9');
+  assert.equal(app.msCell(99.96), '100');
+  assert.equal(app.msCell(9.994), '9.99');
+  assert.equal(app.msCell(9.996), '10.0');
+  // Swept, so that no value between the cases slips through.
+  for (let e = -4; e < 9; e += 0.001) {
+    const ms = 10 ** e;
+    assert.doesNotMatch(app.dur(ms), /^(1000 (µs|ms)|60 s)$/, `dur(${ms})`);
+    assert.doesNotMatch(app.bytes(Math.round(ms * 1000)), /^1024/, `bytes(${Math.round(ms * 1000)})`);
+    assert.doesNotMatch(app.msCell(ms), /^(10\.00|100\.0)$/, `msCell(${ms})`);
+  }
+});
+
+// The period before: which way a number moved and by how much.
+test('a change against the period before is said only when it is one', () => {
+  const said = (now, was, fresh) => app.delta(now, was, app.int, fresh).textContent;
+  assert.equal(said(100, 100), '');
+  assert.equal(said(105, 100), '');
+  assert.equal(said(92, 100), '');
+  assert.equal(said(0, 0), '');
+  assert.equal(said(undefined, undefined), '');
+  assert.equal(said(150, 100), '▲ 50%');
+  assert.equal(said(50, 100), '▼ 50%');
+  assert.equal(said(250, 100), '▲ 2.5×');
+  assert.equal(said(100000, 100), '▲ 1000×');
+  assert.equal(said(0, 40), '▼ from 40');
+  assert.equal(said(40, 0), '▲ from 0');
+  assert.equal(said(40, 0, 'new'), 'new');
+  const el = app.delta(150, 100, app.dur);
+  assert.equal(el.className, 'delta');
+  assert.equal(el.title, '100 ms in the period before');
+  // Never a NaN or an Infinity on the page, whatever the two numbers are.
+  for (const now of [0, 1e-9, 1, 3, 1e12]) for (const was of [0, 1e-9, 1, 3, 1e12]) assert.doesNotMatch(said(now, was), /NaN|Infinity/);
+});
+
+// What a replica says of itself over its status stream.
+test('a replica\u2019s own status fills the load columns, and nothing where it says nothing', () => {
+  const [load, cpu, memory] = app.loadColumns.map((c) => c.cell);
+  const silent = { state: 'idle' };
+  assert.deepEqual([load(silent), cpu(silent), memory(silent)], ['', '', '']);
+  const r = { state: 'busy', status: { util: 0.456, cpu: 1.5, cores: 8, rss_bytes: 3 * 1024 ** 3, mem_share: 0.75, not_ours: false } };
+  assert.deepEqual([load(r), cpu(r), memory(r)], ['45.6%', '1.50 / 8', '3.0 GiB · 75.0%']);
+  // No limit, no share; no second frame yet, no rates.
+  const first = { status: { util: null, cpu: null, cores: 8, rss_bytes: 1024, mem_share: null } };
+  assert.deepEqual([load(first), cpu(first), memory(first)], ['', '', '1.0 KiB']);
+});
+
+test('work the bouncer did not send is named, and its text stays text', () => {
+  assert.equal(app.notOurs({}), '');
+  assert.equal(app.notOurs({ status: { not_ours: false, text: 'x' } }), '');
+  assert.equal(app.notOurs({ status: { not_ours: true, state: 'other', text: '' } }), 'other work');
+  assert.equal(app.notOurs({ status: { not_ours: true, state: 'request', text: '' } }), 'a request');
+  const markup = '<img src=x onerror=alert(1)>';
+  const cell = app.replicaState({ state: 'busy', status: { not_ours: true, state: 'request', text: markup } });
+  assert.equal(cell.textContent, 'busy · not ours');
+  assert.equal(cell.all('img').length, 0);
+  assert.equal(cell.all('span')[0].getAttribute('title'), markup);
+  // Down wins over draining, and draining over what the replica is doing.
+  assert.equal(app.replicaState({ state: 'down', draining: true }).textContent, 'down');
+  assert.equal(app.replicaState({ state: 'idle', draining: true }).textContent, 'draining');
 });

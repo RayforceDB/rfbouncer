@@ -40,10 +40,13 @@ const sig3 = (x) => String(Number(x.toPrecision(3)));
 // and more digits would claim what it does not know.
 function dur(ms) {
   if (!ms) return '0 ms';
-  if (ms < 1) return sig3(ms * 1000) + ' µs';
-  if (ms < 1000) return sig3(ms) + ' ms';
-  if (ms < 60000) return sig3(ms / 1000) + ' s';
-  return span(ms / 1000);
+  // The unit is chosen by the number as it will be written: 999.5 ms is
+  // 1 s, not 1000 ms, and 59.99 s is a minute.
+  const fits = (x, below) => Number(x.toPrecision(3)) < below;
+  if (fits(ms * 1000, 1000)) return sig3(ms * 1000) + ' µs';
+  if (fits(ms, 1000)) return sig3(Math.max(ms, 1)) + ' ms';
+  if (fits(ms / 1000, 60)) return sig3(Math.max(ms / 1000, 1)) + ' s';
+  return span(Math.round(ms / 1000));
 }
 function span(sec) {
   sec = Math.floor(sec);
@@ -55,11 +58,14 @@ function span(sec) {
 }
 // Milliseconds for a column whose header names the unit, so a column reads
 // as magnitudes and not as a mix of units.
-const msCell = (ms) => ms >= 100 ? int(ms) : ms.toFixed(ms >= 10 ? 1 : 2);
+// The steps are where the rounded number changes its length, so 99.96 is
+// 100 and not 100.0.
+const msCell = (ms) => ms >= 99.95 ? int(ms) : ms.toFixed(ms >= 9.995 ? 1 : 2);
 function bytes(n) {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
   let i = 0;
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  // By the number as written: 1023.99 KiB is 1.0 MiB, not 1024.0 KiB.
+  while (i < units.length - 1 && (i ? Number(n.toFixed(1)) : n) >= 1024) { n /= 1024; i++; }
   return (i ? n.toFixed(1) : n) + ' ' + units[i];
 }
 function pct(part, whole) {
@@ -237,7 +243,11 @@ function chart(data, spec) {
 function draw(W, data, points, spec, self) {
   const svg = s('svg', { class: 'chart', viewBox: `0 0 ${W} ${H}`, tabindex: 0 });
   const { from, to, step_s: step } = data;
-  const x = (t) => L + (W - L - R) * (Math.min(Math.max(t, from), to) - from) / (to - from);
+  // A range of no length has no scale; everything in it is at its start.
+  const x = (t) => L + (W - L - R) * (Math.min(Math.max(t, from), to) - from) / (to - from || 1);
+  // Where a step's bar or mark begins. A step that starts where the range
+  // ends has no width left, and is kept as the last pixel inside the plot.
+  const left = (t) => Math.max(L, Math.min(x(t), x(t + step) - 1));
   const values = (p) => spec.series.map((sr) => sr.of(p));
   const top = Math.max(...points.map((p) => spec.bars ? values(p).reduce((a, b) => a + b, 0) : Math.max(...values(p))));
 
@@ -268,7 +278,7 @@ function draw(W, data, points, spec, self) {
   const now = Date.now() / 1000;
   if (spec.bars) {
     for (const p of points) {
-      const x0 = x(p.t) + 0.5, w = Math.max(1, x(p.t + step) - x(p.t) - 1);
+      const w = Math.max(1, x(p.t + step) - x(p.t) - 1), x0 = w > 1 ? x(p.t) + 0.5 : left(p.t);
       let base = 0;
       spec.series.forEach((sr) => {
         const v = sr.of(p);
@@ -306,7 +316,7 @@ function draw(W, data, points, spec, self) {
     const p = t == null ? null : points.find((q) => q.t === t);
     cross.setAttribute('visibility', p ? 'visible' : 'hidden');
     if (p) {
-      cross.setAttribute('x', x(p.t));
+      cross.setAttribute('x', left(p.t));
       cross.setAttribute('width', Math.max(1, x(p.t + step) - x(p.t)));
     }
   };

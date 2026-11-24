@@ -211,11 +211,34 @@ test('the step under the pointer is marked inside the plot, and unmarked again',
   assert.equal(cross.getAttribute('visibility'), 'hidden');
 });
 
-// Not yet true, and kept here until it is. The server answers with a point
-// at `t === to` whenever `to` falls on the edge of a step, and draw() puts
-// that bar at W - R + 0.5, one pixel wide: just past the right edge.
-test('a step that starts where the range ends is inside the plot too', { todo: 'drawn 1.5 px past the right edge' }, () => {
+// The server answers with a point at `t === to` whenever `to` falls on the
+// edge of a step. Its bar was once drawn at W - R + 0.5, past the plot.
+test('a step that starts where the range ends is inside the plot too', () => {
   const data = { from: FROM, to: TO, step_s: 60, points: [{ t: TO - 60, ok: 1, failed: 0 }, { t: TO, ok: 1, failed: 0 }] };
-  const svg = app.draw(W, data, data.points, { bars: true, format: String, series: twoSeries }, {});
-  for (const r of bars(svg)) assert.ok(num(r, 'x') + num(r, 'width') <= W - R + EPS, `bar ends at ${num(r, 'x') + num(r, 'width')}, plot at ${W - R}`);
+  const self = {};
+  const svg = app.draw(W, data, data.points, { bars: true, format: String, series: twoSeries }, self);
+  const rects = bars(svg);
+  assert.equal(rects.length, 2);
+  for (const r of rects) {
+    assert.ok(num(r, 'x') >= L && num(r, 'x') + num(r, 'width') <= W - R + EPS, `bar ${num(r, 'x')}..${num(r, 'x') + num(r, 'width')}, plot ${L}..${W - R}`);
+  }
+  // And so is the mark that follows the pointer onto it.
+  self.mark(TO);
+  const cross = svg.all('rect').find((r) => r.getAttribute('class') === 'cross');
+  assert.ok(num(cross, 'x') >= L && num(cross, 'x') + num(cross, 'width') <= W - R + EPS);
+});
+
+// Only a hand-made answer has a range of no length, but the page must not
+// write NaN into its drawing for one.
+test('a range of no length is drawn without a NaN in it', () => {
+  for (const spec of [{ bars: true, series: twoSeries }, { log: true, series: twoSeries }]) {
+    const data = { from: TO, to: TO, step_s: 60, points: [{ t: TO, ok: 3, failed: 1 }] };
+    const svg = app.draw(W, data, data.points, { ...spec, format: String }, {});
+    for (const tag of ['rect', 'line', 'text', 'path']) {
+      for (const el of svg.all(tag)) {
+        for (const [name, value] of Object.entries(el.attrs)) assert.doesNotMatch(String(value), /NaN|Infinity/, `${tag} ${name}=${value}`);
+      }
+    }
+    for (const r of bars(svg)) assert.ok(num(r, 'x') >= L && num(r, 'x') + num(r, 'width') <= W - R + EPS);
+  }
 });

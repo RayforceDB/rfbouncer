@@ -13,7 +13,8 @@ const source = fs.readFileSync(APP, 'utf8');
 
 const NAMES = ['TABS', 'RANGES', 'OUTCOMES', 'H', 'L', 'R', 'T', 'B', 'h', 's', 'int', 'sig3', 'dur', 'span', 'msCell',
   'bytes', 'pct', 'two', 'hm', 'md', 'stamp', 'zone', 'state', 'link', 'here', 'table', 'text', 'outcome', 'failedCell',
-  'share', 'niceStep', 'timeTicks', 'chart', 'draw'];
+  'share', 'niceStep', 'timeTicks', 'chart', 'draw', 'delta', 'notOurs', 'replicaState', 'loadColumns', 'totals',
+  'replicasNow'];
 
 class Node {
   constructor(tag, ns) {
