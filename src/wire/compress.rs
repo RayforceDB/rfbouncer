@@ -50,14 +50,16 @@ pub fn decompress(body: &[u8], max: usize) -> Result<Vec<u8>, CompressError> {
 mod tests {
     use super::*;
 
-    // Recorded off a rayforce v2.5.14 process: a 2410-byte i64 vector.
+    // Read off a rayforce 3.0.2 process answering `(take [5] 300)` to a
+    // client on another address than loopback: a vector of 300 i64.
     #[test]
     fn a_server_payload_decompresses() {
-        let mut wire = vec![0x6a, 0x09, 0, 0, 0xfb, 0x05, 0xfb, 0x2c, 0xd5, 0xff];
-        wire.extend(std::iter::repeat_n([0x7f, 0x00], 18).flatten());
-        wire.extend_from_slice(&[0x77, 0x00]);
+        let mut wire = vec![
+            0x6a, 0x09, 0, 0, 0xfb, 0x05, 0xfb, 0x2c, 0xd5, 0xff, 0x05, 0x00,
+        ];
+        wire.extend(std::iter::repeat_n([0xfe, 0x05, 0xfb, 0x06, 0x00], 300).flatten());
         let mut expected = vec![5, 0, 0x2c, 1, 0, 0, 0, 0, 0, 0];
-        expected.extend(std::iter::repeat_n(0, 2400));
+        expected.extend(std::iter::repeat_n([5, 0, 0, 0, 0, 0, 0, 0], 300).flatten());
         assert_eq!(decompress(&wire, 1 << 20).unwrap(), expected);
     }
 
