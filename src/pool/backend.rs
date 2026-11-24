@@ -1,6 +1,7 @@
 //! One connection to one replica: open it, keep it, run one request at a
 //! time over it, and open it again when anything about it looks wrong.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
@@ -10,7 +11,7 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
-use tokio::time::{sleep, sleep_until, timeout, timeout_at};
+use tokio::time::{Sleep, sleep, sleep_until, timeout, timeout_at};
 
 use super::{Cmd, Ending, Job, Reply, Shared};
 use crate::config::PoolConfig;
@@ -34,6 +35,10 @@ const SETTLED: Duration = Duration::from_secs(1);
 /// A peer that has vanished without closing is noticed within about this.
 const KEEPALIVE: Duration = Duration::from_secs(30);
 pub const CHUNK: usize = 64 * 1024;
+/// How much of an answer is asked for before its size is known.
+const FIRST_READ: usize = 4096;
+/// Further off than anything is waited for.
+const FAR: Duration = Duration::from_secs(86_400 * 365);
 /// An answer nobody waits for is read off the wire up to this size; past it
 /// a new connection is cheaper.
 const DRAIN_MAX: usize = 1024 * 1024;
@@ -204,6 +209,12 @@ async fn probe(stream: &mut TcpStream, version: u8) -> Result<(), String> {
 async fn serve(ctx: &Ctx, stream: &mut TcpStream, rx: &mut mpsc::UnboundedReceiver<Msg>) -> Next {
     let mut idle_since = tokio::time::Instant::now();
     let mut reconfigured = ctx.cfg.clone();
+    // One timer for the connection, moved for each request. A timer made
+    // for each request is put into the runtime's timer wheel and taken out
+    // again under a lock all its threads share; one that is only ever moved
+    // later is moved without it.
+    let budget = sleep(FAR);
+    tokio::pin!(budget);
     loop {
         let cfg = ctx.cfg.borrow().clone();
         // With several connections to one replica, an idle one would be
@@ -226,7 +237,7 @@ async fn serve(ctx: &Ctx, stream: &mut TcpStream, rx: &mut mpsc::UnboundedReceiv
                     // to be down before the request is said to be over, so
                     // the pool does not hand this replica the next one in
                     // between.
-                    let broken = match exchange(ctx, stream, job, rx, &mut after).await {
+                    let broken = match exchange(ctx, stream, job, rx, &mut after, budget.as_mut()).await {
                         Exchange::Clean => {
                             let _ = ctx.events.send(Cmd::Finished(ctx.idx));
                             None
@@ -314,6 +325,7 @@ async fn exchange(
     job: Job,
     rx: &mut mpsc::UnboundedReceiver<Msg>,
     after: &mut Option<Next>,
+    mut budget: Pin<&mut Sleep>,
 ) -> Exchange {
     let cfg = ctx.cfg.borrow().clone();
     let started = Instant::now();
@@ -332,6 +344,9 @@ async fn exchange(
     // own budget, and no longer than a stalled transfer is given.
     let stalled = started + STALL;
     let written = tokio::select! {
+        // In this order: a request the socket takes at once, which is nearly
+        // every one, then costs no timer.
+        biased;
         written = stream.write_all(&job.frame) => written.map_err(|e| format!("send: {e}")),
         () = sleep_until(deadline.unwrap_or(stalled).min(stalled).into()) => Err(String::new()),
         () = job.reply.closed() => {
@@ -353,15 +368,18 @@ async fn exchange(
     let mut cancel: Option<Why> = None;
     let mut grace: Option<Instant> = None;
     let mut closed = false;
-    let mut raw = [0u8; HEADER_LEN];
-    let mut filled = 0;
+    // The header and as much of the answer as came with it: a short answer
+    // is one read here and one write to the client.
+    let mut buf = BytesMut::with_capacity(FIRST_READ);
+    if let Some(deadline) = deadline {
+        budget.as_mut().reset(deadline.into());
+    }
     let failure = loop {
         let cancel_now = tokio::select! {
-            r = stream.read(&mut raw[filled..]) => match r {
+            r = stream.read_buf(&mut buf) => match r {
                 Ok(0) => break Some("closed by the replica".to_owned()),
-                Ok(n) => {
-                    filled += n;
-                    if filled == HEADER_LEN {
+                Ok(_) => {
+                    if buf.len() >= HEADER_LEN {
                         break None;
                     }
                     continue;
@@ -393,7 +411,7 @@ async fn exchange(
                 }
             },
             () = job.reply.closed(), if cancel.is_none() => Why::ClientGone,
-            () = sleep_until(deadline.unwrap_or(started).into()), if cancel.is_none() && deadline.is_some() => Why::Timeout,
+            () = budget.as_mut(), if cancel.is_none() && deadline.is_some() => Why::Timeout,
             () = sleep_until(grace.unwrap_or(started).into()), if grace.is_some() => {
                 break Some("did not answer a cancel in time".to_owned());
             }
@@ -403,6 +421,10 @@ async fn exchange(
         grace = Some(Instant::now() + cfg.cancel_grace);
     };
 
+    let mut raw = [0u8; HEADER_LEN];
+    if failure.is_none() {
+        raw.copy_from_slice(&buf[..HEADER_LEN]);
+    }
     let header = match failure {
         None => Header::parse(&raw, cfg.wire_version, PAYLOAD_MAX)
             .map_err(|e| e.to_string())
@@ -436,9 +458,21 @@ async fn exchange(
         }
     };
 
+    // Only one request is out, so anything past its answer was not asked
+    // for: a subscription a client left behind. The answer is still the
+    // client's; the connection is not used again.
+    let unsolicited = buf.len() > HEADER_LEN + header.size;
+    buf.truncate(HEADER_LEN + header.size);
+    let mut remaining = HEADER_LEN + header.size - buf.len();
+    let clean = |drained: Result<(), String>| match drained {
+        Ok(()) if unsolicited => Exchange::Broken("unsolicited data from the replica".into()),
+        Ok(()) => Exchange::Clean,
+        Err(reason) => Exchange::Broken(reason),
+    };
+
     // The budget ran out or the client left: the answer has no reader.
     if let Some(why @ (Why::Timeout | Why::ClientGone)) = cancel {
-        let drained = drain(stream, header.size).await;
+        let drained = drain(stream, remaining).await;
         let outcome = if why == Why::Timeout {
             job.refuse("timeout", &timeout_message(&cfg)).await;
             Outcome::Timeout
@@ -446,10 +480,7 @@ async fn exchange(
             Outcome::Cancelled
         };
         ctx.shared.report(&job, end(outcome, 0));
-        return match drained {
-            Ok(()) => Exchange::Clean,
-            Err(reason) => Exchange::Broken(reason),
-        };
+        return clean(drained);
     }
 
     // From here the replica's thread is free again but its connection is
@@ -458,7 +489,7 @@ async fn exchange(
     // likes.
     let due = (!cfg.transfer_timeout.is_zero())
         .then(|| tokio::time::Instant::now() + cfg.transfer_timeout);
-    let far = tokio::time::Instant::now() + Duration::from_secs(86_400 * 365);
+    let far = tokio::time::Instant::now() + FAR;
     // An answer a Rayforce server would have compressed for this client,
     // had the client been its peer: the replica saw the bouncer, most often
     // on its own host, and sent it plain. It is taken whole before any of
@@ -473,19 +504,16 @@ async fn exchange(
         && job.frame.len() + HEADER_LEN + header.size <= cfg.cache_max_entry;
     let mut whole = (squeeze || keep).then(|| {
         let mut whole = BytesMut::with_capacity(HEADER_LEN + header.size);
-        whole.extend_from_slice(&raw);
+        whole.extend_from_slice(&buf);
         whole
     });
+    let mut head: Vec<u8> = Vec::with_capacity(9);
+    head.extend_from_slice(&buf[HEADER_LEN..buf.len().min(HEADER_LEN + 9)]);
     let mut client_gone = if squeeze {
         job.reply.is_closed()
     } else {
-        job.reply
-            .send(Reply::Data(Bytes::copy_from_slice(&raw)))
-            .await
-            .is_err()
+        job.reply.send(Reply::Data(buf.freeze())).await.is_err()
     };
-    let mut remaining = header.size;
-    let mut head: Vec<u8> = Vec::with_capacity(9);
     let mut broken = None;
     let mut slow = false;
     while remaining > 0 {
@@ -594,7 +622,7 @@ async fn exchange(
         cache.insert(&job.frame, to_compress, whole.freeze(), started, &cfg);
     }
     ctx.shared.report(&job, end(outcome, sent));
-    Exchange::Clean
+    clean(Ok(()))
 }
 
 /// The frame a client is sent in place of the plain one a replica gave:

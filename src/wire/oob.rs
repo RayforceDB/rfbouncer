@@ -42,8 +42,9 @@ impl Watch {
         Ok(Self(registered))
     }
 
-    /// Resolves once the peer has sent an urgent byte.
-    pub async fn wait(&self) {
+    /// Resolves once the peer has sent an urgent byte. `&mut` only because
+    /// the other platforms' watch needs it.
+    pub async fn wait(&mut self) {
         loop {
             let Ok(mut ready) = self.0.ready(tokio::io::Interest::PRIORITY).await else {
                 return std::future::pending().await;
@@ -66,20 +67,33 @@ impl Watch {
 // is up to 20 ms late and each waiting client costs 50 syscalls a second;
 // use the platform's own readiness where that starts to matter.
 #[cfg(not(target_os = "linux"))]
-pub struct Watch(std::net::TcpStream);
+pub struct Watch {
+    socket: std::net::TcpStream,
+    /// When the socket is asked next. One timer for the connection, kept
+    /// from one request to the next: a client whose requests follow each
+    /// other within the interval then costs no timer and no syscall at all,
+    /// where a timer made for every wait cost several of each a request.
+    next: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+#[cfg(not(target_os = "linux"))]
+const POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 #[cfg(not(target_os = "linux"))]
 impl Watch {
     pub fn new(stream: &TcpStream) -> io::Result<Self> {
-        Ok(Self(SockRef::from(stream).try_clone()?.into()))
+        Ok(Self {
+            socket: SockRef::from(stream).try_clone()?.into(),
+            next: Box::pin(tokio::time::sleep(POLL)),
+        })
     }
 
     /// Resolves once the peer has sent an urgent byte.
-    pub async fn wait(&self) {
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
+    pub async fn wait(&mut self) {
         loop {
-            tick.tick().await;
-            if take(SockRef::from(&self.0)) {
+            self.next.as_mut().await;
+            self.next.as_mut().reset(tokio::time::Instant::now() + POLL);
+            if take(SockRef::from(&self.socket)) {
                 return;
             }
         }

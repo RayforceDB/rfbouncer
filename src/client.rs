@@ -145,7 +145,7 @@ async fn proxy<S: Transport>(
         requests: 0,
     });
     let mut shutdown = core.shutdown.subscribe();
-    let cancels = oob::Watch::new(stream.tcp())?;
+    let mut cancels = oob::Watch::new(stream.tcp())?;
     let (mut rd, mut wr) = tokio::io::split(stream);
     let mut buf = BytesMut::new();
     let mut served = false;
