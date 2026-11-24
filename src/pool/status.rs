@@ -71,7 +71,7 @@ impl Reading {
     /// replica that restarted counts from zero again: its first frame has
     /// no interval behind it, and neither has one whose counters ran
     /// backwards.
-    fn after(prev: Option<&Reading>, frame: Frame, at: Instant, interval: Duration) -> Self {
+    pub fn after(prev: Option<&Reading>, frame: Frame, at: Instant, interval: Duration) -> Self {
         let prev = prev.map(|p| &p.frame).filter(|p| p.pid == frame.pid);
         let cpu_ns = |f: &Frame| f.cpu_user_ns.checked_add(f.cpu_sys_ns);
         let util = prev.and_then(|p| {

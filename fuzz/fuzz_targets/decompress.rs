@@ -1,9 +1,9 @@
 //! Decompression of a payload a client or a replica marked compressed, and
-//! the variant that reads only its start.
+//! the variant that reads only its start; and the compressor against both.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rfbouncer::wire::compress::{decompress, decompress_prefix};
+use rfbouncer::wire::compress::{compress, decompress, decompress_prefix};
 
 const MAX: usize = 1 << 16;
 
@@ -35,5 +35,15 @@ fuzz_target!(|data: &[u8]| {
             let shorter = decompress_prefix(body, limit / 2);
             assert_eq!(shorter[..], start[..shorter.len()]);
         }
+    }
+    // The other way: the same bytes as a payload to compress. What the
+    // compressor takes is smaller and comes back whole, start included.
+    if let Some(packed) = compress(body) {
+        assert!(packed.len() < body.len());
+        assert_eq!(decompress(&packed, body.len()).as_deref(), Ok(body));
+        assert_eq!(
+            decompress_prefix(&packed, limit),
+            body[..limit.min(body.len())]
+        );
     }
 });

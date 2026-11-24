@@ -10,10 +10,11 @@ what must hold of whatever comes out.
 | `frame_header` | `Header::parse` | an accepted header has a size within the bound and encodes back to the same 16 bytes |
 | `read_frame` | `client::read_frame` | frames are the stream's own bytes, the same however the stream is cut into reads |
 | `greeting` | `read_hello`, `read_credentials`, `connect` | exactly the counted bytes are taken; a replica's answer is accepted or refused |
-| `decompress` | `decompress`, `decompress_prefix` | the start is the start of the whole and costs no more than was asked for |
+| `decompress` | `decompress`, `decompress_prefix`, `compress` | the start is the start of the whole and costs no more than was asked for; what is compressed is smaller and comes back whole |
+| `status` | `wire::status::decode`, `Reading::after`, `load`, `rank` | a frame holds what it declares and encodes back; rates are shares, never negative or NaN |
 | `value_decode` | `decode`, `error_code`, `Rows` | a table read is the table written again; cells past the end read as nothing |
 | `request_text` | `pool::request_source`, `value::request_text` | at most `TEXT_CAP` bytes of text, compressed or not |
-| `normalize` | `normalize` | a shape is its own shape, no longer than twice its source, with no string, comment or line end left |
+| `normalize` | `normalize_with`, symbols kept and taken for values | a shape is its own shape and no longer than twice its source |
 | `filter` | `Filter::parse`, `minutes`, `condition` | the Rayfall conditions are made of fixed words, integers and a pool name of letters, digits, `-` and `_` |
 | `admin` | `admin::run` | every command is answered with a table, `ok` or an error |
 | `config` | the TOML, `validate`, `parse_duration`, `parse_size` | a configuration is refused or is safe to resolve credentials against |

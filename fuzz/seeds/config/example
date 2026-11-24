@@ -4,6 +4,10 @@
 
 # Clients, the admin console and the report pages all use this one port.
 listen = "0.0.0.0:5000"
+# An address for administration alone. With it, the admin console, the report
+# pages and /metrics are served there only, and `listen` takes pool clients
+# and /healthz (which is on both). Not set by default; needs a restart.
+# admin_listen = "127.0.0.1:5050"
 
 # Opens the admin console (user "rfbouncer") and the report pages (HTTP Basic,
 # any user name). Without it there is neither.
@@ -18,6 +22,31 @@ max_request_bytes = "16MiB"
 shutdown_timeout = "30s"
 # How long a client may sit between two requests; 0 is forever.
 client_idle_timeout = "0"
+# Open the port so that a second rfbouncer may open it too (SO_REUSEPORT).
+# That is how a new process takes over from the old one without a client
+# being refused: see "Restarting without dropping clients" in the README.
+# With it on, starting a second process by mistake is not an error either.
+# Needs a restart to change.
+reuse_port = false
+
+# An address refused this many logins within the window is locked out for the
+# period: every login from it is refused, the right password included, over
+# IPC and HTTP alike. 0 turns it off. Clients behind one NAT or proxy share
+# an address and are locked out together: raise the number or use 0 there.
+auth_lockout_failures = 10
+auth_lockout_window = "1m"
+auth_lockout_period = "5m"
+
+# TLS on the same port, beside clear text: HTTPS and IPC over TLS. Not set by
+# default. The files are PEM, read at start and again on SIGHUP.
+# [tls]
+# cert = "/etc/rfbouncer/fullchain.pem"
+# key = "/etc/rfbouncer/privkey.pem"
+# # Refuse HTTP in clear text, /healthz excepted.
+# require_for_http = false
+# # Refuse IPC in clear text, the admin console included. Rayforce's own
+# # client does not speak TLS: leave this off unless every client does.
+# require_for_ipc = false
 
 [stats]
 # The Rayforce process that keeps the request statistics. Without it nothing
@@ -43,6 +72,16 @@ retention_aggregates = "30d"
 retention_samples = "7d"
 # Distinct query shapes counted per minute; the rest are counted together.
 max_fingerprints_per_minute = 2000
+# Replace symbols in a query's shape with ? as numbers and strings are, so
+# that (== sym 'AAPL) and (== sym 'MSFT) are one shape. For workloads that
+# name many distinct symbols. The table after from:, the columns after by:,
+# asc: and desc:, and a function's parameters stay.
+normalize_symbols = false
+# A directory on the store's host where the store keeps the days that are
+# over, so that only the current day is in its memory. Reports read both.
+# Nothing there is ever deleted: remove old days' directories yourself. Not
+# set by default, and then everything stays in memory.
+# disk = "/var/lib/rfbouncer/days"
 
 [[pool]]
 name = "main"
@@ -96,3 +135,57 @@ transfer_timeout = "60s"
 # and opened again.
 cancel_grace = "5s"
 connect_timeout = "5s"
+
+# Whose answers are compressed, in Rayforce's own scheme, when they are over
+# 2000 bytes. A replica does not do it for the bouncer beside it.
+#   "remote"  clients on another host, as a Rayforce server does. The default.
+#   "always"  every client.
+#   "off"     nobody.
+compress = "remote"
+# The largest answer compressed. Compressing needs the whole answer in
+# memory, up to twice this for each replica connection; a larger answer is
+# passed on plain, as it comes.
+compress_max_bytes = "16MiB"
+
+# The result cache: how long an answer may be given again to a request of
+# the same bytes without asking a replica. 0 keeps nothing. An answer may be
+# this old, whatever changed on the replicas meanwhile, and a request whose
+# answer depends on the time or on chance gets the same one for this long.
+cache_ttl = "0"
+# The most memory the kept answers and their requests may take; the oldest
+# go first.
+cache_max_bytes = "64MiB"
+# The largest answer kept, counted together with its request.
+cache_max_entry = "1MiB"
+
+# A replica connection that has been idle for health_check_interval is sent
+# a request that costs nothing, and the replica has health_check_timeout to
+# answer it. One that does not is taken for hung: its connection is dropped,
+# it shows as down, and it is tried again like any replica that went away.
+# Either setting at 0 turns the check off, and so does slots above 1.
+# The answer comes from the replica's one evaluating thread, so the limit
+# must be longer than anything a replica does that is not a request of this
+# bouncer: a timer of its own, a query from a client that connects to it
+# directly or through another bouncer.
+health_check_interval = "10s"
+health_check_timeout = "5s"
+
+# What each replica is doing, as it says itself. A Rayforce that has a status
+# stream is asked, over a connection kept for that alone, to report this
+# often: whether it is idle, what it is running, how busy its main loop is,
+# its CPU and its memory. The report pages, "show servers" and /metrics show
+# it under every mode. Between 100ms and 10s; "0" asks no replica. A replica
+# without the stream is used as before and asked again only rarely.
+status_interval = "1s"
+# A third way to choose a replica, which reads those reports:
+#   "least_loaded"  as "free", but among the free replicas the one whose main
+#                   loop was least busy over the last interval, and one that
+#                   is running work the bouncer did not send (a client
+#                   connected to it directly, a timer of its own) only when
+#                   every free replica is. A replica within a fifth of its
+#                   memory limit counts as more loaded the nearer it is.
+#                   A replica without a status stream counts as carrying
+#                   the average load of the free ones that have one. No
+#                   request waits for a replica to look better while another
+#                   is free.
+# mode = "least_loaded"

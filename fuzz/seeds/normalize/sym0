@@ -1,0 +1,1 @@
+(select {from: trades where: (in sym ['AAPL 'MSFT])})
