@@ -6,6 +6,8 @@ description = "One port in front of a pool of read-only Rayforce replicas, with 
 license = "MIT"
 repository = "https://github.com/RayforceDB/rfbouncer"
 readme = "README.md"
+# `cargo run` means the bouncer; the load generator is asked for by name.
+default-run = "rfbouncer"
 
 [dependencies]
 base64 = "0.23.1"

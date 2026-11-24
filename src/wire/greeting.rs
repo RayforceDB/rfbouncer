@@ -35,6 +35,20 @@ pub async fn connect<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    connect_as(stream, version, "rfbouncer", password).await
+}
+
+/// As `connect`, under a user name of the caller's choosing: the name is
+/// what picks a pool when the server is a bouncer.
+pub async fn connect_as<S>(
+    stream: &mut S,
+    version: u8,
+    user: &str,
+    password: Option<&str>,
+) -> Result<(), GreetError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     stream.write_all(&[version, 0]).await?;
     let mut hello = [0u8; 2];
     stream.read_exact(&mut hello).await?;
@@ -49,7 +63,7 @@ where
     }
     let password = password.ok_or(GreetError::PasswordMissing)?;
     // The NUL is what rayforce's own client sends and counts in the length.
-    let text = format!("rfbouncer:{password}\0");
+    let text = format!("{user}:{password}\0");
     let len = u8::try_from(text.len()).map_err(|_| GreetError::PasswordTooLong)?;
     stream.write_all(&[len]).await?;
     stream.write_all(text.as_bytes()).await?;
