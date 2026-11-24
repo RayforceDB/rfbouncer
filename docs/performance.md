@@ -8,17 +8,18 @@ limits it. The short of it:
   once, about 100 thousand, because it then reads several requests for each
   time it wakes.
 - The bouncer gives a replica connection one request at a time, so each
-  connection is the first case, plus the bouncer's own turn-around: 30 to 34
-  thousand trivial requests a second for one replica, 39 to 44 thousand for
-  two, 46 to 58 thousand for four.
+  connection is the first case, plus the bouncer's own turn-around: 24 to 38
+  thousand trivial requests a second for one replica, 35 to 41 thousand for
+  two, 44 to 64 thousand for four.
 - `slots = 4` gives a replica four connections and so the second case: two
-  replicas then answer 73 thousand trivial requests a second, and 80 thousand
+  replicas then answer 71 thousand trivial requests a second, and 77 thousand
   with `slots = 16`.
 - For requests that cost the replica a millisecond or more the bouncer is not
-  what limits anything: it costs about 4% on one replica, and two and four
-  replicas do the work of two.
-- Clients that are refused with `busy` and ask again at once are the one load
-  that is still served badly. See [Refusals](#refusals).
+  what limits anything: it costs about 4% on one replica.
+- Clients that are refused with `busy` and ask again at once used to bring
+  the bouncer down to a few hundred requests a second. `busy_delay` holds
+  each refusal back for 100 ms, and the same load is now served at 33
+  thousand. See [Refusals](#refusals).
 
 ## Running the benchmark
 
@@ -59,70 +60,76 @@ Two things to know before a large run:
 
 Machine: Apple M4, 10 cores, macOS 26 (Darwin 25.6), everything on loopback:
 the replicas (`rayforce -p PORT -U pw -c 1`, a development build that speaks
-wire version 4), the bouncer and `rfbench`. The machine was running other
-work throughout, with a load average between 4 and 13, so every number is
-the median of three runs of two seconds, with the least and the most beside
-it where they matter, and "before" and "after" were run in turns within the
-same minute. The pool had `queue_max = 100000`. "Before" is commit 418a204.
+wire version 4), the bouncer and `rfbench`. The machine was doing other work
+too, with a load average between 3 and 6, so every number is the median of
+three runs of two seconds, with the least and the most beside it where they
+overlap, and "before" and "after" were run in turns within the same minute.
+The pool had `queue_max = 100000`. "Before" is commit bef9b7c, which has
+TLS, the result cache, compression, health checks, the status streams and
+the wait histogram, and none of what this page describes.
 
 Trivial requests, `(+ 1 2)`, persistent connections, requests a second:
 
 | Replicas | Clients | A replica directly | Before | After | CPU a request, before | after |
 |---|---|---|---|---|---|---|
-| 1 | 1 | 50 600 | 23 500 | 24 100 | 22 µs | 19 µs |
-| 1 | 10 | 101 300 | 31 800 | 33 900 | 30 µs | 26 µs |
-| 1 | 100 | 105 600 | 31 300 | 34 000 | 32 µs | 26 µs |
-| 1 | 1000 | 102 700 | 28 700 | 33 500 | 39 µs | 30 µs |
-| 1 | 3000 | 95 500 | 22 100 | 30 000 | 73 µs | 48 µs |
-| 2 | 10 | | 45 200 | 39 900 | 33 µs | 33 µs |
-| 2 | 100 | | 20 400 (15 200..42 700) | 32 900 (30 400..46 400) | 67 µs | 34 µs |
-| 2 | 1000 | | 37 300 | 43 600 | 47 µs | 33 µs |
-| 2 | 3000 | | 28 900 | 39 100 | 81 µs | 49 µs |
-| 4 | 10 | | 55 300 | 57 700 | 45 µs | 37 µs |
-| 4 | 100 | | 41 400 | 51 300 | 57 µs | 40 µs |
-| 4 | 1000 | | 46 100 | 52 200 | 59 µs | 42 µs |
-| 4 | 3000 | | 32 100 (22 700..35 500) | 45 900 (41 900..49 300) | 92 µs | 54 µs |
+| 1 | 1 | 51 700 | 23 600 | 24 300 | 22 µs | 18 µs |
+| 1 | 10 | 130 800 | 38 500 | 38 400 | 25 µs | 23 µs |
+| 1 | 100 | 112 300 | 34 100 | 36 200 | 30 µs | 25 µs |
+| 1 | 1000 | 102 800 | 28 600 | 32 900 | 40 µs | 31 µs |
+| 1 | 3000 | 95 100 | 21 000 | 28 500 | 80 µs | 53 µs |
+| 2 | 1 | | 23 100 | 24 000 | 23 µs | 19 µs |
+| 2 | 10 | | 46 600 (37 900..56 800) | 40 200 (39 800..58 700) | 32 µs | 33 µs |
+| 2 | 100 | | 40 500 | 41 200 | 40 µs | 32 µs |
+| 2 | 1000 | | 32 500 | 36 800 | 55 µs | 41 µs |
+| 2 | 3000 | | 26 200 | 34 700 | 95 µs | 57 µs |
+| 4 | 1 | | 22 800 | 23 800 | 23 µs | 19 µs |
+| 4 | 10 | | 67 000 (54 400..67 800) | 63 600 (57 300..74 500) | 37 µs | 34 µs |
+| 4 | 100 | | 50 100 | 53 800 | 53 µs | 41 µs |
+| 4 | 1000 | | 43 600 | 50 000 | 65 µs | 47 µs |
+| 4 | 3000 | | 32 600 | 44 200 | 98 µs | 61 µs |
 
 "A replica directly" is one replica, whatever the row says: it is what one
 Rayforce process does when the clients are its own. "CPU a request" is the
 bouncer's processor time, user and system, over the requests of the run. It
-is the steadier of the two measures on a busy machine: throughput moved by a
-quarter between runs of the same thing, this by a few percent. The rows for
-two and four replicas with one to a hundred clients were measured as the
-machine was busiest and are the least sure; the row for two replicas and ten
-clients shows no gain at all.
+is the steadier of the two measures on a machine that is not idle. With ten
+clients nothing was gained: the runs overlap, and so does the CPU.
 
 Requests that cost the replica about 1.6 ms,
 `(count (map (fn [i] (sum (til 100000))) (til 100)))`, requests a second:
 
 | Replicas | Clients | A replica directly | Before | After |
 |---|---|---|---|---|
-| 1 | 1 | 606 | 584 | 582 |
-| 1 | 100 | 627 | 606 | 607 |
-| 1 | 3000 | 633 | 601 | 588 |
-| 2 | 100 | | 814 | 862 |
-| 2 | 1000 | | 918 | 882 |
-| 4 | 100 | | 1308 | 1230 |
-| 4 | 1000 | | 1310 | 1284 |
-| 4 | 3000 | | 1265 | 1283 |
+| 1 | 1 | 583 | 558 | 556 |
+| 1 | 100 | 615 | 591 | 602 |
+| 1 | 3000 | 632 | 572 | 581 |
+| 2 | 100 | | 1034 | 1038 |
+| 2 | 1000 | | 905 | 908 |
+| 2 | 3000 | | 901 | 906 |
+| 4 | 100 | | 1471 | 1464 |
+| 4 | 1000 | | 1223 | 1244 |
+| 4 | 3000 | | 1230 | 1270 |
 
 Nothing changed here, and nothing was expected to: the time is the
-replica's. Four replicas did the work of two because the machine had no
-four idle cores to give them.
+replica's. The two rows with 100 clients are from a second run of five
+rounds with "after" run first. In the first, where it ran second, it was 8%
+behind (858 against 936, 1087 against 1188), which the second run did not
+show again: with replicas that fill their cores, which run comes first
+matters more than which bouncer it is. Two and four replicas do not do two
+and four times the work of one because the machine had no idle cores to
+give them.
 
-A connection for every request, one client, 300 requests: 112 µs a request
-at the replica, 129 µs through the bouncer before and 96 µs after (median of
-three; the three overlap, so read it as "the same"). More clients than one
-were not measured this way: on macOS a few thousand connections a second
-exhaust the machine's ports for everybody on it.
+A connection for every request, one client, 300 requests: 116 µs a request
+at the replica, 105 µs through the bouncer before and 108 µs after, the same.
+More clients than one were not measured this way: on macOS a few thousand
+connections a second exhaust the machine's ports for everybody on it.
 
 `slots`, two replicas, 1000 clients, trivial requests:
 
-| `slots` | Requests a second | CPU a request |
-|---|---|---|
-| 1 | 44 500 (29 800..57 600) | 32 µs |
-| 4 | 72 900 (70 300..80 000) | 42 µs |
-| 16 | 79 600 (77 000..91 100) | 44 µs |
+| `slots` | Before | After | CPU a request, before | after |
+|---|---|---|---|---|
+| 1 | 40 300 | 47 400 | 45 µs | 32 µs |
+| 4 | 61 000 | 70 500 | 62 µs | 44 µs |
+| 16 | 66 100 | 76 900 | 67 µs | 48 µs |
 
 ## What was changed, and what each change bought
 
@@ -142,11 +149,26 @@ exhaust the machine's ports for everybody on it.
    70 → 60 µs with 1000.
 3. **What a replica reports is read before what clients send.** Both came
    down one channel, so a replica that had become free waited behind every
-   request sent meanwhile. See below for what this did and did not fix.
+   request sent meanwhile.
+4. **A client's stream is not split into a reading and a writing half**,
+   whose every use takes a lock they share, and **the status board is not
+   shown the replicas for what a client sends**, which changes nothing about
+   them. Small: 18.6 → 18.4 µs CPU a request with one client; with more
+   clients the difference was within the noise.
+5. **A request that finds the queue full is told so after `busy_delay`.**
+   See [Refusals](#refusals).
+
+The figures in 1 and 2 are from before the features named above were merged,
+against the commit before them; they were not measured apart again. Those
+features cost a request about 1 µs of CPU with `slots = 1` (18.1 → 18.8 µs
+with one client, 24.0 → 25.2 µs with 1000) and 3 µs with `slots = 16`, where
+the status board reads 32 connections each time a request ends. A cache that
+is off costs a comparison, and the wait histogram one addition.
 
 Tried and left out: running the pools' tasks on threads of their own, with a
 full queue refused by the client's task. It served a refusal storm two to
-six times better (below) and cost every other request a quarter more CPU.
+six times better and cost every other request a quarter more CPU; the delay
+serves it seventy times better and costs the others nothing.
 
 ## What limits it now
 
@@ -169,16 +191,24 @@ six times better (below) and cost every other request a quarter more CPU.
 
 ### Refusals
 
-With the default `queue_max = 1000` and 3000 clients that ask again the
-moment they are refused, two replicas answered 470 requests a second before
-and 495 after, beside some 150 thousand refusals a second. With one replica,
-`queue_max = 50` and 600 clients: 190 to 230 before, 690 to 730 after. Every
-thread is busy refusing, and the tasks that serve the replicas take their
-turn behind thousands of others.
+A client that finds the queue full is answered `busy`. Told at once, a
+client that asks again the moment it is refused does so tens of thousands of
+times a second, every thread is busy refusing, and the tasks that serve the
+replicas take their turn behind thousands of others. So the answer is held
+back for `busy_delay`, 100 ms unless set: a refused client then asks at most
+ten times a second, whatever it does. Requests a second, with clients that
+do not wait before they ask again:
+
+| Load | Before | After | With `busy_delay = "0"` |
+|---|---|---|---|
+| 2 replicas, 3000 clients, `queue_max = 1000` | 469, and 141 000 refusals | 33 400, and 20 000 refusals | 484 |
+| 1 replica, 600 clients, `queue_max = 50` | 333, and 160 000 refusals | 31 200, and 5 500 refusals | |
+
+The same two replicas with 3000 clients and room in the queue for all of
+them answer 34 700 a second, so a full queue now costs next to nothing. A
+client sees the difference in one place: its `busy` comes 100 ms later. A
+request turned away for having waited past `query_wait_timeout` is told at
+once, as before: it has waited already.
 
 This is what the reviewer's 6.8 thousand a second most likely was: 3000
-clients against a queue of 1000. It is not what the bouncer does with 3000
-clients (39 thousand a second above); it is what it does when two thirds of
-them are refused in a tight loop. Until that is changed in the bouncer,
-size `queue_max` for the clients there are, and have clients wait before
-they ask again.
+clients against a queue of 1000.
