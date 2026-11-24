@@ -17,6 +17,19 @@ browser ──►   │   queue      ──► replica :5002
               └─ statistics ──► a Rayforce of their own :5100
 ```
 
+## Status
+
+Version 0.1: early, and not yet run in production. What it does is covered by
+tests against real Rayforce processes, on Linux and macOS, at wire version 4.
+
+- Wire version 3 is supported by the layout of its bytes and has not been
+  run against a version 3 server.
+- A client's cancel is noticed by asking the socket every 20 ms, so it is
+  passed on up to 20 ms late.
+- The statistics store keeps everything in memory.
+- There is no TLS: the admin password and the report pages travel in the
+  clear.
+
 ## What it does
 
 - **Speaks Rayforce's IPC.** A client connects to the bouncer exactly as it
@@ -196,3 +209,7 @@ from `RAYFORCE_BIN`, or from `.cache/rayforce` beside `Cargo.toml`.
 The wire is written against Rayforce's `src/core/ipc.c` and
 `src/store/serde.c`; the expected bytes in the unit tests were read off a
 running server. Recheck `src/wire/` when Rayforce's wire version moves.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -2,6 +2,10 @@
 name = "rfbouncer"
 version = "0.1.0"
 edition = "2024"
+description = "One port in front of a pool of read-only Rayforce replicas, with request statistics and a report page"
+license = "MIT"
+repository = "https://github.com/RayforceDB/rfbouncer"
+readme = "README.md"
 
 [dependencies]
 base64 = "0.23.1"
