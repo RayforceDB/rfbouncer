@@ -130,7 +130,7 @@ async fn greet<S: Transport>(
 }
 
 async fn proxy<S: Transport>(
-    stream: S,
+    mut stream: S,
     peer: SocketAddr,
     version: u8,
     user: Arc<str>,
@@ -146,13 +146,14 @@ async fn proxy<S: Transport>(
     });
     let mut shutdown = core.shutdown.subscribe();
     let mut cancels = oob::Watch::new(stream.tcp())?;
-    let (mut rd, mut wr) = tokio::io::split(stream);
+    // The stream is not split in two: it is never read and written at the
+    // same moment, and the halves of a split share a lock taken at each use.
     let mut buf = BytesMut::new();
     let mut served = false;
     loop {
         let config = core.config();
         let idle = config.client_idle_timeout;
-        let next = read_frame(&mut rd, &mut buf, version, config.max_request_bytes);
+        let next = read_frame(&mut stream, &mut buf, version, config.max_request_bytes);
         let frame = tokio::select! {
             // In this order: a request that has arrived whole is served
             // even when the stop is already known.
@@ -171,7 +172,7 @@ async fn proxy<S: Transport>(
             // has had none yet. A client that opens a connection for each
             // request must get its one answer.
             None => {
-                let last = read_frame(&mut rd, &mut buf, version, config.max_request_bytes);
+                let last = read_frame(&mut stream, &mut buf, version, config.max_request_bytes);
                 match timeout(LAST_REQUEST, last).await {
                     Ok(frame) => frame?,
                     Err(_) => return Ok(()),
@@ -211,7 +212,7 @@ async fn proxy<S: Transport>(
         loop {
             tokio::select! {
                 reply = replies.recv() => match reply {
-                    Some(Reply::Data(bytes)) => match timeout(WRITE_STALL, wr.write_all(&bytes)).await {
+                    Some(Reply::Data(bytes)) => match timeout(WRITE_STALL, stream.write_all(&bytes)).await {
                         Ok(written) => written?,
                         Err(_) => return Ok(()),
                     },
@@ -224,7 +225,7 @@ async fn proxy<S: Transport>(
                 }
                 // Reading on is how a client that went away is noticed; what
                 // it reads is the start of the next request, kept for later.
-                read = rd.read_buf(&mut buf), if buf.len() < limit => {
+                read = stream.read_buf(&mut buf), if buf.len() < limit => {
                     if read? == 0 {
                         return Ok(());
                     }
