@@ -2,6 +2,7 @@
 //! time over it, and open it again when anything about it looks wrong.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -17,7 +18,7 @@ use crate::stats::event::Outcome;
 use crate::wire::frame::{
     self, FLAG_COMPRESSED, HEADER_LEN, Header, MSG_RESPONSE, MSG_SYNC, PAYLOAD_MAX,
 };
-use crate::wire::{greeting, oob, value};
+use crate::wire::{compress, greeting, oob, value};
 
 /// A replica answers the greeting from its evaluating thread, so this is how
 /// long a replica busy with someone else's query may keep a new connection.
@@ -32,7 +33,7 @@ const RETRY_MAX: Duration = Duration::from_secs(5);
 const SETTLED: Duration = Duration::from_secs(1);
 /// A peer that has vanished without closing is noticed within about this.
 const KEEPALIVE: Duration = Duration::from_secs(30);
-const CHUNK: usize = 64 * 1024;
+pub const CHUNK: usize = 64 * 1024;
 /// An answer nobody waits for is read off the wire up to this size; past it
 /// a new connection is cheaper.
 const DRAIN_MAX: usize = 1024 * 1024;
@@ -412,11 +413,31 @@ async fn exchange(
     let due = (!cfg.transfer_timeout.is_zero())
         .then(|| tokio::time::Instant::now() + cfg.transfer_timeout);
     let far = tokio::time::Instant::now() + Duration::from_secs(86_400 * 365);
-    let mut client_gone = job
-        .reply
-        .send(Reply::Data(Bytes::copy_from_slice(&raw)))
-        .await
-        .is_err();
+    // An answer a Rayforce server would have compressed for this client,
+    // had the client been its peer: the replica saw the bouncer, most often
+    // on its own host, and sent it plain. It is taken whole before any of
+    // it is sent, as its compressed size goes into the header.
+    let to_compress = cfg.compress.applies(job.client.ip());
+    let squeeze = to_compress
+        && header.flags & FLAG_COMPRESSED == 0
+        && header.size > compress::THRESHOLD
+        && header.size <= cfg.compress_max_bytes;
+    // The answer is also gathered where the cache may keep it.
+    let keep = !cfg.cache_ttl.is_zero()
+        && job.frame.len() + HEADER_LEN + header.size <= cfg.cache_max_entry;
+    let mut whole = (squeeze || keep).then(|| {
+        let mut whole = BytesMut::with_capacity(HEADER_LEN + header.size);
+        whole.extend_from_slice(&raw);
+        whole
+    });
+    let mut client_gone = if squeeze {
+        job.reply.is_closed()
+    } else {
+        job.reply
+            .send(Reply::Data(Bytes::copy_from_slice(&raw)))
+            .await
+            .is_err()
+    };
     let mut remaining = header.size;
     let mut head: Vec<u8> = Vec::with_capacity(9);
     let mut broken = None;
@@ -434,7 +455,12 @@ async fn exchange(
                 if head.len() < 9 {
                     head.extend_from_slice(&chunk[..n.min(9 - head.len())]);
                 }
-                if !client_gone {
+                if let Some(whole) = &mut whole {
+                    whole.extend_from_slice(&chunk);
+                }
+                if squeeze {
+                    client_gone = job.reply.is_closed();
+                } else if !client_gone {
                     match timeout_at(
                         due.unwrap_or(far),
                         job.reply.send(Reply::Data(chunk.freeze())),
@@ -459,7 +485,29 @@ async fn exchange(
             break;
         }
     }
-    let sent = (HEADER_LEN + header.size - remaining) as u64;
+    let mut sent = (HEADER_LEN + header.size - remaining) as u64;
+    if squeeze {
+        sent = 0;
+        if broken.is_none() && !client_gone {
+            let plain = whole.take().unwrap_or_default().freeze();
+            let mut rest = squeezed(&ctx.shared.counters, &header, plain).await;
+            // A copy: the compressed frame sits in memory sized for the
+            // plain one, which the cache would hold without counting it.
+            whole = keep.then(|| BytesMut::from(&rest[..]));
+            while !rest.is_empty() && !client_gone && !slow {
+                let part = rest.split_to(rest.len().min(CHUNK));
+                let size = part.len() as u64;
+                match timeout_at(due.unwrap_or(far), job.reply.send(Reply::Data(part))).await {
+                    Ok(Ok(())) => sent += size,
+                    Ok(Err(_)) => client_gone = true,
+                    Err(_) => {
+                        slow = true;
+                        broken = Some("client took the answer too slowly".to_owned());
+                    }
+                }
+            }
+        }
+    }
     if let Some(reason) = broken {
         // `try_send`: a client that is not taking the answer is not waited
         // for again; dropping the channel closes its connection just as well.
@@ -487,8 +535,39 @@ async fn exchange(
         Some(code) => Outcome::ServerError(code),
         None => Outcome::Ok,
     };
+    if let Some(whole) = whole.filter(|_| keep && outcome == Outcome::Ok) {
+        let cache = &ctx.shared.cache;
+        cache.insert(&job.frame, to_compress, whole.freeze(), started, &cfg);
+    }
     ctx.shared.report(&job, end(outcome, sent));
     Exchange::Clean
+}
+
+/// The frame a client is sent in place of the plain one a replica gave:
+/// compressed where that makes it smaller, the same where it does not.
+async fn squeezed(counters: &super::Counters, header: &Header, plain: Bytes) -> Bytes {
+    let input = plain.clone();
+    let pack = move || compress::compress(&input[HEADER_LEN..]);
+    // A large answer takes milliseconds of processor, which the tasks that
+    // share this thread are not made to wait for.
+    let packed = if plain.len() > CHUNK {
+        tokio::task::spawn_blocking(pack).await.unwrap_or(None)
+    } else {
+        pack()
+    };
+    let Some(mut packed) = packed else {
+        return plain;
+    };
+    counters.compressed.fetch_add(1, Relaxed);
+    let saved = (plain.len() - HEADER_LEN - packed.len()) as u64;
+    counters.compress_saved.fetch_add(saved, Relaxed);
+    let head = Header {
+        flags: header.flags | FLAG_COMPRESSED,
+        size: packed.len(),
+        ..*header
+    };
+    packed.splice(0..0, head.encode());
+    Bytes::from(packed)
 }
 
 fn timeout_message(cfg: &PoolConfig) -> String {

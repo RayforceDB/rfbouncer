@@ -12,7 +12,9 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 
 use super::backend::{self, Msg};
-use super::{BackendInfo, Cmd, Counters, Ending, Job, PoolHandle, QueuedInfo, Shared, Snapshot};
+use super::{
+    BackendInfo, Cmd, Counters, Ending, Job, PoolHandle, QueuedInfo, Reply, Shared, Snapshot,
+};
 use crate::config::{Mode, PoolConfig};
 use crate::stats::Stats;
 use crate::stats::event::Outcome;
@@ -82,6 +84,7 @@ pub fn spawn(cfg: Arc<PoolConfig>, stats: Arc<Stats>) -> PoolHandle {
         counters: Counters::default(),
         stats,
         queue_max: (cfg.queue_max as u64).into(),
+        cache: super::cache::Cache::default(),
     });
     let (cfg_tx, _) = watch::channel(cfg.clone());
     let mut d = Dispatcher {
@@ -245,6 +248,12 @@ impl Dispatcher {
             job.refuse("io", "pool removed from the configuration")
                 .await;
             self.end(&job, Outcome::Failed);
+        } else if !self.paused
+            && let Some(answer) = self.cached(&job)
+        {
+            // Before the queue is looked at: an answer in memory needs no
+            // place in it. A paused pool holds every request, this one too.
+            self.answer_cached(job, answer);
         } else if self.queue.len() >= self.cfg.queue_max {
             job.refuse("busy", "the queue is full").await;
             self.end(&job, Outcome::Busy);
@@ -297,6 +306,46 @@ impl Dispatcher {
             job.refuse("io", &format!("replica failed: {reason}")).await;
             self.end(&job, Outcome::Failed);
         }
+    }
+
+    /// The answer the cache holds for this request, if the pool has a cache.
+    /// A request too large to be kept is not looked for, which also spares
+    /// this task the hashing of it.
+    fn cached(&self, job: &Job) -> Option<Bytes> {
+        let cfg = &self.cfg;
+        if cfg.cache_ttl.is_zero() || job.frame.len() >= cfg.cache_max_entry {
+            return None;
+        }
+        let compressed = cfg.compress.applies(job.client.ip());
+        self.shared.cache.get(&job.frame, compressed, cfg.cache_ttl)
+    }
+
+    /// Sends a kept answer, on a task of its own: a client that reads
+    /// slowly holds no replica now, and must not hold the pool either.
+    fn answer_cached(&self, job: Job, answer: Bytes) {
+        let shared = self.shared.clone();
+        let wait = job.arrived.elapsed();
+        tokio::spawn(async move {
+            let mut rest = answer.clone();
+            let mut left = false;
+            while !rest.is_empty() && !left {
+                let part = rest.split_to(rest.len().min(backend::CHUNK));
+                left = job.reply.send(Reply::Data(part)).await.is_err();
+            }
+            left = left || job.reply.send(Reply::Done).await.is_err();
+            let ending = Ending {
+                backend: None,
+                wait,
+                exec: Duration::ZERO,
+                bytes_out: (answer.len() - rest.len()) as u64,
+                outcome: if left {
+                    Outcome::Cancelled
+                } else {
+                    Outcome::Cached
+                },
+            };
+            shared.report(&job, ending);
+        });
     }
 
     /// Reports a request that ended in the queue, where no replica saw it.
@@ -385,17 +434,28 @@ impl Dispatcher {
             }
         }
         for idx in 0..n {
-            if !self.replicas[idx].free() {
-                continue;
-            }
-            let waiting = self.queue.iter().position(|j| j.target == Some(idx));
-            if let Some(job) = waiting.and_then(|at| self.queue.remove(at)) {
+            // More than once: a request answered from the cache leaves its
+            // replica free for the next that waits for it.
+            while self.replicas[idx].free() {
+                let waiting = self.queue.iter().position(|j| j.target == Some(idx));
+                let Some(job) = waiting.and_then(|at| self.queue.remove(at)) else {
+                    break;
+                };
                 self.start(idx, job);
             }
         }
     }
 
     fn start(&mut self, idx: usize, job: Job) {
+        // Asked again here: the same request may have been answered while
+        // this one waited in the queue.
+        if let Some(answer) = self.cached(&job) {
+            self.answer_cached(job, answer);
+            return;
+        }
+        if !self.cfg.cache_ttl.is_zero() {
+            self.shared.cache.misses.fetch_add(1, Relaxed);
+        }
         let r = &mut self.replicas[idx];
         r.running = Some(Running {
             id: job.id,
@@ -474,6 +534,9 @@ impl Dispatcher {
             }
         }
         self.shared.queue_max.store(cfg.queue_max as u64, Relaxed);
+        // The replicas or the settings changed: what was kept was answered
+        // under the old ones.
+        self.shared.cache.clear();
         self.cfg = cfg.clone();
         self.cfg_tx.send_replace(cfg);
         if reconnect {

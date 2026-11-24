@@ -119,3 +119,25 @@ transfer_timeout = "60s"
 # and opened again.
 cancel_grace = "5s"
 connect_timeout = "5s"
+
+# Whose answers are compressed, in Rayforce's own scheme, when they are over
+# 2000 bytes. A replica does not do it for the bouncer beside it.
+#   "remote"  clients on another host, as a Rayforce server does. The default.
+#   "always"  every client.
+#   "off"     nobody.
+compress = "remote"
+# The largest answer compressed. Compressing needs the whole answer in
+# memory, up to twice this for each replica connection; a larger answer is
+# passed on plain, as it comes.
+compress_max_bytes = "16MiB"
+
+# The result cache: how long an answer may be given again to a request of
+# the same bytes without asking a replica. 0 keeps nothing. An answer may be
+# this old, whatever changed on the replicas meanwhile, and a request whose
+# answer depends on the time or on chance gets the same one for this long.
+cache_ttl = "0"
+# The most memory the kept answers and their requests may take; the oldest
+# go first.
+cache_max_bytes = "64MiB"
+# The largest answer kept, counted together with its request.
+cache_max_entry = "1MiB"

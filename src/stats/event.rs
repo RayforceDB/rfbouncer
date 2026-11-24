@@ -17,6 +17,8 @@ pub enum Outcome {
     Busy,
     /// No replica could answer.
     Failed,
+    /// Answered from the pool's result cache: no replica was asked.
+    Cached,
 }
 
 impl Outcome {
@@ -28,6 +30,7 @@ impl Outcome {
             Self::Timeout => "timeout",
             Self::Busy => "busy",
             Self::Failed => "io",
+            Self::Cached => "cached",
         }
     }
 }

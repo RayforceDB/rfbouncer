@@ -423,7 +423,7 @@ impl Writer {
             }
         });
         let (dur, wait) = (e.exec.as_micros() as u64, e.wait.as_micros() as u64);
-        let failed = !matches!(e.outcome, Outcome::Ok);
+        let failed = !matches!(e.outcome, Outcome::Ok | Outcome::Cached);
         let backend = e.backend.as_deref().unwrap_or_default().to_owned();
         let client = e.client.to_string();
         let status = e.outcome.label().to_owned();
@@ -432,7 +432,7 @@ impl Writer {
         let c = &mut a.counters;
         c[COUNT] += 1;
         match e.outcome {
-            Outcome::Ok => {}
+            Outcome::Ok | Outcome::Cached => {}
             Outcome::ServerError(_) => c[ERRORS] += 1,
             Outcome::Cancelled => c[CANCELS] += 1,
             Outcome::Timeout => c[TIMEOUTS] += 1,
@@ -446,7 +446,11 @@ impl Writer {
         c[WAIT_MAX] = c[WAIT_MAX].max(wait);
         c[BYTES_IN] += e.bytes_in;
         c[BYTES_OUT] += e.bytes_out;
-        a.hist[bucket(dur)] += 1;
+        // The histogram is of time in a replica, and an answer from the
+        // cache spent none there.
+        if e.outcome != Outcome::Cached {
+            a.hist[bucket(dur)] += 1;
+        }
         self.dirty_agg.insert((pool.clone(), fp));
 
         let count = |rows: &mut HashMap<Key, Small>, dirty: &mut HashSet<Key>, who: &str| {

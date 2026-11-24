@@ -112,6 +112,7 @@ pub async fn render(core: &Core) -> String {
             ("timeout", &c.timeouts),
             ("busy", &c.busy),
             ("io", &c.failed),
+            ("cached", &c.cached),
         ] {
             let n = n.load(Relaxed);
             let _ = writeln!(
@@ -123,6 +124,12 @@ pub async fn render(core: &Core) -> String {
             ("retries_total", c.retries.load(Relaxed)),
             ("bytes_in_total", c.bytes_in.load(Relaxed)),
             ("bytes_out_total", c.bytes_out.load(Relaxed)),
+            ("compressed_total", c.compressed.load(Relaxed)),
+            ("compress_saved_bytes_total", c.compress_saved.load(Relaxed)),
+            ("cache_hits_total", pool.shared.cache.hits.load(Relaxed)),
+            ("cache_misses_total", pool.shared.cache.misses.load(Relaxed)),
+            ("cache_entries", pool.shared.cache.size().0 as u64),
+            ("cache_bytes", pool.shared.cache.size().1 as u64),
         ] {
             let _ = writeln!(totals, "rfbouncer_{metric}{{pool=\"{name}\"}} {value}");
         }

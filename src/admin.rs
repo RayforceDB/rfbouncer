@@ -44,7 +44,8 @@ pub async fn session<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 const HELP: &str = "commands: show pools | servers | clients | stats | config; \
-    pause [pool]; resume [pool]; drain <addr>; undrain <addr>; reconnect [pool]; reload; shutdown";
+    pause [pool]; resume [pool]; drain <addr>; undrain <addr>; reconnect [pool]; flush [pool]; \
+    reload; shutdown";
 
 /// Runs one command and returns the payload of its answer.
 pub async fn run(text: &str, core: &Arc<Core>) -> Result<Vec<u8>, String> {
@@ -68,6 +69,11 @@ pub async fn run(text: &str, core: &Arc<Core>) -> Result<Vec<u8>, String> {
         ["reconnect"] | ["reconnect", _] => {
             each(core, words.get(1), |p| p.send(Cmd::Reconnect)).and(ok)
         }
+        ["flush"] | ["flush", _] => each(core, words.get(1), |p| {
+            p.shared.cache.clear();
+            true
+        })
+        .and(ok),
         ["drain", addr] => drain(core, addr, true).await.and(ok),
         ["undrain", addr] => drain(core, addr, false).await.and(ok),
         ["reload"] => core.reload().map_err(|e| e.to_string()).and(ok),
@@ -327,6 +333,20 @@ fn show_config(core: &Core) -> Vec<u8> {
                 p.query_wait_timeout,
                 p.query_timeout,
                 p.cancel_grace
+            ),
+        ));
+    }
+    for p in &c.pool {
+        rows.push((
+            "pool_answers",
+            format!(
+                "{} compress={:?} compress_max_bytes={} cache_ttl={:?} cache_max_bytes={} cache_max_entry={}",
+                p.name,
+                p.compress,
+                p.compress_max_bytes,
+                p.cache_ttl,
+                p.cache_max_bytes,
+                p.cache_max_entry
             ),
         ));
     }

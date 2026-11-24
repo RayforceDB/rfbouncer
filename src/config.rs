@@ -2,7 +2,7 @@
 //! that has just presented its credentials.
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -144,6 +144,35 @@ pub enum Mode {
     RoundRobin,
 }
 
+/// Whose answers a pool compresses.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Compress {
+    /// Those of clients on another host, as a Rayforce server does.
+    #[default]
+    Remote,
+    /// Every client's, a local one's too.
+    Always,
+    Off,
+}
+
+impl Compress {
+    /// Whether a client at this address is sent compressed answers. What is
+    /// local is what `ray_sock_addr_is_local` says: 127/8, ::1, and a
+    /// loopback address mapped into IPv6.
+    pub fn applies(self, client: IpAddr) -> bool {
+        let local = match client {
+            IpAddr::V4(a) => a.is_loopback(),
+            IpAddr::V6(a) => a.is_loopback() || a.to_ipv4_mapped().is_some_and(|a| a.is_loopback()),
+        };
+        match self {
+            Self::Remote => !local,
+            Self::Always => true,
+            Self::Off => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PoolConfig {
@@ -187,6 +216,33 @@ pub struct PoolConfig {
     pub cancel_grace: Duration,
     #[serde(default = "secs_5", deserialize_with = "duration")]
     pub connect_timeout: Duration,
+    /// Whose answers are compressed on their way out.
+    #[serde(default)]
+    pub compress: Compress,
+    /// The largest answer compressed. Compressing needs the whole answer in
+    /// memory; a larger one is passed on as it comes.
+    #[serde(default = "mib_16", deserialize_with = "size")]
+    pub compress_max_bytes: usize,
+    /// How long an answer may be given again to the same request without
+    /// asking a replica; zero is never.
+    #[serde(default, deserialize_with = "duration")]
+    pub cache_ttl: Duration,
+    /// The most memory the kept answers and their requests may take.
+    #[serde(default = "mib_64", deserialize_with = "size")]
+    pub cache_max_bytes: usize,
+    /// The largest answer kept, counted together with its request.
+    #[serde(default = "mib_1", deserialize_with = "size")]
+    pub cache_max_entry: usize,
+}
+
+fn mib_1() -> usize {
+    1 << 20
+}
+fn mib_16() -> usize {
+    16 << 20
+}
+fn mib_64() -> usize {
+    64 << 20
 }
 
 fn default_max_clients() -> usize {
@@ -569,6 +625,31 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn compression_is_for_clients_on_another_host() {
+        let c = config(TWO).unwrap();
+        assert_eq!(c.pool[0].compress, Compress::Remote);
+        assert_eq!(c.pool[0].compress_max_bytes, 16 << 20);
+        assert_eq!(c.pool[0].cache_ttl, Duration::ZERO);
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        for local in ["127.0.0.1", "127.8.9.10", "::1", "::ffff:127.0.0.1"] {
+            assert!(!Compress::Remote.applies(ip(local)), "{local}");
+            assert!(Compress::Always.applies(ip(local)));
+        }
+        for remote in ["10.0.0.1", "::ffff:10.0.0.1", "fe80::1"] {
+            assert!(Compress::Remote.applies(ip(remote)), "{remote}");
+            assert!(!Compress::Off.applies(ip(remote)));
+        }
+        let set = TWO.replace(
+            "default = true",
+            "default = true\ncompress = \"always\"\ncache_ttl = \"2s\"\ncache_max_entry = \"64KiB\"",
+        );
+        let c = config(&set).unwrap();
+        assert_eq!(c.pool[1].compress, Compress::Always);
+        assert_eq!(c.pool[1].cache_ttl, Duration::from_secs(2));
+        assert_eq!(c.pool[1].cache_max_entry, 64 << 10);
     }
 
     #[test]

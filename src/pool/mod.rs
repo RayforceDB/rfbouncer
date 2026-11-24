@@ -1,6 +1,7 @@
 //! A pool: equal read-only replicas behind one queue.
 
 pub mod backend;
+pub mod cache;
 pub mod dispatcher;
 
 use std::net::SocketAddr;
@@ -113,6 +114,11 @@ pub struct Counters {
     pub timeouts: AtomicU64,
     pub busy: AtomicU64,
     pub failed: AtomicU64,
+    /// Answered from the result cache.
+    pub cached: AtomicU64,
+    /// Answers compressed here, and the bytes that saved on the wire.
+    pub compressed: AtomicU64,
+    pub compress_saved: AtomicU64,
     pub retries: AtomicU64,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
@@ -131,6 +137,8 @@ pub struct Shared {
     pub stats: Arc<Stats>,
     /// The most requests that may wait, as the configuration in force says.
     pub queue_max: AtomicU64,
+    /// Answers kept for a while, to be given again to the same request.
+    pub cache: cache::Cache,
 }
 
 /// How one request ended, as whoever ended it saw it.
@@ -154,6 +162,7 @@ impl Shared {
             Outcome::Timeout => &c.timeouts,
             Outcome::Busy => &c.busy,
             Outcome::Failed => &c.failed,
+            Outcome::Cached => &c.cached,
         }
         .fetch_add(1, Relaxed);
         c.retries.fetch_add(u64::from(job.retries), Relaxed);
@@ -162,7 +171,11 @@ impl Shared {
         c.wait_us.fetch_add(wait, Relaxed);
         c.exec_us.fetch_add(exec, Relaxed);
         c.wait_hist[bucket(wait)].fetch_add(1, Relaxed);
-        c.exec_hist[bucket(exec)].fetch_add(1, Relaxed);
+        // The histogram is of time in a replica, and an answer from the
+        // cache spent none there.
+        if end.outcome != Outcome::Cached {
+            c.exec_hist[bucket(exec)].fetch_add(1, Relaxed);
+        }
         if !self.stats.enabled() {
             return;
         }

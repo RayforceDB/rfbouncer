@@ -33,7 +33,8 @@ speaks 4. Set `wire_version` to the one your replicas speak; the default is 4.
 ## What it does
 
 - **Speaks Rayforce's IPC.** A client connects to the bouncer exactly as it
-  would to a replica. Requests and answers pass through byte for byte.
+  would to a replica. Requests pass through byte for byte, and so do
+  answers, but for what the two points below say.
 - **One request, one replica.** Each sync request goes to a free replica,
   round robin; with every replica busy it waits in the bouncer's queue.
 - **Two ways to choose a replica**, set per pool with `mode`. `free`, the
@@ -54,6 +55,11 @@ speaks 4. Set `wire_version` to the one your replicas speak; the default is 4.
   the client has the request run again, once, on another replica if there is
   one; the wait for that replica is counted afresh. A dead replica is retried
   with a backoff and used again once it answers a greeting.
+- **Compression.** An answer is compressed for a client on another host,
+  as a Rayforce server would have done had the client been its own. See
+  [Compression](#compression).
+- **Result cache**, off unless a pool sets `cache_ttl`: the same request
+  within that time is answered from memory. See [Result cache](#result-cache).
 - **Pools.** Several pools on one port; the user name in a client's
   credentials picks the pool.
 - **Admin console**, read with any Rayforce client.
@@ -245,6 +251,7 @@ wrong password, and every HTTP path but `/healthz` answers `404`.
 | `pause [pool]`, `resume [pool]` | hold requests in the queue, for as long as it takes; let them go |
 | `drain <addr>`, `undrain <addr>` | stop handing a replica requests; start again |
 | `reconnect [pool]` | open every replica connection anew |
+| `flush [pool]` | empty the result cache |
 | `reload`, `shutdown` | as `SIGHUP` and `SIGTERM` |
 
 ## Reports
@@ -302,7 +309,7 @@ the minute being filled every ten seconds. They are ordinary tables:
 | Table | A row is |
 |---|---|
 | `rfb_agg` | a minute, a pool and a query shape: counts by outcome, time and wait sums and maxima, bytes, and a histogram of time in `h0`..`h31` (`h<i>` counts requests under 2^i µs) |
-| `rfb_status` | a minute, a pool and an outcome (`ok`, `cancel`, `timeout`, `busy`, `io`, or a replica's error code) |
+| `rfb_status` | a minute, a pool and an outcome (`ok`, `cached`, `cancel`, `timeout`, `busy`, `io`, or a replica's error code) |
 | `rfb_backend`, `rfb_client` | a minute, a pool and a replica or a client address |
 | `rfb_fp` | a query shape's text |
 | `rfb_sample` | a request kept whole: the slowest of each hour and up to 20 failed a minute |
@@ -322,6 +329,114 @@ a workload with many distinct symbols has many shapes. The journal grows with
 every row written, and only rows that changed are written. Lower
 `retention_aggregates` or `max_fingerprints_per_minute` if either is too
 much.
+
+## Compression
+
+A Rayforce server compresses an answer of more than 2000 bytes for a client
+on another host and sends it plain to one on its own. Behind the bouncer a
+replica's peer is the bouncer, which mostly sits on the replica's host, so a
+client far away would get every answer plain. The bouncer does what the
+replica would have done: the same scheme, giving the same bytes, for a client
+whose address is not loopback (`127.0.0.0/8`, `::1`).
+
+| Setting, per pool | |
+|---|---|
+| `compress` | `"remote"` (the default): clients on another host. `"always"`: every client. `"off"`: nobody |
+| `compress_max_bytes` | the largest answer compressed, `16MiB` unless set |
+
+- Compressing needs the whole answer in memory, where otherwise it is passed
+  on as it comes, 64 KiB at a time. While an answer is compressed a replica
+  connection holds up to twice `compress_max_bytes`. A larger answer is passed
+  on plain, as before.
+- An answer that does not get smaller is sent plain, as a server does. One a
+  replica compressed itself, being on another host, is passed on as it is.
+- The budgets are what they were: `query_timeout` until the replica begins
+  to answer, `transfer_timeout` from then until the client has it all, which
+  now includes taking it from the replica and compressing it. Nothing
+  reaches the client until that is done.
+- If the replica's connection breaks in the middle of such an answer, the
+  client's connection is closed, as it is for an answer passed on plain.
+
+What it buys depends on the data: Rayforce's scheme is run lengths of byte
+differences, which finds the zero bytes of small integers and little else.
+Measured on one core of an Apple M4, on results as a replica serialized them:
+
+| Result | Plain | Compressed | Saved | Time | |
+|---|---|---|---|---|---|
+| table of 100 000 rows: a running id, a float, a small integer | 2.40 MB | 2.02 MB | 15.7 % | 4.2 ms | 545 MiB/s |
+| table of 50 000 rows: two symbols, a string, a timestamp | 1.84 MB | 1.70 MB | 7.4 % | 2.4 ms | 728 MiB/s |
+| 1 000 000 integers counting up | 8.00 MB | 6.93 MB | 13.3 % | 9.8 ms | 781 MiB/s |
+| 50 000 short strings | 0.94 MB | 0.80 MB | 15.3 % | 1.3 ms | 702 MiB/s |
+| 1 000 000 random floats | 8.00 MB | not smaller, sent plain | 0 % | 22.9 ms | 334 MiB/s |
+
+A tenth of the bytes for a few milliseconds of one core per megabyte-sized
+answer: worth it on a slow link, not on a fast one. Set `compress = "off"`
+where the network is not what limits you. `/metrics` counts the answers
+compressed (`rfbouncer_compressed_total`) and the bytes that saved
+(`rfbouncer_compress_saved_bytes_total`). The numbers above come from
+`cargo test --release --test compress -- --ignored --nocapture`.
+
+## Result cache
+
+With `cache_ttl` set, a pool keeps the answers its replicas give and hands
+one back to a request made of the same bytes, without asking a replica. It is
+off unless set.
+
+| Setting, per pool | |
+|---|---|
+| `cache_ttl` | how long an answer may be given again; `0`, the default, keeps nothing |
+| `cache_max_bytes` | the most memory the kept answers and their requests may take, `64MiB` unless set; the oldest go first |
+| `cache_max_entry` | the largest answer kept, counted with its request, `1MiB` unless set |
+
+What it means for the answers a client gets:
+
+- **An answer may be `cache_ttl` old.** Replicas change underneath; the
+  bouncer does not know when. The age is counted from the moment the request
+  was handed to its replica, so what a client reads is never older than
+  `cache_ttl`, and the setting is the staleness you accept. `flush [pool]` on
+  the admin console empties the cache at once, for when the replicas were
+  just given new data; an answer on its way from a replica at that moment is
+  not kept either. Changing a pool's settings or its replicas empties it too.
+- **The same bytes, the same answer.** The key is the whole request frame,
+  so `(+ 1 2)` and `(+ 1  2)` are two requests. The bouncer does not read a
+  request to guess whether it may be kept: one whose answer depends on the
+  time or on chance, such as `(now)` or `(rand 10 100)`, gets the same answer
+  for `cache_ttl`. Send such requests through a pool without a cache: a
+  second pool over the same replicas, picked by another user name, costs
+  nothing.
+- **It is for reads.** A request that changes something on a replica that
+  lets it (one without `-U`, or a function marked with `.sys.trust`) is not
+  run again while its answer is kept.
+- **Only whole, good answers are kept.** An error a replica raised, a
+  request that timed out, was cancelled, was turned away as `busy` or lost
+  its replica leaves nothing behind: the next one like it goes to a replica.
+- **Any client's answer.** A pool's clients share its cache, whichever
+  replica answered; `affinity` does not hold for an answer from memory.
+  Pools do not share: each has its own. Clients that are sent compressed
+  answers and clients that are not are kept apart, so each gets the bytes it
+  would have got from a replica.
+- **The same request twice at once goes to a replica twice.** While the
+  first is still running there is nothing to give the second, and it is not
+  made to wait for it: tied to another client's request it would inherit that
+  client's cancel, that request's timeout and its replica's failure, and
+  would then have to start over, later than if it had not waited. With a
+  replica free it loses nothing by running; the cost is that a burst of the
+  same slow request is run once per free replica. A request that waits in
+  the queue anyway, every replica being busy, is looked up again when its
+  turn comes, and is given the answer its twin left meanwhile.
+
+An answer from memory needs no replica and no place in the queue: it is given
+while every replica is busy and when the queue is full. A paused pool holds
+it like any other request.
+
+In the statistics such a request has the outcome `cached`, no replica and no
+time in one. It is not counted as failed, and it is left out of the histogram
+of time in the replica, so the percentiles are those of the requests that
+were run; an average per request divides by all of them, the cached ones too.
+`/metrics` has `rfbouncer_requests_total{outcome="cached"}`,
+`rfbouncer_cache_hits_total`, `rfbouncer_cache_misses_total` (requests handed
+to a replica while the cache is on; one that is run again after its replica
+failed counts twice), `rfbouncer_cache_entries` and `rfbouncer_cache_bytes`.
 
 ## Development
 

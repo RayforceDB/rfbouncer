@@ -146,7 +146,7 @@ function text(value, href) {
 // How a request ended, in the data's own words. `error: name` is a code a
 // replica raised; the rest are the bouncer's.
 function outcome(status) {
-  if (status === 'ok') return h('span', { class: 'dim' }, 'ok');
+  if (status === 'ok' || status === 'cached') return h('span', { class: 'dim' }, status);
   if (status === 'cancel') return 'cancel';
   const own = OUTCOMES.some(([name]) => name === status);
   return h('span', { class: 'bad' }, own ? status : 'error: ' + status);
@@ -452,7 +452,7 @@ const views = {
     const data = await get('/api/errors' + q({ limit: 200 }));
     const of = (name) => (data.outcomes.find((o) => o.status === name) || { count: 0 }).count;
     const total = data.outcomes.reduce((n, o) => n + o.count, 0);
-    const codes = data.outcomes.filter((o) => o.status !== 'ok' && !OUTCOMES.some(([name]) => name === o.status));
+    const codes = data.outcomes.filter((o) => o.status !== 'ok' && o.status !== 'cached' && !OUTCOMES.some(([name]) => name === o.status));
     const rows = OUTCOMES.flatMap(([name, meaning]) => name === 'error'
       ? [{ name, meaning, count: codes.reduce((n, c) => n + c.count, 0) }, ...codes.map((c) => ({ name: c.status, count: c.count, code: true }))]
       : [{ name, meaning, count: of(name) }]);
