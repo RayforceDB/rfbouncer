@@ -44,6 +44,7 @@ fn counts_that_do_not_fit_are_shown_at_the_most_a_count_can_be() {
         ("s_dur_sum", wild()),
         ("s_h5", wild()),
         ("s_h9", wild()),
+        ("s_w3", wild()),
     ]));
     for path in ["/api/overview", "/api/top", "/api/query?fp=1"] {
         let report = http_json(bouncer.port, path, "root");

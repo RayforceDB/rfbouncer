@@ -159,7 +159,7 @@ impl Acc {
             *mine = mine.saturating_add(theirs);
         }
         for (mine, theirs) in self.wait_hist.iter_mut().zip(o.wait_hist) {
-            *mine += theirs;
+            *mine = mine.saturating_add(theirs);
         }
     }
 
