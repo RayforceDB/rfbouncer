@@ -152,11 +152,11 @@ impl Acc {
             self.counters[i] = if name.ends_with("_max") {
                 self.counters[i].max(o.counters[i])
             } else {
-                self.counters[i] + o.counters[i]
+                self.counters[i].saturating_add(o.counters[i])
             };
         }
         for (mine, theirs) in self.hist.iter_mut().zip(o.hist) {
-            *mine += theirs;
+            *mine = mine.saturating_add(theirs);
         }
         for (mine, theirs) in self.wait_hist.iter_mut().zip(o.wait_hist) {
             *mine += theirs;
@@ -166,8 +166,7 @@ impl Acc {
     fn not_ok(&self) -> u64 {
         ["errors", "cancels", "timeouts", "refused", "failed"]
             .iter()
-            .map(|c| self.get(c))
-            .sum()
+            .fold(0, |sum, c| sum.saturating_add(self.get(c)))
     }
 
     /// The requests that were not answered from the cache.
@@ -261,7 +260,7 @@ async fn series(stats: &Stats, f: &Filter) -> Result<Value, String> {
         .iter()
         .map(|(minute, acc)| {
             let mut point = acc.json();
-            point["t"] = json!(minute * 60);
+            point["t"] = json!(minute.saturating_mul(60));
             point
         })
         .collect();

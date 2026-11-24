@@ -249,14 +249,16 @@ pub fn bucket(micros: u64) -> usize {
 /// The duration, in microseconds, below which `q` of the histogram's
 /// requests fall: the upper edge of the bucket that holds that request.
 pub fn quantile(hist: &[u64; BUCKETS], q: f64) -> u64 {
-    let total: u64 = hist.iter().sum();
+    // The counts may come back from the store, which is another process:
+    // their sum is held at the most a count can be instead of trusted to fit.
+    let total = hist.iter().fold(0u64, |sum, n| sum.saturating_add(*n));
     if total == 0 {
         return 0;
     }
     let rank = (q * total as f64).ceil().max(1.0) as u64;
-    let mut seen = 0;
+    let mut seen = 0u64;
     for (i, n) in hist.iter().enumerate() {
-        seen += n;
+        seen = seen.saturating_add(*n);
         if seen >= rank {
             return 1 << i;
         }
