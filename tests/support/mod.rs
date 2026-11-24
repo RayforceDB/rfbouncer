@@ -389,6 +389,18 @@ impl Bouncer {
 
 impl Drop for Bouncer {
     fn drop(&mut self) {
+        // When coverage is being measured the process is asked to stop
+        // first, and given a moment: one that is killed never writes its
+        // counters, and the request path would count as never run.
+        if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+            let _ = Command::new("kill")
+                .arg(self.child.id().to_string())
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(self.dir());

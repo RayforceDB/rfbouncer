@@ -49,3 +49,65 @@ jobs:
           RFBOUNCER_TEST_WIRE: ${{ matrix.wire }}
       - name: Release build
         run: cargo build --release --locked
+
+  # The page's script: its formatting, its address parsing and its charts,
+  # under Node's own test runner with no package installed.
+  page:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The page's logic
+        run: node --test web/test/*.test.js
+
+  # A short run of every fuzz target: enough to see that each still builds,
+  # still takes its seeds, and that the last change did not break an
+  # invariant a few million inputs can reach. Long runs are done by hand;
+  # docs/fuzzing.md says how.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: A nightly compiler, for the fuzz targets alone
+        run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Every target for half a minute
+        run: fuzz/run.sh 30
+      - name: Keep what failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
+  # How much of the code the suite runs, printed per file. Nothing fails on
+  # a number: it is there to be read when deciding what to test next.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: RayforceDB/rayforce
+          ref: dev
+          path: rayforce-src
+      - name: Build Rayforce
+        run: make -C rayforce-src release -j4
+      - name: The tools that read the counters
+        run: rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Line coverage of the whole suite
+        run: cargo llvm-cov --summary-only | tee coverage.txt
+        env:
+          RAYFORCE_BIN: ${{ github.workspace }}/rayforce-src/rayforce
+          RFBOUNCER_TEST_WIRE: 4
+      - name: Publish the summary
+        run: |
+          {
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
