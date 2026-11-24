@@ -77,13 +77,20 @@ fn spawn(command: &mut Command) -> Child {
 /// out, a different stretch of it for each test process, each used once.
 pub fn free_port() -> u16 {
     static NEXT_PORT: AtomicUsize = AtomicUsize::new(0);
+    // `RFBOUNCER_TEST_PORT_BASE` gives a run a range of its own, for when
+    // several suites share a machine and must not meet.
+    let base = std::env::var("RFBOUNCER_TEST_PORT_BASE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
     let stretch = (std::process::id() as usize % 100) * 120;
     let n = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
     assert!(
         n < 120,
         "a test process may take 120 ports; give it a longer stretch"
     );
-    (20_000 + stretch + n) as u16
+    base.map_or(20_000 + stretch + n, |base| {
+        base + (std::process::id() as usize % 8) * 120 + n
+    }) as u16
 }
 
 fn wait_for_port(port: u16, what: &str) {
