@@ -15,6 +15,31 @@ use std::time::{Duration, Instant};
 use rfbouncer::wire::frame::{self, HEADER_LEN, Header, MSG_SYNC, PAYLOAD_MAX};
 use rfbouncer::wire::value;
 
+/// The wire version the suite speaks: the one the Rayforce under test
+/// does. `RFBOUNCER_TEST_WIRE=3` runs every test against a version 3 server.
+pub fn wire() -> u8 {
+    std::env::var("RFBOUNCER_TEST_WIRE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+}
+
+/// A wire version the suite does not speak.
+pub fn other_wire() -> u8 {
+    if wire() == 4 { 3 } else { 4 }
+}
+
+/// `body` with the suite's wire version given to every pool and to the
+/// statistics store, unless it names a version itself.
+fn versioned(body: &str) -> String {
+    if body.contains("wire_version") {
+        return body.to_owned();
+    }
+    let line = format!("wire_version = {}\n", wire());
+    body.replace("[[pool]]\n", &format!("[[pool]]\n{line}"))
+        .replace("[stats]\n", &format!("[stats]\n{line}"))
+}
+
 /// A query that keeps a replica's thread for about `n / 7500` seconds on the
 /// machine these tests were written on, and stops at a cancel within
 /// milliseconds. Its answer is `n`.
@@ -208,7 +233,11 @@ impl Bouncer {
         let dir = std::env::temp_dir().join(format!("rfbouncer-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("rfbouncer.toml");
-        std::fs::write(&config, format!("listen = \"127.0.0.1:{port}\"\n{body}")).unwrap();
+        std::fs::write(
+            &config,
+            format!("listen = \"127.0.0.1:{port}\"\n{}", versioned(body)),
+        )
+        .unwrap();
         let log = if std::env::var_os("RFBOUNCER_TEST_LOG").is_some() {
             Stdio::inherit()
         } else {
@@ -277,6 +306,7 @@ impl Bouncer {
 
     /// Replaces the configuration and has the bouncer read it again.
     pub fn reload(&self, body: &str) {
+        let body = versioned(body);
         std::fs::write(
             &self.config,
             format!("listen = \"127.0.0.1:{}\"\n{body}", self.port),
@@ -333,7 +363,7 @@ pub struct Client {
 
 impl Client {
     pub fn connect(port: u16) -> Self {
-        Self::connect_as(port, 4, None).unwrap()
+        Self::connect_as(port, wire(), None).unwrap()
     }
 
     /// Opens a connection the way a Rayforce client does. `credentials` are

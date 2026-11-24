@@ -14,8 +14,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # A release this code is known to work with, and the branch where
-        # the next one is being made.
+        # The released Rayforce, which speaks wire version 3, and the branch
+        # where the next release is being made, which speaks 4. The whole
+        # suite runs against each in the version it speaks.
+        include:
+          - rayforce: v3.0.2
+            wire: 3
+          - rayforce: dev
+            wire: 4
         rayforce: [v3.0.2, dev]
     runs-on: ${{ matrix.os }}
     steps:
@@ -40,5 +46,6 @@ jobs:
         run: cargo test
         env:
           RAYFORCE_BIN: ${{ github.workspace }}/rayforce-src/rayforce
+          RFBOUNCER_TEST_WIRE: ${{ matrix.wire }}
       - name: Release build
         run: cargo build --release --locked

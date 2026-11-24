@@ -148,7 +148,7 @@ fn requests_are_counted_by_the_shape_of_their_query() {
     assert_eq!(row(&top, "(+ ? ?)")["count"], 31);
 
     // The store holds ordinary tables, there for anyone to query.
-    let mut direct = Client::connect_as(store.port, 4, Some(("me", "s"))).unwrap();
+    let mut direct = Client::connect_as(store.port, support::wire(), Some(("me", "s"))).unwrap();
     assert_eq!(direct.query("(sum (at rfb_agg 'count))"), int(35));
 }
 

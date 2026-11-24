@@ -92,7 +92,7 @@ fn a_frozen_replica_costs_its_request_and_nothing_else() {
 fn an_answer_cut_short_closes_the_client() {
     let fake = Fake::start(|mut stream, _| {
         if read_request(&mut stream) {
-            let whole = frame::frame(4, MSG_RESPONSE, &[0u8; 1000]);
+            let whole = frame::frame(support::wire(), MSG_RESPONSE, &[0u8; 1000]);
             let _ = stream.write_all(&whole[..500]);
         }
     });
@@ -132,7 +132,7 @@ fn a_replica_that_speaks_out_of_turn_gets_a_new_connection() {
         if n == 0 {
             // What a subscription left on the connection would push.
             std::thread::sleep(Duration::from_millis(300));
-            let _ = stream.write_all(&frame::frame(4, 0, &int(7)));
+            let _ = stream.write_all(&frame::frame(support::wire(), 0, &int(7)));
             std::thread::sleep(Duration::from_secs(5));
         } else {
             answer_forever(stream, 42);

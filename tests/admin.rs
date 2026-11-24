@@ -12,11 +12,11 @@ const ADMIN: &str = "admin_password = \"root\"\n";
 const OPEN: &str = "require_restricted = false\npassword = \"pw\"";
 
 fn admin(bouncer: &Bouncer) -> Client {
-    Client::connect_as(bouncer.port, 4, Some(("rfbouncer", "root"))).unwrap()
+    Client::connect_as(bouncer.port, support::wire(), Some(("rfbouncer", "root"))).unwrap()
 }
 
 fn user(bouncer: &Bouncer) -> Client {
-    Client::connect_as(bouncer.port, 4, Some(("app", "pw"))).unwrap()
+    Client::connect_as(bouncer.port, support::wire(), Some(("app", "pw"))).unwrap()
 }
 
 fn text(payload: &[u8]) -> String {
@@ -62,7 +62,7 @@ fn only_the_admin_password_opens_the_console() {
     let replica = Rayforce::start(&[]);
     let bouncer = Bouncer::start(&format!("{ADMIN}{}", pool(&[&replica], OPEN)));
     assert!(matches!(
-        Client::connect_as(bouncer.port, 4, Some(("rfbouncer", "pw"))),
+        Client::connect_as(bouncer.port, support::wire(), Some(("rfbouncer", "pw"))),
         Err(Refused::Credentials)
     ));
     let mut a = admin(&bouncer);

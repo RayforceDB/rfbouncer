@@ -12,7 +12,7 @@ use support::{Bouncer, Client, Rayforce, Refused, int, pool, slow};
 fn an_answer_through_the_bouncer_is_the_replicas_own_bytes() {
     let replica = Rayforce::start(&["-U", "pw"]);
     let bouncer = Bouncer::start(&pool(&[&replica], "backend_password = \"pw\""));
-    let mut direct = Client::connect_as(replica.port, 4, Some(("t", "pw"))).unwrap();
+    let mut direct = Client::connect_as(replica.port, support::wire(), Some(("t", "pw"))).unwrap();
     let mut through = Client::connect(bouncer.port);
     for source in [
         "(+ 1 2)",
@@ -100,21 +100,23 @@ fn credentials_choose_the_pool() {
         a.addr(),
         b.addr()
     ));
-    let mut alice = Client::connect_as(bouncer.port, 4, Some(("alice", "pa"))).unwrap();
+    let mut alice =
+        Client::connect_as(bouncer.port, support::wire(), Some(("alice", "pa"))).unwrap();
     assert_eq!(alice.query("who"), int(1));
-    let mut other = Client::connect_as(bouncer.port, 4, Some(("bob", "anything"))).unwrap();
+    let mut other =
+        Client::connect_as(bouncer.port, support::wire(), Some(("bob", "anything"))).unwrap();
     assert_eq!(other.query("who"), int(2));
     assert!(matches!(
-        Client::connect_as(bouncer.port, 4, Some(("alice", "wrong"))),
+        Client::connect_as(bouncer.port, support::wire(), Some(("alice", "wrong"))),
         Err(Refused::Credentials)
     ));
     assert!(matches!(
-        Client::connect_as(bouncer.port, 3, Some(("alice", "pa"))),
-        Err(Refused::Version(4))
+        Client::connect_as(bouncer.port, support::other_wire(), Some(("alice", "pa"))),
+        Err(Refused::Version(v)) if v == support::wire()
     ));
     assert!(matches!(
         Client::connect_as(bouncer.port, 9, None),
-        Err(Refused::Version(4))
+        Err(Refused::Version(v)) if v == support::wire()
     ));
 }
 

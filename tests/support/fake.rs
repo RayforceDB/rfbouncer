@@ -17,7 +17,7 @@ pub struct Fake {
 impl Fake {
     /// `behave` gets each greeted connection and its number, counted from 0.
     pub fn start(behave: impl Fn(TcpStream, usize) + Send + Sync + 'static) -> Self {
-        Self::start_speaking(4, behave)
+        Self::start_speaking(super::wire(), behave)
     }
 
     /// As `start`, greeting with another wire version.
@@ -75,6 +75,6 @@ pub fn read_request(stream: &mut TcpStream) -> bool {
 /// Answers every request with the i64 `n`, until the peer closes.
 pub fn answer_forever(mut stream: TcpStream, n: i64) {
     while read_request(&mut stream) {
-        let _ = stream.write_all(&frame::frame(4, MSG_RESPONSE, &super::int(n)));
+        let _ = stream.write_all(&frame::frame(super::wire(), MSG_RESPONSE, &super::int(n)));
     }
 }

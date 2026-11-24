@@ -101,6 +101,7 @@ async fn proxy(
         requests: 0,
     });
     let mut shutdown = core.shutdown.subscribe();
+    let cancels = oob::Watch::new(&stream)?;
     let (mut rd, mut wr) = stream.into_split();
     let mut buf = BytesMut::new();
     loop {
@@ -153,7 +154,7 @@ async fn proxy(
                     Some(Reply::Done) => break,
                     Some(Reply::Abort) | None => return Ok(()),
                 },
-                () = oob::wait(wr.as_ref()), if !cancelled => {
+                () = cancels.wait(), if !cancelled => {
                     cancelled = true;
                     pool.send(Cmd::Cancel(id));
                 }

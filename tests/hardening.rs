@@ -37,7 +37,7 @@ fn a_compressed_answer_is_not_taken_for_an_error() {
     let fake = Fake::start(move |mut stream, _| {
         while read_request(&mut stream) {
             let header = Header {
-                version: 4,
+                version: support::wire(),
                 flags: FLAG_COMPRESSED,
                 msgtype: MSG_RESPONSE,
                 size: sent.len(),
@@ -67,10 +67,10 @@ fn a_reconnect_asked_for_meanwhile_does_not_deafen_a_request_to_its_cancel() {
         "admin_password = \"root\"\n{}",
         pool(&[&replica], &format!("{OPEN}\npassword = \"pw\""))
     ));
-    let mut c = Client::connect_as(bouncer.port, 4, Some(("app", "pw"))).unwrap();
+    let mut c = Client::connect_as(bouncer.port, support::wire(), Some(("app", "pw"))).unwrap();
     c.send(&slow(60_000));
     bouncer.wait_busy(1);
-    Client::connect_as(bouncer.port, 4, Some(("rfbouncer", "root")))
+    Client::connect_as(bouncer.port, support::wire(), Some(("rfbouncer", "root")))
         .unwrap()
         .query("reconnect");
     let started = Instant::now();
@@ -98,7 +98,7 @@ fn a_request_given_back_by_a_dead_replica_waits_afresh_for_another() {
     let slow_one = Fake::start(|mut stream, _| {
         while read_request(&mut stream) {
             std::thread::sleep(Duration::from_millis(3500));
-            let _ = stream.write_all(&frame::frame(4, MSG_RESPONSE, &int(42)));
+            let _ = stream.write_all(&frame::frame(support::wire(), MSG_RESPONSE, &int(42)));
         }
     });
     let bouncer = Bouncer::start(&fakes(&[&dying, &slow_one], "query_wait_timeout = \"2s\""));
@@ -215,9 +215,10 @@ fn a_paused_pool_holds_a_request_for_as_long_as_it_is_paused() {
         )
     );
     let bouncer = Bouncer::start(&body);
-    let mut admin = Client::connect_as(bouncer.port, 4, Some(("rfbouncer", "root"))).unwrap();
+    let mut admin =
+        Client::connect_as(bouncer.port, support::wire(), Some(("rfbouncer", "root"))).unwrap();
     admin.query("pause");
-    let mut c = Client::connect_as(bouncer.port, 4, Some(("app", "pw"))).unwrap();
+    let mut c = Client::connect_as(bouncer.port, support::wire(), Some(("app", "pw"))).unwrap();
     c.send("(+ 1 2)");
     c.stream
         .set_read_timeout(Some(Duration::from_millis(1200)))
@@ -300,13 +301,13 @@ fn connections_are_limited_and_given_back() {
     let second = Client::connect(bouncer.port);
     assert_eq!(first.query("(+ 1 1)"), int(2));
     assert!(matches!(
-        Client::connect_as(bouncer.port, 4, None),
+        Client::connect_as(bouncer.port, support::wire(), None),
         Err(Refused::Closed)
     ));
     assert!(bouncer.metric("rfbouncer_connections_refused_total") >= 1.0);
     drop(second);
     eventually("the place is given back", || {
-        Client::connect_as(bouncer.port, 4, None).is_ok()
+        Client::connect_as(bouncer.port, support::wire(), None).is_ok()
     });
     // A client that sits between two requests longer than it may is let go.
     std::thread::sleep(Duration::from_millis(900));
@@ -438,7 +439,7 @@ fn health_needs_no_password_and_the_report_password_opens_only_the_reports() {
     assert_eq!(http_get(bouncer.port, "/api/live", Some("look")).0, 200);
     assert_eq!(http_get(bouncer.port, "/metrics", Some("look")).0, 200);
     assert!(matches!(
-        Client::connect_as(bouncer.port, 4, Some(("rfbouncer", "look"))),
+        Client::connect_as(bouncer.port, support::wire(), Some(("rfbouncer", "look"))),
         Err(Refused::Credentials)
     ));
     // A refused login is counted, over either protocol.
@@ -505,16 +506,16 @@ fn a_reload_applies_passwords_slots_and_the_removal_of_a_pool() {
         )
     };
     let bouncer = Bouncer::start(&two("old", 1, true));
-    let mut stays = Client::connect_as(bouncer.port, 4, Some(("x", "old"))).unwrap();
-    let mut removed = Client::connect_as(bouncer.port, 4, Some(("o", ""))).unwrap();
+    let mut stays = Client::connect_as(bouncer.port, support::wire(), Some(("x", "old"))).unwrap();
+    let mut removed = Client::connect_as(bouncer.port, support::wire(), Some(("o", ""))).unwrap();
     assert_eq!(removed.query("(+ 1 1)"), int(2));
 
     bouncer.reload(&two("new", 2, false));
     eventually("the new password is the one that works", || {
-        Client::connect_as(bouncer.port, 4, Some(("x", "new"))).is_ok()
+        Client::connect_as(bouncer.port, support::wire(), Some(("x", "new"))).is_ok()
     });
     assert!(matches!(
-        Client::connect_as(bouncer.port, 4, Some(("x", "old"))),
+        Client::connect_as(bouncer.port, support::wire(), Some(("x", "old"))),
         Err(Refused::Credentials)
     ));
     // A connection made under the old password goes on.
