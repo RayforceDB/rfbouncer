@@ -82,6 +82,12 @@ struct Dispatcher {
 
 pub fn spawn(cfg: Arc<PoolConfig>, stats: Arc<Stats>) -> PoolHandle {
     let (tx, mut rx) = mpsc::unbounded_channel();
+    // What the replicas report comes on a channel of its own and is read
+    // first. On the clients' channel a replica that has just become free
+    // would wait behind every request sent meanwhile, and when clients that
+    // were turned away ask again at once, that is thousands: the replicas
+    // then idle while the pool is busy refusing.
+    let (events, mut reports) = mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
         name: cfg.name.as_str().into(),
         counters: Counters::default(),
@@ -93,7 +99,7 @@ pub fn spawn(cfg: Arc<PoolConfig>, stats: Arc<Stats>) -> PoolHandle {
     let mut d = Dispatcher {
         cfg: cfg.clone(),
         cfg_tx,
-        events: tx.clone(),
+        events,
         shared: shared.clone(),
         replicas: Vec::new(),
         queue: VecDeque::new(),
@@ -112,11 +118,15 @@ pub fn spawn(cfg: Arc<PoolConfig>, stats: Arc<Stats>) -> PoolHandle {
         let mut tick = tokio::time::interval(TICK);
         loop {
             tokio::select! {
+                biased;
+                Some(report) = reports.recv() => d.handle(report).await,
+                // Ahead of the clients, or a steady stream of requests would
+                // keep the queue from ever being looked over.
+                _ = tick.tick() => d.expire().await,
                 cmd = rx.recv() => match cmd {
                     Some(cmd) => d.handle(cmd).await,
                     None => break,
                 },
-                _ = tick.tick() => d.expire().await,
             }
             if d.closing && d.queue.is_empty() && d.replicas.iter().all(|r| r.gone) {
                 break;
@@ -391,6 +401,9 @@ impl Dispatcher {
                 at += 1;
             }
         }
+        if !self.paused {
+            self.forget_gone();
+        }
         self.pump();
     }
 
@@ -399,7 +412,21 @@ impl Dispatcher {
         if self.paused {
             return;
         }
-        // A client that left while queued has nobody to answer.
+        match self.cfg.mode {
+            Mode::Free => self.pump_free(),
+            Mode::RoundRobin => {
+                self.forget_gone();
+                self.pump_in_turn();
+            }
+            Mode::LeastLoaded => self.pump_least_loaded(),
+        }
+    }
+
+    /// Takes out of the queue the requests whose client left while they
+    /// waited: there is nobody to answer. This reads the whole queue, which
+    /// is why it is not done for every command: `pump_free` looks only at
+    /// the request it is about to hand out, and the tick finds the rest.
+    fn forget_gone(&mut self) {
         let mut at = 0;
         while at < self.queue.len() {
             if self.queue[at].reply.is_closed() {
@@ -410,17 +437,19 @@ impl Dispatcher {
                 at += 1;
             }
         }
-        match self.cfg.mode {
-            Mode::Free => self.pump_free(),
-            Mode::RoundRobin => self.pump_in_turn(),
-            Mode::LeastLoaded => self.pump_least_loaded(),
-        }
     }
 
     /// The head of the queue goes to a free replica, until one of the two
     /// runs out.
     fn pump_free(&mut self) {
         while let Some((client, avoid)) = self.queue.front().map(|j| (j.client.ip(), j.avoid)) {
+            // A client that left while queued has nobody to answer.
+            if self.queue.front().is_some_and(|j| j.reply.is_closed()) {
+                if let Some(job) = self.queue.pop_front() {
+                    self.end(&job, Outcome::Cancelled);
+                }
+                continue;
+            }
             let Some(idx) = self.pick(client, avoid) else {
                 return;
             };
@@ -635,6 +664,13 @@ impl Dispatcher {
     /// no request waits for a replica to look better.
     fn pump_least_loaded(&mut self) {
         while let Some(avoid) = self.queue.front().map(|j| j.avoid) {
+            // As in `pump_free`: a client that left has nobody to answer.
+            if self.queue.front().is_some_and(|j| j.reply.is_closed()) {
+                if let Some(job) = self.queue.pop_front() {
+                    self.end(&job, Outcome::Cancelled);
+                }
+                continue;
+            }
             let Some(idx) = self.pick_least_loaded(avoid) else {
                 return;
             };
