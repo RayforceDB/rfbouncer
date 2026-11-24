@@ -170,17 +170,22 @@ impl Acc {
             .sum()
     }
 
+    /// The requests that were not answered from the cache.
+    fn ran(&self) -> u64 {
+        self.get("count").saturating_sub(self.get("cached"))
+    }
+
     fn json(&self) -> Value {
         let count = self.get("count");
+        // An average is over the requests that asked for a replica: one
+        // answered from the cache neither waited nor ran.
+        let ran = self.ran();
         let per = |sum: u64| {
-            if count == 0 {
-                0.0
-            } else {
-                ms(sum) / count as f64
-            }
+            if ran == 0 { 0.0 } else { ms(sum) / ran as f64 }
         };
         json!({
             "count": count,
+            "cached": self.get("cached"),
             "not_ok": self.not_ok(),
             "errors": self.get("errors"),
             "cancels": self.get("cancels"),
@@ -321,7 +326,7 @@ pub async fn top(stats: &Stats, f: &Filter) -> Result<Value, String> {
     rows.iter().for_each(|(_, acc)| all.add(acc));
     let key = |a: &Acc| match f.sort.as_str() {
         "count" => a.get("count"),
-        "avg" => a.get("dur_sum") / a.get("count").max(1),
+        "avg" => a.get("dur_sum") / a.ran().max(1),
         "max" => a.get("dur_max"),
         "errors" => a.not_ok(),
         "bytes" => a.get("bytes_out"),
@@ -435,17 +440,18 @@ async fn grouped_rows(
 ) -> Result<Vec<Value>, String> {
     let select = |from: &str, condition: &str| {
         format!(
-            "(select {{from: {from} where: {condition} by: [pool who] n: (sum count) e: (sum errors) d: (sum dur_sum)}})"
+            "(select {{from: {from} where: {condition} by: [pool who] n: (sum count) e: (sum errors) d: (sum dur_sum) c: (sum cached)}})"
         )
     };
-    // Per pool and name: requests, those not ok, and time.
-    let mut sums: BTreeMap<(String, String), [u64; 3]> = BTreeMap::new();
+    // Per pool and name: requests, those not ok, time, and those answered
+    // from the cache.
+    let mut sums: BTreeMap<(String, String), [u64; 4]> = BTreeMap::new();
     for rows in from_both(stats, f, table, with_fp, select).await? {
         for row in 0..rows.len() {
             let sum = sums
                 .entry((rows.text("pool", row), rows.text("who", row)))
                 .or_default();
-            for (slot, name) in sum.iter_mut().zip(["n", "e", "d"]) {
+            for (slot, name) in sum.iter_mut().zip(["n", "e", "d", "c"]) {
                 *slot += rows.int(name, row);
             }
         }
@@ -455,14 +461,16 @@ async fn grouped_rows(
     let listed: Vec<Value> = order
         .into_iter()
         .take(f.limit)
-        .map(|((pool, name), [count, not_ok, dur])| {
+        .map(|((pool, name), [count, not_ok, dur, cached])| {
+            let ran = count.saturating_sub(cached);
             json!({
                 "pool": pool,
                 "name": name,
                 "count": count,
                 "not_ok": not_ok,
+                "cached": cached,
                 "total_ms": ms(dur),
-                "avg_ms": if count == 0 { 0.0 } else { ms(dur) / count as f64 },
+                "avg_ms": if ran == 0 { 0.0 } else { ms(dur) / ran as f64 },
             })
         })
         .collect();

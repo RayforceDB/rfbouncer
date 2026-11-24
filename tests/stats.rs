@@ -397,9 +397,16 @@ fn totals_come_with_those_of_the_period_before() {
 
 #[test]
 fn a_store_of_the_layout_before_is_refused_in_so_many_words() {
+    // `rfb_agg` as it was before the wait had a histogram, and as it was
+    // before an answer from the cache had a counter.
+    refused_for_lacking("w0", &[]);
+    let wait: Vec<String> = (0..32).map(|i| format!("w{i}")).collect();
+    refused_for_lacking("cached", &wait);
+}
+
+fn refused_for_lacking(column: &str, more: &[String]) {
     let replica = Rayforce::start(&[]);
     let store = Rayforce::start(&[]);
-    // `rfb_agg` as it was before the wait had a histogram.
     let mut columns: Vec<String> = [
         "minute",
         "pool",
@@ -423,6 +430,7 @@ fn a_store_of_the_layout_before_is_refused_in_so_many_words() {
     .map(|c| (*c).to_owned())
     .collect();
     columns.extend((0..32).map(|i| format!("h{i}")));
+    columns.extend(more.iter().cloned());
     let types: Vec<&str> = columns
         .iter()
         .map(|c| match c.as_str() {
@@ -431,9 +439,10 @@ fn a_store_of_the_layout_before_is_refused_in_so_many_words() {
         })
         .collect();
     Client::connect(store.port).query(&format!(
-        "(set rfb_agg (table [{}] (list {})))",
+        "(set rfb_agg (table [{}] (concat (list {}) (list {}))))",
         columns.join(" "),
-        types.join(" ")
+        types[..40].join(" "),
+        types[40..].join(" ")
     ));
     let body = format!(
         "admin_password = \"root\"\n[stats]\nrayforce = \"{}\"\n{}",
@@ -445,7 +454,9 @@ fn a_store_of_the_layout_before_is_refused_in_so_many_words() {
     let (status, body) = http_get(bouncer.port, "/api/overview", Some("root"));
     assert_eq!(status, 502);
     assert!(
-        body.contains("rfb_agg is of an older layout (it has no column w0)"),
+        body.contains(&format!(
+            "rfb_agg is of an older layout (it has no column {column})"
+        )),
         "{body}"
     );
     // Nothing was made beside the table it could not use.
@@ -574,4 +585,42 @@ fn days_that_are_over_are_kept_on_disk_and_still_reported() {
     });
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(root.with_extension("journal"));
+}
+
+#[test]
+fn the_texts_no_row_refers_to_are_dropped_and_nothing_is_left_bound() {
+    let replica = Rayforce::start(&[]);
+    let store = Rayforce::start(&[]);
+    let root = std::env::temp_dir().join(format!("rfbouncer-prune-{}", std::process::id()));
+    let body = format!(
+        "admin_password = \"root\"\n[stats]\nrayforce = \"{}\"\ndisk = \"{}\"\n{}",
+        store.addr(),
+        root.display(),
+        pool(&[&replica], "require_restricted = false")
+    );
+    let bouncer = Bouncer::start(&body);
+    assert_eq!(Client::connect(bouncer.port).query("(+ 1 2)"), int(3));
+    let top = http_json(bouncer.port, "/api/top", "root");
+    assert_eq!(row(&top, "(+ ? ?)")["count"], 1);
+    let mut direct = Client::connect(store.port);
+    direct
+        .query("(upsert 'rfb_fp 1 (table [fp first_seen text] (list [42] [0] (list \"(gone)\"))))");
+    assert_eq!(direct.query("(count rfb_fp)"), int(2));
+    // The first pruning comes with the first write the clock asks for, ten
+    // seconds after the bouncer started.
+    std::thread::sleep(std::time::Duration::from_secs(9));
+    support::eventually("the text no row refers to is dropped", || {
+        direct.query("(count rfb_fp)") == int(1)
+    });
+    assert_eq!(
+        http_json(bouncer.port, "/api/top", "root")["rows"][0]["text"],
+        "(+ ? ?)"
+    );
+    for name in ["rfb_live_agg", "rfb_live_sample", "live", "kept"] {
+        assert!(
+            direct.query_error(&format!("(count {name})")).is_some(),
+            "{name}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }

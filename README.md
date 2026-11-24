@@ -416,9 +416,9 @@ the minute being filled every ten seconds. They are ordinary tables:
 
 | Table | A row is |
 |---|---|
-| `rfb_agg` | a minute, a pool and a query shape: counts by outcome, time and wait sums and maxima, bytes, a histogram of time in `h0`..`h31` (`h<i>` counts requests under 2^i µs) and one of the wait in `w0`..`w31` |
+| `rfb_agg` | a minute, a pool and a query shape: counts by outcome (`cached` among them), time and wait sums and maxima, bytes, a histogram of time in `h0`..`h31` (`h<i>` counts requests under 2^i µs) and one of the wait in `w0`..`w31` |
 | `rfb_status` | a minute, a pool and an outcome (`ok`, `cached`, `cancel`, `timeout`, `busy`, `io`, or a replica's error code) |
-| `rfb_backend`, `rfb_client` | a minute, a pool and a replica or a client address |
+| `rfb_backend`, `rfb_client` | a minute, a pool and a replica or a client address: requests, those that failed, those answered from the cache, and time |
 | `rfb_fp` | a query shape's text |
 | `rfb_sample` | a request kept whole: the slowest of each hour and up to 20 failed a minute |
 | `rfb_fp_client`, `rfb_fp_backend` | a minute, a pool, a query shape and a client address or a replica |
@@ -440,7 +440,7 @@ with `disk` set: see [Days on disk](#days-on-disk)), about 650 bytes a row of
 `rfb_agg`, one row a minute for each query shape seen in it. Names and
 symbols are part of a shape, so `(== sym 'AAPL)` and `(== sym 'MSFT)` are two:
 a workload with many distinct symbols has many shapes, unless
-`normalize_symbols` is set. `rfb_fp_client` and `rfb_fp_backend` hold eight
+`normalize_symbols` is set. `rfb_fp_client` and `rfb_fp_backend` hold nine
 numbers a row and at most twice `max_fingerprints_per_minute` rows a minute
 each. The journal grows with
 every row written, and only rows that changed are written. Lower
@@ -589,9 +589,13 @@ while every replica is busy and when the queue is full. A paused pool holds
 it like any other request.
 
 In the statistics such a request has the outcome `cached`, no replica and no
-time in one. It is not counted as failed, and it is left out of the histogram
-of time in the replica, so the percentiles are those of the requests that
-were run; an average per request divides by all of them, the cached ones too.
+time in one. It is not counted as failed and has a count of its own (`cached` in
+`rfb_agg` and beside each client), which the pages show with the requests
+and among the outcomes. It is left out of the times, the waits and both
+histograms, so the percentiles and the averages are those of the requests
+that asked for a replica: an average divides by them, not by all. That goes
+for the wait of a request that stood in the queue before its twin's answer
+was there for it, too.
 `/metrics` has `rfbouncer_requests_total{outcome="cached"}`,
 `rfbouncer_cache_hits_total`, `rfbouncer_cache_misses_total` (requests handed
 to a replica while the cache is on; one that is run again after its replica

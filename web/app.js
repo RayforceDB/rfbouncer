@@ -372,7 +372,7 @@ function totals(t, seconds, extra, was) {
     { label: 'Exec p99', value: dur(t.p99_ms), sub: `p50 ${dur(t.p50_ms)} · p95 ${dur(t.p95_ms)}`, delta: moved(t.p99_ms, was.p99_ms, dur) },
     { label: 'Wait p99', value: dur(t.wait_p99_ms), delta: moved(t.wait_p99_ms, was.wait_p99_ms, dur),
       sub: `p50 ${dur(t.wait_p50_ms)} · p95 ${dur(t.wait_p95_ms)} · max ${dur(t.wait_max_ms)} · avg ${dur(t.wait_avg_ms)}` },
-    { label: 'Requests', value: int(t.count), sub: `${sig3(t.count / seconds)}/s`, delta: was && delta(t.count, was.count, int) },
+    { label: 'Requests', value: int(t.count), sub: `${sig3(t.count / seconds)}/s` + (t.cached ? ` · ${int(t.cached)} cached` : ''), delta: was && delta(t.count, was.count, int) },
     ...(extra || []),
   ]);
 }
@@ -490,6 +490,8 @@ const views = {
     const rows = OUTCOMES.flatMap(([name, meaning]) => name === 'error'
       ? [{ name, meaning, count: codes.reduce((n, c) => n + c.count, 0) }, ...codes.map((c) => ({ name: c.status, count: c.count, code: true }))]
       : [{ name, meaning, count: of(name) }]);
+    // Not a failure, but an outcome: listed where the pool has a cache.
+    if (of('cached')) rows.push({ name: 'cached', meaning: 'answered from the result cache, not a failure', count: of('cached') });
     const faded = (r, value) => h('span', { class: r.count ? '' : 'dim' }, value);
     return [section('Outcomes', `of ${int(total)} requests in ${st.range[2]}`, table([
         { title: 'Outcome', cls: (r) => r.code ? 'indent' : '', cell: (r) => faded(r, r.name) },

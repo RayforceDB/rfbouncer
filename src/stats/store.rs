@@ -39,7 +39,7 @@ const OTHER_WHO: &str = "<other>";
 /// The counters of a row of `rfb_agg`, in column order, after its key
 /// (minute, pool, fp, src) and before its histograms: of the time in the
 /// replica (h0..h31), then of the wait for one (w0..w31).
-pub const COUNTERS: [&str; 13] = [
+pub const COUNTERS: [&str; 14] = [
     "count",
     "errors",
     "cancels",
@@ -53,6 +53,7 @@ pub const COUNTERS: [&str; 13] = [
     "wait_max",
     "bytes_in",
     "bytes_out",
+    "cached",
 ];
 
 // Where each counter sits in `Agg::counters`, as `COUNTERS` orders them.
@@ -69,6 +70,7 @@ const WAIT_SUM: usize = 9;
 const WAIT_MAX: usize = 10;
 const BYTES_IN: usize = 11;
 const BYTES_OUT: usize = 12;
+const CACHED: usize = 13;
 
 /// Every table, with the source that makes it empty. A table's key is its
 /// leading columns, which is what `upsert` matches on. `src` names the
@@ -97,12 +99,15 @@ fn schema() -> Vec<(&'static str, String)> {
     let mut agg_types = vec![int, sym, int, sym];
     agg_types.resize(agg.len(), int);
 
-    let small = own(&["minute", "pool", "who", "src", "count", "errors", "dur_sum"]);
+    let small = own(&[
+        "minute", "pool", "who", "src", "count", "errors", "dur_sum", "cached",
+    ]);
+    let small_types = [int, sym, sym, sym, int, int, int, int];
     let status = own(&["minute", "pool", "status", "src", "count"]);
     let by_fp = own(&[
-        "minute", "pool", "fp", "who", "src", "count", "errors", "dur_sum",
+        "minute", "pool", "fp", "who", "src", "count", "errors", "dur_sum", "cached",
     ]);
-    let by_fp_types = [int, sym, int, sym, sym, int, int, int];
+    let by_fp_types = [int, sym, int, sym, sym, int, int, int, int];
     let sample = own(&[
         "kind", "pool", "bucket", "slot", "src", "ts", "fp", "dur", "wait", "backend", "client",
         "status", "text",
@@ -112,14 +117,8 @@ fn schema() -> Vec<(&'static str, String)> {
     ];
     vec![
         ("rfb_agg", make(&agg, &agg_types)),
-        (
-            "rfb_backend",
-            make(&small, &[int, sym, sym, sym, int, int, int]),
-        ),
-        (
-            "rfb_client",
-            make(&small, &[int, sym, sym, sym, int, int, int]),
-        ),
+        ("rfb_backend", make(&small, &small_types)),
+        ("rfb_client", make(&small, &small_types)),
         ("rfb_status", make(&status, &[int, sym, sym, sym, int])),
         (
             "rfb_fp",
@@ -217,17 +216,24 @@ pub async fn ensure_schema(conn: &mut Conn) -> Result<(), String> {
         if conn.eval(&format!("(count {name})")).await.is_err() {
             conn.eval(&format!("(set {name} {empty})")).await?;
         } else if name != "rfb_fp" {
-            // The column each layout so far added to the table: a store made
-            // before any of them is told here, not by a failed write later.
-            let newest = if name == "rfb_agg" { "w0" } else { "src" };
-            if conn
-                .eval(&format!("(count (at {name} '{newest}))"))
-                .await
-                .is_err()
-            {
-                return Err(format!(
-                    "{name} is of an older layout (it has no column {newest}): start an empty store, or delete the rfb_ tables in this one"
-                ));
+            // The columns the layouts so far added to the table, oldest
+            // first: a store made before any of them is told here, and which
+            // layout it is of, not by a failed write later.
+            let added: &[&str] = match name {
+                "rfb_agg" => &["src", "w0", "cached"],
+                "rfb_status" | "rfb_sample" => &["src"],
+                _ => &["src", "cached"],
+            };
+            for column in added {
+                if conn
+                    .eval(&format!("(count (at {name} '{column}))"))
+                    .await
+                    .is_err()
+                {
+                    return Err(format!(
+                        "{name} is of an older layout (it has no column {column}): start an empty store, or delete the rfb_ tables in this one"
+                    ));
+                }
             }
         }
     }
@@ -270,6 +276,7 @@ struct Small {
     count: u64,
     errors: u64,
     dur_sum: u64,
+    cached: u64,
 }
 
 #[derive(Clone)]
@@ -551,6 +558,7 @@ impl Writer {
         });
         let (dur, wait) = (e.exec.as_micros() as u64, e.wait.as_micros() as u64);
         let failed = !matches!(e.outcome, Outcome::Ok | Outcome::Cached);
+        let cached = e.outcome == Outcome::Cached;
         let backend = e.backend.as_deref().unwrap_or_default().to_owned();
         let client = e.client.to_string();
         let status = e.outcome.label().to_owned();
@@ -559,7 +567,8 @@ impl Writer {
         let c = &mut a.counters;
         c[COUNT] += 1;
         match e.outcome {
-            Outcome::Ok | Outcome::Cached => {}
+            Outcome::Ok => {}
+            Outcome::Cached => c[CACHED] += 1,
             Outcome::ServerError(_) => c[ERRORS] += 1,
             Outcome::Cancelled => c[CANCELS] += 1,
             Outcome::Timeout => c[TIMEOUTS] += 1,
@@ -567,15 +576,16 @@ impl Writer {
             Outcome::Failed => c[FAILED] += 1,
         }
         c[RETRIES] += u64::from(e.retries);
-        c[DUR_SUM] += dur;
-        c[DUR_MAX] = c[DUR_MAX].max(dur);
-        c[WAIT_SUM] += wait;
-        c[WAIT_MAX] = c[WAIT_MAX].max(wait);
         c[BYTES_IN] += e.bytes_in;
         c[BYTES_OUT] += e.bytes_out;
-        // The histograms are of time in a replica and in the queue, and an
-        // answer from the cache spent none in either.
-        if e.outcome != Outcome::Cached {
+        // The times, the waits and their histograms are of the requests that
+        // asked for a replica. An answer from the cache did not: it is
+        // counted in `cached`, and a report divides by the rest.
+        if !cached {
+            c[DUR_SUM] += dur;
+            c[DUR_MAX] = c[DUR_MAX].max(dur);
+            c[WAIT_SUM] += wait;
+            c[WAIT_MAX] = c[WAIT_MAX].max(wait);
             a.hist[bucket(dur)] += 1;
             a.wait_hist[bucket(wait)] += 1;
         }
@@ -587,6 +597,7 @@ impl Writer {
             small.count += 1;
             small.errors += u64::from(failed);
             small.dur_sum += dur;
+            small.cached += u64::from(cached);
             dirty.insert(key);
         };
         count(&mut self.clients, &mut self.dirty_clients, &client);
@@ -606,6 +617,7 @@ impl Writer {
             small.count += 1;
             small.errors += u64::from(failed);
             small.dur_sum += dur;
+            small.cached += u64::from(cached);
             dirty.insert(key);
         };
         count(&mut self.fp_clients, &mut self.dirty_fp_clients, &client);
@@ -746,6 +758,7 @@ impl Writer {
                     ("count", ints(rows.iter().map(|(_, s)| s.count))),
                     ("errors", ints(rows.iter().map(|(_, s)| s.errors))),
                     ("dur_sum", ints(rows.iter().map(|(_, s)| s.dur_sum))),
+                    ("cached", ints(rows.iter().map(|(_, s)| s.cached))),
                 ])
             })
         };
@@ -770,6 +783,7 @@ impl Writer {
                     ("count", ints(rows.iter().map(|(_, s)| s.count))),
                     ("errors", ints(rows.iter().map(|(_, s)| s.errors))),
                     ("dur_sum", ints(rows.iter().map(|(_, s)| s.dur_sum))),
+                    ("cached", ints(rows.iter().map(|(_, s)| s.cached))),
                 ])
             })
         };
@@ -861,9 +875,12 @@ impl Writer {
             format!("(delete {{from: 'rfb_fp_client where: (< minute {aggregates})}})"),
             format!("(delete {{from: 'rfb_fp_backend where: (< minute {aggregates})}})"),
             format!("(delete {{from: 'rfb_sample where: (< ts {samples})}})"),
-            format!("(set rfb_live_agg (concat (at rfb_agg 'fp){on_disk}))"),
-            "(set rfb_live_sample (at rfb_sample 'fp))".to_owned(),
-            "(delete {from: 'rfb_fp where: (and (not (in fp rfb_live_agg)) (not (in fp rfb_live_sample)))})".to_owned(),
+            // The shapes in use are a function's arguments: inside `where:`
+            // a table's column cannot be asked for, and a name they were set
+            // to would put them into the store's journal and snapshots.
+            format!(
+                "((fn [live kept] (delete {{from: 'rfb_fp where: (and (not (in fp live)) (not (in fp kept)))}})) (concat (at rfb_agg 'fp){on_disk}) (at rfb_sample 'fp))"
+            ),
             "(select {from: rfb_fp fp: fp})".to_owned(),
         ];
         let result: Result<(), String> = async {

@@ -258,6 +258,16 @@ fn the_statistics_tell_a_cached_answer_from_one_a_replica_gave() {
     assert_eq!((count_of("ok"), count_of("cached")), (1, 2));
     assert_eq!(overview["total"]["count"], 3);
     assert_eq!(overview["total"]["not_ok"], 0);
+    // An average is over the one that ran, not over all three.
+    let total = &overview["total"];
+    assert_eq!(total["cached"], 2);
+    assert!(total["total_ms"].as_f64().unwrap() > 0.0, "{total}");
+    assert_eq!(total["avg_ms"], total["total_ms"]);
+    let clients = http_json(bouncer.port, "/api/clients", "root");
+    let client = &clients["rows"][0];
+    assert_eq!(client["count"], 3);
+    assert_eq!(client["cached"], 2);
+    assert_eq!(client["avg_ms"], client["total_ms"]);
     // Neither failed, nor served by a replica.
     let errors = http_json(bouncer.port, "/api/errors", "root");
     assert!(errors["rows"].as_array().unwrap().is_empty(), "{errors}");
