@@ -12,8 +12,10 @@ seconds=${1:-30}
 for target in "$@"; do
     mkdir -p "corpus/$target"
     echo "== $target, $seconds s"
-    # A build directory named in the environment is used as it is.
+    # A build directory, or a target to build for, named in the environment is
+    # used as it is.
     cargo +nightly fuzz run ${CARGO_TARGET_DIR:+--target-dir "$CARGO_TARGET_DIR"} \
+        ${FUZZ_TARGET:+--target "$FUZZ_TARGET"} \
         "$target" "corpus/$target" "seeds/$target" -- \
         -max_total_time="$seconds" -timeout=10 -verbosity=0 -print_final_stats=1
 done

@@ -129,13 +129,23 @@ fn a_request_that_arrives_during_a_check_waits_no_longer_than_the_check() {
     assert_eq!(bouncer.metric(OK), 1.0);
 }
 
-/// Whether a cancel byte was sent to this end of a connection.
-fn urged(stream: &std::net::TcpStream) -> bool {
-    let mut byte = [std::mem::MaybeUninit::<u8>::uninit()];
-    matches!(
-        socket2::SockRef::from(stream).recv_out_of_band(&mut byte),
-        Ok(1)
-    )
+/// Has a cancel byte arrive among the ordinary bytes of this end of a
+/// connection, where reading finds it. Looking for it out of band after the
+/// fact does not work everywhere: on Linux a stream read past the byte no
+/// longer gives it up.
+fn cancels_inline(stream: &std::net::TcpStream) {
+    socket2::SockRef::from(stream)
+        .set_out_of_band_inline(true)
+        .unwrap();
+}
+
+/// Reads this end to its close and says whether anything at all arrived.
+fn anything_before_the_close(stream: &mut std::net::TcpStream) -> bool {
+    let mut any = false;
+    while matches!(stream.read(&mut [0u8; 64]), Ok(n) if n > 0) {
+        any = true;
+    }
+    any
 }
 
 #[test]
@@ -199,11 +209,14 @@ fn a_stop_past_its_timeout_sends_no_cancel_to_a_replica_that_is_already_answerin
     let (done, closed) = mpsc::channel();
     let done = std::sync::Mutex::new(done);
     let fake = Fake::start(move |mut stream, _| {
+        cancels_inline(&stream);
         if read_request(&mut stream) {
             let answer = frame::frame(support::wire(), MSG_RESPONSE, &[0u8; 10_000]);
             let _ = stream.write_all(&answer[..5000]);
-            while matches!(stream.read(&mut [0u8; 64]), Ok(n) if n > 0) {}
-            let _ = done.lock().unwrap().send(urged(&stream));
+            let _ = done
+                .lock()
+                .unwrap()
+                .send(anything_before_the_close(&mut stream));
         }
     });
     let extra = "health_check_interval = \"0\"\ncompress = \"always\"";
@@ -223,12 +236,12 @@ fn a_stop_past_its_timeout_sends_no_cancel_to_a_replica_that_is_already_answerin
     let listener = support::listen(support::free_port()).unwrap();
     let sender = support::connect(listener.local_addr().unwrap().port()).unwrap();
     let (mut receiver, _) = listener.accept().unwrap();
+    cancels_inline(&receiver);
     socket2::SockRef::from(&sender)
         .send_out_of_band(b"!")
         .unwrap();
     drop(sender);
-    while matches!(receiver.read(&mut [0u8; 64]), Ok(n) if n > 0) {}
-    assert!(urged(&receiver));
+    assert!(anything_before_the_close(&mut receiver));
 }
 
 #[test]
