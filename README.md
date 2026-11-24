@@ -667,6 +667,16 @@ The wire is written against Rayforce's `src/core/ipc.c` and
 `src/store/serde.c`; the expected bytes in the unit tests were read off a
 running server. Recheck `src/wire/` when Rayforce's wire version moves.
 
+## Performance
+
+[`docs/performance.md`](docs/performance.md) has what the bouncer does under
+many clients, how it was measured, and what limits it. `rfbench`, built
+beside the bouncer, is the load generator it was measured with:
+
+```sh
+./target/release/rfbench 127.0.0.1:5000 --clients 1000 --duration 10s
+```
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

@@ -49,6 +49,22 @@ jobs:
           RFBOUNCER_TEST_WIRE: ${{ matrix.wire }}
       - name: Release build
         run: cargo build --release --locked
+      # Fifty clients through the bouncer for three seconds. It fails when
+      # nothing is answered, never for being slow: a shared runner's speed
+      # says nothing. docs/performance.md has the numbers that mean something.
+      - name: Benchmark smoke run
+        run: |
+          rayforce-src/rayforce -p 5901 -U pw </dev/null &
+          printf 'listen = "127.0.0.1:5900"\n[[pool]]\nname = "main"\nwire_version = %s\nbackend_password = "pw"\nbackends = ["127.0.0.1:5901"]\n' "$WIRE" > bench.toml
+          ./target/release/rfbouncer --config bench.toml &
+          for attempt in $(seq 50); do
+            ./target/release/rfbench 127.0.0.1:5900 --wire "$WIRE" -n 1 > /dev/null && break
+            sleep 0.2
+          done
+          ./target/release/rfbench 127.0.0.1:5900 --wire "$WIRE" -c 50 -d 3s
+          kill %1 %2
+        env:
+          WIRE: ${{ matrix.wire }}
 
   # The page's script: its formatting, its address parsing and its charts,
   # under Node's own test runner with no package installed.
