@@ -176,8 +176,20 @@ function share(part, whole) {
 }
 function replicaState(r) {
   const kind = r.state === 'down' ? 'down' : r.draining ? 'draining' : r.state;
-  return h('span', { class: kind === 'down' ? 'bad' : '' }, h('i', { class: 'dot ' + kind }), kind);
+  return h('span', { class: kind === 'down' ? 'bad' : '' }, h('i', { class: 'dot ' + kind }), kind,
+    notOurs(r) ? h('span', { class: 'dim', title: notOurs(r) }, ' · not ours') : null);
 }
+// What a replica says of itself over its status stream; blank where it says
+// nothing. `notOurs` is what it runs that the bouncer did not send.
+function notOurs(r) {
+  const st = r.status;
+  return st && st.not_ours ? st.text || (st.state === 'other' ? 'other work' : 'a request') : '';
+}
+const loadColumns = [
+  num('Load', (r) => r.status && r.status.util != null ? pct(r.status.util, 1) : ''),
+  num('CPU', (r) => r.status && r.status.cpu != null ? `${r.status.cpu.toFixed(2)} / ${int(r.status.cores)}` : ''),
+  num('Memory', (r) => r.status ? bytes(r.status.rss_bytes) + (r.status.mem_share != null ? ' · ' + pct(r.status.mem_share, 1) : '') : ''),
+];
 
 // ---- charts ----
 // Time across, over the whole range asked for, so a stretch without requests
@@ -412,8 +424,10 @@ function replicasNow(live, pool) {
   const rows = poolsOf(live, pool).flatMap((p) => p.backends.map((b) => ({ pool: p.name + (p.paused ? ' (paused)' : ''), ...b })));
   return table([
     { title: 'Replica', cell: (r) => r.addr }, { title: 'Pool', cell: (r) => r.pool }, { title: 'State', cell: replicaState },
-    num('Running', (r) => r.running ? dur(r.running.ms) : ''),
-    { title: 'Request', cls: 'q one', cell: (r) => text(r.running ? r.running.text : '') },
+    ...loadColumns,
+    num('Running', (r) => r.running ? dur(r.running.ms) : notOurs(r) && r.status.running_ms != null ? dur(r.status.running_ms) : ''),
+    { title: 'Request', cls: 'q one', cell: (r) => r.running || !notOurs(r) ? text(r.running ? r.running.text : '')
+      : h('span', { class: 'dim', title: notOurs(r) }, 'not ours · ' + notOurs(r)) },
     num('Served', (r) => int(r.served)), num('Conn failures', (r) => int(r.failures)),
     { title: 'Last error', cell: (r) => r.last_error },
   ], rows, 'No replicas configured.', true);
@@ -519,6 +533,7 @@ const views = {
       { pool: p.name + (p.paused ? ' (paused)' : ''), ...b, ...(data.rows.find((r) => r.pool === p.name && r.name === b.addr) || none) })));
     return [section('Replicas', `requests are of ${st.range[2]}; state is now`, table([
       { title: 'Replica', cell: (r) => r.addr }, { title: 'Pool', cell: (r) => r.pool }, { title: 'State', cell: replicaState },
+      ...loadColumns,
       num('Requests', (r) => int(r.count)), num('%', (r) => pct(r.count, total)), { title: '', cell: (r) => share(r.count, total) },
       num('Failed', (r) => failedCell(r.not_ok, r.count)), num('Avg ms', (r) => msCell(r.avg_ms)),
       num('Conn failures', (r) => int(r.failures)), { title: 'Last error', cell: (r) => r.last_error },

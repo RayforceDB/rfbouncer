@@ -4,6 +4,7 @@ use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use crate::core::Core;
+use crate::pool::BackendInfo;
 use crate::stats::store::BUCKETS;
 
 /// A histogram's lines: one cumulative count per bucket, then the total.
@@ -19,6 +20,35 @@ fn histogram(out: &mut String, name: &str, pool: &str, hist: &[AtomicU64; BUCKET
     let _ = writeln!(out, "{name}_bucket{{pool=\"{pool}\",le=\"+Inf\"}} {seen}");
     let _ = writeln!(out, "{name}_sum{{pool=\"{pool}\"}} {}", sum_us as f64 / 1e6);
     let _ = writeln!(out, "{name}_count{{pool=\"{pool}\"}} {seen}");
+}
+
+/// What each replica's status stream says, one set of lines per address: a
+/// replica with several slots has one stream. A value the stream does not
+/// say has no line.
+fn status(out: &mut String, pool: &str, backends: &[BackendInfo]) {
+    for (at, b) in backends.iter().enumerate() {
+        if backends[..at].iter().any(|seen| seen.addr == b.addr) {
+            continue;
+        }
+        let labels = format!("pool=\"{pool}\",replica=\"{}\"", b.addr);
+        let reading = b.load.reading.as_deref();
+        let up = u8::from(reading.is_some());
+        let _ = writeln!(out, "rfbouncer_replica_status_up{{{labels}}} {up}");
+        let Some(r) = reading else { continue };
+        let limit = r.frame.mem_limit_bytes;
+        for (metric, value) in [
+            ("utilisation", r.util),
+            ("cpu_cores", r.cpu),
+            ("rss_bytes", Some(r.frame.rss_bytes as f64)),
+            ("heap_bytes", Some(r.frame.heap_bytes as f64)),
+            ("mem_limit_bytes", (limit > 0).then_some(limit as f64)),
+            ("not_ours", Some(f64::from(u8::from(b.load.not_ours)))),
+        ] {
+            if let Some(value) = value {
+                let _ = writeln!(out, "rfbouncer_replica_{metric}{{{labels}}} {value}");
+            }
+        }
+    }
 }
 
 pub async fn render(core: &Core) -> String {
@@ -194,6 +224,7 @@ pub async fn render(core: &Core) -> String {
                 b.failures
             );
         }
+        status(&mut replicas, name, &s.backends);
     }
     out.push_str("# HELP rfbouncer_requests_total Requests ended, by how they ended.\n# TYPE rfbouncer_requests_total counter\n");
     out.push_str(&requests);

@@ -38,11 +38,14 @@ speaks 4. Set `wire_version` to the one your replicas speak; the default is 4.
   answers, but for what the two points below say.
 - **One request, one replica.** Each sync request goes to a free replica,
   round robin; with every replica busy it waits in the bouncer's queue.
-- **Two ways to choose a replica**, set per pool with `mode`. `free`, the
+- **Three ways to choose a replica**, set per pool with `mode`. `free`, the
   default, is the above. `round_robin` gives each request the next replica in
   turn whether it is free or not: every replica gets the same number of
-  requests, and a request may wait behind a slow one. Either way a replica
-  that is down gets nothing.
+  requests, and a request may wait behind a slow one. `least_loaded` is
+  `free` with a better choice among the free replicas: the one that says it
+  is least loaded, and not one busy with work the bouncer did not send; see
+  [What a replica is doing](#what-a-replica-is-doing). Whatever the mode, a
+  replica that is down gets nothing.
 - **Cancel.** A client's cancel byte takes its request out of the queue, or
   is passed on to the replica running it. A client that disconnects cancels
   its request the same way, so a replica never finishes a query for nobody.
@@ -195,6 +198,56 @@ A Rayforce process runs a query's parallel parts on a worker pool sized to the
 machine. N replicas each sized to the whole machine fight over the same
 cores. Start each with `-c` so that together they fit, or pin them with a
 cpuset.
+
+### What a replica is doing
+
+The bouncer knows of its own requests only. A replica that something else
+loads (a client connected to it directly, a timer inside it, a refresh it
+runs itself) looks free to it. A Rayforce with a status stream says what it
+is doing: the bouncer keeps one more connection to each replica address,
+apart from the ones requests travel on, and every `status_interval` (1 s
+unless set; `"0"` turns it off) the replica reports whether it is idle,
+what it is running, how busy its main loop is, its CPU time and its memory.
+
+- **Shown** per replica on the report pages, in `/api/live` (`status`,
+  `status_stream`), in the admin's `show servers` (`status`, `util`, `cpu`,
+  `rss`, `mem_share`, `not_ours`) and in `/metrics`
+  (`rfbouncer_replica_status_up`, `_utilisation`, `_cpu_cores`, `_rss_bytes`,
+  `_heap_bytes`, `_mem_limit_bytes`, `_not_ours`). Load is the share of the
+  last interval the replica's main loop spent working, CPU the cores it
+  used, memory its resident size and, where it has a limit, the share of
+  it. A replica running something the bouncer did not send is marked *not
+  ours*, with that query's text.
+- **Used to choose** under `mode = "least_loaded"`. A request goes to a
+  free replica as under `free`, and among the free ones:
+  1. not to one that is running work that is not ours, unless every free
+     replica is;
+  2. to the one with the least load: its loop's share of the last interval,
+     plus the time the bouncer's own requests ran there since that report
+     (the report cannot know of them, and without this every request of an
+     interval would go to the replica that looked idlest when it began),
+     plus a penalty that grows from nothing at 80% of the memory limit to a
+     full load at the limit;
+  3. a replica that reports no load is taken to carry the average of the
+     free ones that do, so in a pool where only some have a stream the
+     silent ones get neither nothing nor everything; replicas that rank
+     alike go in turn.
+
+  A request never waits for a replica to look better while another is free,
+  and one answered from the result cache counts as load on no replica.
+- **Never needed.** A report is up to an interval old, so the bouncer's own
+  knowledge comes first: a replica it has a request on, or that has just
+  answered one, is not taken to be busy with someone else's work on the
+  word of an older report. A stream silent for three intervals is no longer
+  believed. A replica that has no status stream (every Rayforce released so far),
+  or whose stream breaks or says something unreadable, serves requests
+  exactly as before: the log says so once, and it is asked again every five
+  minutes and when its connection is opened anew. The stream is information,
+  not a health check: it never takes a replica out of use, and never puts
+  one back. A replica the health check found hung, or whose connection is
+  down for any reason, gets nothing however idle its stream calls it. The
+  stream's connection is no request either: it is not counted as one, not
+  checked, and a replica is not busy for it.
 
 ## Credentials
 

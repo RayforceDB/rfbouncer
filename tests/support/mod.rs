@@ -32,12 +32,22 @@ pub fn other_wire() -> u8 {
 /// `body` with the suite's wire version given to every pool and to the
 /// statistics store, unless it names a version itself.
 fn versioned(body: &str) -> String {
-    if body.contains("wire_version") {
-        return body.to_owned();
+    let mut body = body.to_owned();
+    if !body.contains("wire_version") {
+        let line = format!("wire_version = {}\n", wire());
+        body = body
+            .replace("[[pool]]\n", &format!("[[pool]]\n{line}"))
+            .replace("[stats]\n", &format!("[stats]\n{line}"));
     }
-    let line = format!("wire_version = {}\n", wire());
-    body.replace("[[pool]]\n", &format!("[[pool]]\n{line}"))
-        .replace("[stats]\n", &format!("[stats]\n{line}"))
+    // The replicas' status streams are turned off in every pool as well,
+    // unless the body sets `status_interval` itself. A stand-in replica is
+    // scripted connection by connection, and the stream is one more
+    // connection that opens with a frame of its own: the tests that are
+    // about it ask for it.
+    if !body.contains("status_interval") {
+        body = body.replace("[[pool]]\n", "[[pool]]\nstatus_interval = \"0\"\n");
+    }
+    body
 }
 
 /// A query that keeps a replica's thread for about `n / 7500` seconds on the
@@ -245,10 +255,11 @@ impl Bouncer {
             format!("listen = \"127.0.0.1:{port}\"\n{}", versioned(body)),
         )
         .unwrap();
+        // Kept beside the configuration, for the tests that read it.
         let log = if std::env::var_os("RFBOUNCER_TEST_LOG").is_some() {
             Stdio::inherit()
         } else {
-            Stdio::null()
+            std::fs::File::create(dir.join("log")).unwrap().into()
         };
         let child = spawn(
             Command::new(env!("CARGO_BIN_EXE_rfbouncer"))
@@ -320,6 +331,11 @@ impl Bouncer {
         )
         .unwrap();
         signal(self.child.id(), "HUP");
+    }
+
+    /// What the bouncer has logged so far.
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.dir().join("log")).unwrap()
     }
 
     pub fn dir(&self) -> PathBuf {

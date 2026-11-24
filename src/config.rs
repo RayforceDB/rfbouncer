@@ -154,6 +154,11 @@ pub enum Mode {
     /// number of requests, and a request may wait behind a slow one while
     /// another replica is idle.
     RoundRobin,
+    /// As `Free`, but among the free replicas the one its status stream
+    /// shows least loaded, and one busy with work that is not the
+    /// bouncer's only when there is no other. A replica without a status
+    /// stream counts as carrying the average load of those that have one.
+    LeastLoaded,
 }
 
 /// Whose answers a pool compresses.
@@ -252,6 +257,10 @@ pub struct PoolConfig {
     /// How long the replica has to answer that; zero is no check at all.
     #[serde(default = "secs_5", deserialize_with = "duration")]
     pub health_check_timeout: Duration,
+    /// How often a replica is asked to report its status; zero asks for
+    /// no status at all.
+    #[serde(default = "secs_1", deserialize_with = "duration")]
+    pub status_interval: Duration,
 }
 
 fn mib_1() -> usize {
@@ -284,6 +293,9 @@ fn one() -> usize {
 }
 fn yes() -> bool {
     true
+}
+fn secs_1() -> Duration {
+    Duration::from_secs(1)
 }
 fn secs_5() -> Duration {
     Duration::from_secs(5)
@@ -491,6 +503,19 @@ impl Config {
                     p.name
                 ));
             }
+            if p.affinity && p.mode == Mode::LeastLoaded {
+                return bad(format!(
+                    "pool {:?}: affinity has no effect under mode = \"least_loaded\"; remove one",
+                    p.name
+                ));
+            }
+            let status_ms = u32::try_from(p.status_interval.as_millis()).unwrap_or(u32::MAX);
+            if status_ms != 0 && !crate::wire::status::INTERVAL_MS.contains(&status_ms) {
+                return bad(format!(
+                    "pool {:?}: status_interval must be 0 or between 100ms and 10s",
+                    p.name
+                ));
+            }
             for u in &p.users {
                 if u == ADMIN_USER || !users.insert(u) {
                     return bad(format!(
@@ -659,6 +684,21 @@ mod tests {
                 "{disk}"
             );
         }
+        let with =
+            |line: &str| config(&TWO.replace("default = true", &format!("default = true\n{line}")));
+        assert_eq!(
+            with("mode = \"least_loaded\"").unwrap().pool[1].mode,
+            Mode::LeastLoaded
+        );
+        assert!(with("mode = \"least_loaded\"\naffinity = true").is_err());
+        assert_eq!(
+            with("").unwrap().pool[1].status_interval,
+            Duration::from_secs(1)
+        );
+        assert!(with("status_interval = \"0\"").is_ok());
+        assert!(with("status_interval = \"100ms\"").is_ok());
+        assert!(with("status_interval = \"50ms\"").is_err());
+        assert!(with("status_interval = \"11s\"").is_err());
         assert!(
             config(&TWO.replace(
                 "[[pool]]\n        name = \"main\"",

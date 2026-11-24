@@ -169,3 +169,23 @@ cache_max_entry = "1MiB"
 # directly or through another bouncer.
 health_check_interval = "10s"
 health_check_timeout = "5s"
+
+# What each replica is doing, as it says itself. A Rayforce that has a status
+# stream is asked, over a connection kept for that alone, to report this
+# often: whether it is idle, what it is running, how busy its main loop is,
+# its CPU and its memory. The report pages, "show servers" and /metrics show
+# it under every mode. Between 100ms and 10s; "0" asks no replica. A replica
+# without the stream is used as before and asked again only rarely.
+status_interval = "1s"
+# A third way to choose a replica, which reads those reports:
+#   "least_loaded"  as "free", but among the free replicas the one whose main
+#                   loop was least busy over the last interval, and one that
+#                   is running work the bouncer did not send (a client
+#                   connected to it directly, a timer of its own) only when
+#                   every free replica is. A replica within a fifth of its
+#                   memory limit counts as more loaded the nearer it is.
+#                   A replica without a status stream counts as carrying
+#                   the average load of the free ones that have one. No
+#                   request waits for a replica to look better while another
+#                   is free.
+# mode = "least_loaded"

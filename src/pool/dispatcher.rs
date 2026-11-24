@@ -12,6 +12,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 
 use super::backend::{self, Msg};
+use super::status;
 use super::{
     BackendInfo, Cmd, Counters, Ending, Job, PoolHandle, QueuedInfo, Reply, Shared, Snapshot,
 };
@@ -75,6 +76,8 @@ struct Dispatcher {
     /// Running requests whose client asked for a cancel. One that its
     /// replica hands back is answered `cancel`, not run again.
     cancelled: HashSet<u64>,
+    /// The replicas' status streams, one per address.
+    load: status::Board,
 }
 
 pub fn spawn(cfg: Arc<PoolConfig>, stats: Arc<Stats>) -> PoolHandle {
@@ -99,10 +102,12 @@ pub fn spawn(cfg: Arc<PoolConfig>, stats: Arc<Stats>) -> PoolHandle {
         closing: false,
         affinity: HashMap::new(),
         cancelled: HashSet::new(),
+        load: status::Board::default(),
     };
     for addr in &cfg.backends {
         d.add(addr, cfg.slots);
     }
+    d.note_status();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(TICK);
         loop {
@@ -249,6 +254,7 @@ impl Dispatcher {
                 }
             }
         }
+        self.note_status();
         self.retire();
         self.pump();
     }
@@ -407,6 +413,7 @@ impl Dispatcher {
         match self.cfg.mode {
             Mode::Free => self.pump_free(),
             Mode::RoundRobin => self.pump_in_turn(),
+            Mode::LeastLoaded => self.pump_least_loaded(),
         }
     }
 
@@ -467,6 +474,9 @@ impl Dispatcher {
             self.shared.cache.misses.fetch_add(1, Relaxed);
         }
         let r = &mut self.replicas[idx];
+        // Here and not where the replica is chosen: a request answered from
+        // the cache above ran nowhere, and is no load on the one chosen.
+        self.load.started(&r.addr);
         r.running = Some(Running {
             id: job.id,
             client: job.client,
@@ -586,8 +596,94 @@ impl Dispatcher {
                         .running
                         .as_ref()
                         .map(|run| (run.client, run.since.elapsed(), run.frame.clone())),
+                    load: self.load_of(&r.addr),
                 })
                 .collect(),
         }
+    }
+}
+
+/// The replicas' status streams and the choice that reads them.
+impl Dispatcher {
+    /// Shows the status board the replicas as they are after a command: it
+    /// keeps a stream per address in use, and learns from here when a
+    /// replica came up and when a request of ours ended.
+    fn note_status(&mut self) {
+        let (pool, cfg) = (&self.shared.name, &self.cfg_tx);
+        self.load.observe(
+            self.replicas
+                .iter()
+                .filter(|r| !r.gone)
+                .map(|r| (&r.addr, r.connected, r.served + r.failures)),
+            |addr| status::Monitor::spawn(pool.clone(), addr.clone(), cfg.subscribe()),
+        );
+    }
+
+    /// Requests of ours running on an address, over all its connections.
+    fn ours(&self, addr: &str) -> usize {
+        let on = |r: &&Replica| *r.addr == *addr && !r.gone && r.running.is_some();
+        self.replicas.iter().filter(on).count()
+    }
+
+    fn load_of(&self, addr: &str) -> status::Load {
+        let off = self.cfg.status_interval.is_zero();
+        self.load.view(addr, self.ours(addr), off)
+    }
+
+    /// As `pump_free`: the head of the queue goes to a free replica until
+    /// one of the two runs out. Only the choice among the free differs, so
+    /// no request waits for a replica to look better.
+    fn pump_least_loaded(&mut self) {
+        while let Some(avoid) = self.queue.front().map(|j| j.avoid) {
+            let Some(idx) = self.pick_least_loaded(avoid) else {
+                return;
+            };
+            if let Some(job) = self.queue.pop_front() {
+                self.start(idx, job);
+            }
+        }
+    }
+
+    /// The free replica that ranks best, and not the one that just failed
+    /// under this request while another is free. They are looked at in
+    /// turn and only a strictly better one replaces the first, so replicas
+    /// that rank alike, as those without a status stream do, are taken in
+    /// turn. Only a free replica is looked at, and one whose connection is
+    /// down, by the health check's word or any other, is not free: a stream
+    /// that still calls it idle changes nothing about that.
+    fn pick_least_loaded(&mut self, avoid: Option<usize>) -> Option<usize> {
+        let n = self.replicas.len();
+        // A free replica that reports no load is ranked at the average of
+        // the free ones that do.
+        let mut known = (0.0, 0u32);
+        for i in 0..n {
+            if self.replicas[i].free()
+                && let Some(load) = self.load.load(&self.replicas[i].addr)
+            {
+                known = (known.0 + load, known.1 + 1);
+            }
+        }
+        let unknown = if known.1 == 0 {
+            0.0
+        } else {
+            known.0 / f64::from(known.1)
+        };
+        let mut best = None;
+        for i in (0..n).map(|k| (self.cursor + k) % n) {
+            if !self.replicas[i].free() {
+                continue;
+            }
+            let addr = &self.replicas[i].addr;
+            let key = (
+                Some(i) == avoid,
+                self.load.rank(addr, self.ours(addr), unknown),
+            );
+            if best.as_ref().is_none_or(|(least, _)| key < *least) {
+                best = Some((key, i));
+            }
+        }
+        let (_, idx) = best?;
+        self.cursor = (idx + 1) % n;
+        Some(idx)
     }
 }

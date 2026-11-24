@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod cache;
 pub mod dispatcher;
+pub mod status;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -276,6 +277,8 @@ pub struct BackendInfo {
     pub failures: u64,
     /// The request it is running: who sent it, for how long, and its frame.
     pub running: Option<(SocketAddr, Duration, Bytes)>,
+    /// What the replica's status stream says of it.
+    pub load: status::Load,
 }
 
 impl BackendInfo {

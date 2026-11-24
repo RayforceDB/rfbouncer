@@ -179,6 +179,8 @@ async fn show_servers(core: &Core) -> Vec<u8> {
     let (mut pool, mut addr, mut state, mut draining, mut served, mut failures) =
         (vec![], vec![], vec![], vec![], vec![], vec![]);
     let (mut running_ms, mut client, mut query, mut last_error) = (vec![], vec![], vec![], vec![]);
+    let (mut status, mut util, mut cpu, mut rss, mut mem_share, mut not_ours) =
+        (vec![], vec![], vec![], vec![], vec![], vec![]);
     for handle in core.pools() {
         let Some(s) = handle.snapshot().await else {
             continue;
@@ -203,6 +205,18 @@ async fn show_servers(core: &Core) -> Vec<u8> {
             client.push(who);
             query.push(text);
             last_error.push(b.last_error);
+            // What the status stream says; a number it does not say is null.
+            let reading = b.load.reading.as_deref();
+            status.push(b.load.stream.to_owned());
+            util.push(reading.and_then(|r| r.util).unwrap_or(f64::NAN));
+            cpu.push(reading.and_then(|r| r.cpu).unwrap_or(f64::NAN));
+            rss.push(reading.map_or(0, |r| r.frame.rss_bytes as i64));
+            mem_share.push(reading.and_then(|r| r.mem_share()).unwrap_or(f64::NAN));
+            not_ours.push(match reading {
+                Some(r) if b.load.not_ours && r.frame.query.is_empty() => "<other work>".to_owned(),
+                Some(r) if b.load.not_ours => r.frame.query.clone(),
+                _ => String::new(),
+            });
         }
     }
     value::table(&[
@@ -216,6 +230,12 @@ async fn show_servers(core: &Core) -> Vec<u8> {
         ("client", Column::Str(client)),
         ("query", Column::Str(query)),
         ("last_error", Column::Str(last_error)),
+        ("status", Column::Sym(status)),
+        ("util", Column::F64(util)),
+        ("cpu", Column::F64(cpu)),
+        ("rss", Column::I64(rss)),
+        ("mem_share", Column::F64(mem_share)),
+        ("not_ours", Column::Str(not_ours)),
     ])
 }
 
@@ -355,6 +375,10 @@ fn show_config(core: &Core) -> Vec<u8> {
                 p.cache_max_entry
             ),
         ));
+    }
+    for p in &c.pool {
+        let status = format!("{} {:?}", p.name, p.status_interval);
+        rows.push(("pool.status_interval", status));
     }
     pairs(rows)
 }

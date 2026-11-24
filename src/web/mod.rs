@@ -31,6 +31,8 @@ use crate::core::Core;
 use crate::listener::Scope;
 use crate::metrics;
 use crate::pool::request_text;
+use crate::pool::status::Load;
+use crate::wire::status::State;
 use api::Filter;
 
 const INDEX: &str = include_str!("../../web/index.html");
@@ -242,6 +244,35 @@ async fn healthy(core: &Core) -> bool {
     false
 }
 
+/// What a replica's status stream said last, or null when it says nothing.
+fn status(load: &Load) -> Value {
+    let Some(r) = &load.reading else {
+        return Value::Null;
+    };
+    let f = &r.frame;
+    json!({
+        "state": match f.state {
+            State::Idle => "idle",
+            State::Request => "request",
+            State::Other => "other",
+        },
+        "not_ours": load.not_ours,
+        "running_ms": r.running_for().map(|d| d.as_millis() as u64),
+        "text": f.query,
+        "util": r.util,
+        "cpu": r.cpu,
+        "rss_bytes": f.rss_bytes,
+        "heap_bytes": f.heap_bytes,
+        "mem_limit_bytes": f.mem_limit_bytes,
+        "mem_share": r.mem_share(),
+        "conns": f.conns,
+        "workers": f.workers,
+        "cores": f.cores,
+        "pid": f.pid,
+        "age_ms": r.at.elapsed().as_millis() as u64,
+    })
+}
+
 /// What the bouncer is doing this instant: every pool's replicas and queue.
 async fn live(core: &Core) -> Value {
     let mut pools = Vec::new();
@@ -266,6 +297,8 @@ async fn live(core: &Core) -> Value {
                         "ms": since.as_millis() as u64,
                         "text": request_text(frame),
                     })),
+                    "status_stream": b.load.stream,
+                    "status": status(&b.load),
                 })
             })
             .collect();
