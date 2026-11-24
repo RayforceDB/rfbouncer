@@ -269,7 +269,9 @@ pub fn decode(payload: &[u8]) -> Result<Value, DecodeError> {
     let mut r = Reader(payload);
     Ok(match r.u8()? {
         TYPE_ERROR => {
-            let code = error_code(payload).unwrap_or_default();
+            // An error cut short of its code is a broken answer, not an
+            // error with no name.
+            let code = error_code(payload).ok_or(DecodeError("it ends early"))?;
             let msg = payload
                 .get(10..)
                 .map(|m| String::from_utf8_lossy(m).into_owned())
