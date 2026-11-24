@@ -7,6 +7,7 @@
 pub mod api;
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
@@ -24,9 +25,10 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::core::Core;
+use crate::listener::Scope;
 use crate::metrics;
 use crate::pool::request_text;
 use api::Filter;
@@ -41,10 +43,30 @@ const TEXT: &str = "text/plain; charset=utf-8";
 
 type Reply = Response<Full<Bytes>>;
 
-pub async fn serve(stream: TcpStream, core: Arc<Core>) {
+/// What a request's connection says about it.
+#[derive(Clone, Copy)]
+struct Via {
+    peer: SocketAddr,
+    scope: Scope,
+    /// Whether it came through TLS.
+    secure: bool,
+}
+
+pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    peer: SocketAddr,
+    scope: Scope,
+    secure: bool,
+    core: Arc<Core>,
+) {
+    let via = Via {
+        peer,
+        scope,
+        secure,
+    };
     let service = service_fn(move |request| {
         let core = core.clone();
-        async move { Ok::<_, Infallible>(handle(request, &core).await) }
+        async move { Ok::<_, Infallible>(handle(request, via, &core).await) }
     });
     let _ = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
@@ -90,7 +112,7 @@ fn authorized(request: &Request<Incoming>, password: &str) -> bool {
     secret.ct_eq(password.as_bytes()).into()
 }
 
-async fn handle(request: Request<Incoming>, core: &Arc<Core>) -> Reply {
+async fn handle(request: Request<Incoming>, via: Via, core: &Arc<Core>) -> Reply {
     // What a load balancer asks, with no password: is there a replica to
     // send a request to. It says nothing else.
     if request.uri().path() == "/healthz" {
@@ -101,6 +123,32 @@ async fn handle(request: Request<Incoming>, core: &Arc<Core>) -> Reply {
         };
     }
     let config = core.config();
+    // Where administration has an address of its own, this one has nothing
+    // else to show, and says so before any password is looked at.
+    if via.scope == Scope::Clients {
+        return reply(StatusCode::NOT_FOUND, TEXT, "not found\n");
+    }
+    if !via.secure && config.tls.as_ref().is_some_and(|t| t.require_for_http) {
+        // The password has already crossed in the clear by now; the least
+        // to do is not to take it, so that it shows at the first try.
+        core.cleartext_refused.fetch_add(1, Relaxed);
+        let why = "clear text is refused here: use https\n";
+        return reply(StatusCode::FORBIDDEN, TEXT, why);
+    }
+    let attempt = request.headers().contains_key(AUTHORIZATION);
+    if attempt && let Some(left) = core.lockout.locked(via.peer.ip(), &config) {
+        tracing::debug!(peer = %via.peer, "login refused over HTTP: the address is locked out");
+        let mut response = reply(
+            StatusCode::TOO_MANY_REQUESTS,
+            TEXT,
+            "too many refused logins from this address\n",
+        );
+        let seconds = hyper::header::HeaderValue::from(left.as_secs() + 1);
+        response
+            .headers_mut()
+            .insert(hyper::header::RETRY_AFTER, seconds);
+        return response;
+    }
     let passwords: Vec<&str> = [&config.report_password, &config.admin_password]
         .into_iter()
         .flatten()
@@ -116,9 +164,10 @@ async fn handle(request: Request<Incoming>, core: &Arc<Core>) -> Reply {
     {
         // A browser asks once without credentials to learn that it needs
         // them; only a wrong password is a refusal worth a line.
-        if request.headers().contains_key(AUTHORIZATION) {
+        if attempt {
             core.auth_failures.fetch_add(1, Relaxed);
-            tracing::warn!(path = request.uri().path(), "credentials refused over HTTP");
+            core.lockout.failed(via.peer.ip(), &config);
+            tracing::warn!(peer = %via.peer, path = request.uri().path(), "credentials refused over HTTP");
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         let mut response = reply(StatusCode::UNAUTHORIZED, TEXT, "a password is required\n");

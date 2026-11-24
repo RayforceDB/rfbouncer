@@ -5,6 +5,7 @@ pub mod client;
 pub mod config;
 pub mod core;
 pub mod listener;
+pub mod lockout;
 pub mod metrics;
 pub mod pool;
 pub mod stats;
@@ -32,7 +33,20 @@ pub async fn run(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>>
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut stop = core.shutdown.subscribe();
-    let serving = tokio::spawn(listener::run(listener, core.clone()));
+    // With an address of its own for administration, the clients' port
+    // serves the clients alone.
+    let admin = match core.config().admin_listen {
+        Some(addr) => Some(TcpListener::bind(addr).await?),
+        None => None,
+    };
+    let scope = if admin.is_some() {
+        listener::Scope::Clients
+    } else {
+        listener::Scope::All
+    };
+    let serving = tokio::spawn(listener::run(listener, scope, core.clone()));
+    let administering =
+        admin.map(|l| tokio::spawn(listener::run(l, listener::Scope::Admin, core.clone())));
     loop {
         tokio::select! {
             _ = hangup.recv() => {
@@ -49,6 +63,9 @@ pub async fn run(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>>
     // Stop taking connections, let the requests in flight end, then go.
     core.shutdown.send_replace(true);
     let _ = serving.await;
+    if let Some(administering) = administering {
+        let _ = administering.await;
+    }
     let deadline = tokio::time::Instant::now() + core.config().shutdown_timeout;
     while core.client_count() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

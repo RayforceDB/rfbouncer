@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer};
@@ -34,6 +35,65 @@ pub struct Config {
     #[serde(default)]
     pub stats: StatsConfig,
     pub pool: Vec<PoolConfig>,
+    /// Where the admin console, the report pages and the metrics are served
+    /// instead of `listen`, which then takes pool clients and `/healthz`
+    /// only.
+    pub admin_listen: Option<SocketAddr>,
+    pub tls: Option<TlsConfig>,
+    /// Refused logins from one address, within `auth_lockout_window`, that
+    /// lock it out for `auth_lockout_period`; zero never locks.
+    #[serde(default = "default_lockout_failures")]
+    pub auth_lockout_failures: u32,
+    #[serde(default = "secs_60", deserialize_with = "duration")]
+    pub auth_lockout_window: Duration,
+    #[serde(default = "mins_5", deserialize_with = "duration")]
+    pub auth_lockout_period: Duration,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// The certificate chain, leaf first, in PEM.
+    pub cert: PathBuf,
+    /// The leaf's private key, in PEM.
+    pub key: PathBuf,
+    /// Refuse HTTP in clear text, `/healthz` excepted.
+    #[serde(default)]
+    pub require_for_http: bool,
+    /// Refuse Rayforce IPC in clear text, the admin console included.
+    #[serde(default)]
+    pub require_for_ipc: bool,
+    /// What the two files held when the configuration was read. It lives
+    /// here so that a reload replaces the certificate together with the
+    /// rest, or not at all.
+    #[serde(skip)]
+    pub server: Option<Arc<rustls::ServerConfig>>,
+}
+
+impl TlsConfig {
+    fn load(&self) -> Result<Arc<rustls::ServerConfig>, ConfigError> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let bad = |path: &Path, why: String| {
+            ConfigError::Invalid(format!("[tls] {}: {why}", path.display()))
+        };
+        let chain = CertificateDer::pem_file_iter(&self.cert)
+            .and_then(Iterator::collect::<Result<Vec<_>, _>>)
+            .map_err(|e| bad(&self.cert, e.to_string()))?;
+        if chain.is_empty() {
+            return Err(bad(&self.cert, "no certificate in it".into()));
+        }
+        let key =
+            PrivateKeyDer::from_pem_file(&self.key).map_err(|e| bad(&self.key, e.to_string()))?;
+        // The provider is named rather than taken from the process default:
+        // there is then nothing to install first and nothing to forget.
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .and_then(|b| b.with_no_client_auth().with_single_cert(chain, key))
+            .map_err(|e| bad(&self.key, e.to_string()))?;
+        Ok(Arc::new(server))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -162,6 +222,12 @@ fn secs_60() -> Duration {
 fn secs_30() -> Duration {
     Duration::from_secs(30)
 }
+fn mins_5() -> Duration {
+    Duration::from_secs(300)
+}
+fn default_lockout_failures() -> u32 {
+    10
+}
 fn days_7() -> Duration {
     Duration::from_secs(7 * 86_400)
 }
@@ -250,11 +316,16 @@ impl Config {
             path: path.to_owned(),
             source,
         })?;
-        let config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        let mut config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
             path: path.to_owned(),
             source: Box::new(source),
         })?;
         config.validate()?;
+        // Read here, so that `--check` and a reload refuse a certificate
+        // that cannot be served.
+        if let Some(tls) = &mut config.tls {
+            tls.server = Some(tls.load()?);
+        }
         Ok(config)
     }
 
@@ -276,6 +347,19 @@ impl Config {
             && !is_host_port(addr)
         {
             return bad(format!("[stats] rayforce {addr:?}: expected host:port"));
+        }
+        if self.admin_listen == Some(self.listen) {
+            return bad(
+                "admin_listen must differ from listen; leave it out to share the port".into(),
+            );
+        }
+        if self.auth_lockout_failures > 0
+            && (self.auth_lockout_window.is_zero() || self.auth_lockout_period.is_zero())
+        {
+            return bad(
+                "auth_lockout_window and auth_lockout_period must be more than 0; set auth_lockout_failures = 0 to turn the lockout off"
+                    .into(),
+            );
         }
         if self.pool.iter().filter(|p| p.default).count() > 1 {
             return bad("only one pool may be the default".into());
@@ -474,6 +558,10 @@ mod tests {
             .is_err()
         );
         assert!(config(&format!("max_client_conn = 0\n{TWO}")).is_err());
+        assert!(config(&format!("admin_listen = \"127.0.0.1:5000\"\n{TWO}")).is_err());
+        assert!(config(&format!("auth_lockout_period = \"0\"\n{TWO}")).is_err());
+        let off = format!("auth_lockout_failures = 0\nauth_lockout_period = \"0\"\n{TWO}");
+        assert!(config(&off).is_ok());
         assert!(
             config(&TWO.replace(
                 "[[pool]]\n        name = \"main\"",

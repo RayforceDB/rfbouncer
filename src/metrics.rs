@@ -68,6 +68,34 @@ pub async fn render(core: &Core) -> String {
         "Connections turned away at max_client_conn.",
         turned_away,
     );
+    let lockouts = core.lockout.lockouts.load(Relaxed) as f64;
+    one(
+        "counter",
+        "rfbouncer_auth_lockouts_total",
+        "Times an address was locked out after too many refused logins.",
+        lockouts,
+    );
+    let locked = core.lockout.locked_now() as f64;
+    one(
+        "gauge",
+        "rfbouncer_auth_locked_addresses",
+        "Addresses locked out now.",
+        locked,
+    );
+    let turned_away = core.lockout.turned_away.load(Relaxed) as f64;
+    one(
+        "counter",
+        "rfbouncer_auth_locked_out_total",
+        "Logins refused unexamined because their address was locked out.",
+        turned_away,
+    );
+    let cleartext = core.cleartext_refused.load(Relaxed) as f64;
+    one(
+        "counter",
+        "rfbouncer_cleartext_refused_total",
+        "Connections and requests in clear text refused where TLS is required.",
+        cleartext,
+    );
 
     let (mut requests, mut totals, mut gauges, mut replicas) =
         (String::new(), String::new(), String::new(), String::new());

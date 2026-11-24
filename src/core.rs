@@ -11,6 +11,7 @@ use std::time::Instant;
 use tokio::sync::watch;
 
 use crate::config::{Config, ConfigError};
+use crate::lockout::Lockout;
 use crate::pool::{Cmd, PoolHandle, dispatcher};
 use crate::stats::Stats;
 
@@ -35,6 +36,10 @@ pub struct Core {
     pub auth_failures: AtomicU64,
     /// Connections turned away at `max_client_conn`.
     pub refused: AtomicU64,
+    /// Addresses whose logins are refused after too many wrong ones.
+    pub lockout: Lockout,
+    /// Connections in clear text turned away where TLS is required.
+    pub cleartext_refused: AtomicU64,
     /// One reload at a time: two at once would each compare against the
     /// same old configuration.
     reloading: Mutex<()>,
@@ -70,6 +75,8 @@ impl Core {
             started: Instant::now(),
             auth_failures: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            lockout: Lockout::default(),
+            cleartext_refused: AtomicU64::new(0),
             reloading: Mutex::new(()),
         })
     }
@@ -111,6 +118,9 @@ impl Core {
         let old = self.config();
         if new.listen != old.listen {
             tracing::warn!("listen changed in the configuration: restart to apply it");
+        }
+        if new.admin_listen != old.admin_listen {
+            tracing::warn!("admin_listen changed in the configuration: restart to apply it");
         }
         let mut pools = self.pools.write().unwrap_or_else(PoisonError::into_inner);
         pools.retain(|name, handle| {

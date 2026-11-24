@@ -4,6 +4,10 @@
 
 # Clients, the admin console and the report pages all use this one port.
 listen = "0.0.0.0:5000"
+# An address for administration alone. With it, the admin console, the report
+# pages and /metrics are served there only, and `listen` takes pool clients
+# and /healthz (which is on both). Not set by default; needs a restart.
+# admin_listen = "127.0.0.1:5050"
 
 # Opens the admin console (user "rfbouncer") and the report pages (HTTP Basic,
 # any user name). Without it there is neither.
@@ -18,6 +22,25 @@ max_request_bytes = "16MiB"
 shutdown_timeout = "30s"
 # How long a client may sit between two requests; 0 is forever.
 client_idle_timeout = "0"
+
+# An address refused this many logins within the window is locked out for the
+# period: every login from it is refused, the right password included, over
+# IPC and HTTP alike. 0 turns it off. Clients behind one NAT or proxy share
+# an address and are locked out together: raise the number or use 0 there.
+auth_lockout_failures = 10
+auth_lockout_window = "1m"
+auth_lockout_period = "5m"
+
+# TLS on the same port, beside clear text: HTTPS and IPC over TLS. Not set by
+# default. The files are PEM, read at start and again on SIGHUP.
+# [tls]
+# cert = "/etc/rfbouncer/fullchain.pem"
+# key = "/etc/rfbouncer/privkey.pem"
+# # Refuse HTTP in clear text, /healthz excepted.
+# require_for_http = false
+# # Refuse IPC in clear text, the admin console included. Rayforce's own
+# # client does not speak TLS: leave this off unless every client does.
+# require_for_ipc = false
 
 [stats]
 # The Rayforce process that keeps the request statistics. Without it nothing

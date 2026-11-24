@@ -27,8 +27,8 @@ speaks 4. Set `wire_version` to the one your replicas speak; the default is 4.
 - On Linux a client's cancel is passed on as it arrives. Elsewhere the
   socket is asked every 20 ms, so it is up to 20 ms late.
 - The statistics store keeps everything in memory.
-- There is no TLS: the admin password and the report pages travel in the
-  clear.
+- TLS is there to be turned on, and is off until `[tls]` is set: without it
+  the admin password and the report pages travel in the clear.
 
 ## What it does
 
@@ -77,7 +77,10 @@ process that owns them.
   closes its sending side after the request is taken to have left, and its
   request is cancelled: the two cannot be told apart, and a client that left
   must not keep a replica busy.
-- No TLS. Keep the port on a private network, or put a proxy in front.
+- Rayforce's own client does not speak TLS, so the clients it serves stay in
+  clear text; see [TLS](#tls) for what can be protected and how.
+- TLS clients are not asked for a certificate: a client is known by its
+  password.
 
 ## Running it
 
@@ -109,7 +112,7 @@ backends = ["127.0.0.1:5001", "127.0.0.1:5002"]
 `SIGHUP` reads the configuration again: limits, timeouts and passwords apply
 at once, replicas added are connected, replicas removed finish their request
 and go. A file that does not parse leaves the running configuration alone.
-`listen` and `[stats]` need a restart. `SIGTERM` stops taking
+`listen`, `admin_listen` and `[stats]` need a restart. `SIGTERM` stops taking
 connections, lets the requests in flight end (for `shutdown_timeout` at
 most), and exits.
 
@@ -137,6 +140,94 @@ A refused login is logged with its address, counted in
 `rfbouncer_auth_failures_total`, and answered half a second late. A client
 that speaks another wire version than its pool is refused the same way. A
 changed password applies to new connections; the ones already open stay.
+
+### Lockout
+
+On top of the delay, an address that is refused `auth_lockout_failures`
+times (10) within `auth_lockout_window` (1 m) is locked out for
+`auth_lockout_period` (5 m): every login from it is refused unexamined, the
+right password included, over IPC (the verdict a wrong password gets) and
+over HTTP (`429` with `Retry-After`). `auth_lockout_failures = 0` turns it
+off. Connections already open go on, and so does what needs no login:
+`/healthz`, and a pool that asks its clients for nothing.
+
+- Failures over IPC and HTTP are counted together, by IPv4 address or IPv6
+  /64, and a login that succeeds does not clear them: someone who holds one
+  password could otherwise guess at another without end. A client that
+  speaks the wrong wire version is refused like a wrong password, and
+  counted like one.
+- An address is the peer of a completed TCP handshake, so it cannot be
+  forged: nobody can have someone else locked out from afar.
+- Clients that share an address are locked out together: behind a NAT, or
+  when a proxy or a TLS terminator stands in front of the bouncer, one
+  client with a wrong password locks out all of them. Raise the number or
+  set it to 0 there, and limit attempts in the proxy, which sees the real
+  addresses.
+- At most 10 000 addresses are remembered at once. Past that a new address
+  is delayed like any other and not locked out, until a window has passed.
+- A lockout is logged once, with the address. `/metrics` has
+  `rfbouncer_auth_lockouts_total`, `rfbouncer_auth_locked_addresses` (locked
+  out now) and `rfbouncer_auth_locked_out_total` (logins refused unexamined).
+  Nothing lifts one early but setting 0 and reloading, or a restart.
+
+## TLS
+
+```toml
+[tls]
+cert = "/etc/rfbouncer/fullchain.pem"   # the chain, leaf first, PEM
+key = "/etc/rfbouncer/privkey.pem"      # PEM: PKCS#8, PKCS#1 or SEC1
+require_for_http = true
+```
+
+With `[tls]` set the same port takes TLS as well as clear text: a TLS client
+opens with a byte that neither Rayforce's IPC nor HTTP starts with, and says
+which of the two it speaks inside the tunnel. So `https://host:5000/` and
+IPC over TLS both work, beside what worked before. TLS 1.2 and 1.3 are
+offered, with rustls and the `ring` provider, which needs a C compiler to
+build and nothing else.
+
+- `require_for_http` refuses HTTP in clear text with `403`, before any
+  password is looked at. `/healthz` is the exception: it has no password and
+  tells nothing, and a load balancer's check is often clear text.
+- `require_for_ipc` closes an IPC connection in clear text before its
+  greeting, the admin console's included. Rayforce's own client does not
+  speak TLS, so leave this off unless every client comes through TLS: a
+  client library that has it, or a tunnel such as `stunnel` on the client's
+  machine.
+- Both are counted in `rfbouncer_cleartext_refused_total`.
+- `SIGHUP` reads the two files again with the rest of the configuration.
+  Connections already open keep the certificate they were made under. A
+  certificate or key that cannot be read, or that do not belong together,
+  fails `--check` and a reload alike, and the old one stays.
+- Relative paths are taken from the directory the bouncer was started in.
+
+**Cancel over TLS.** A client cancels a request with one byte of TCP urgent
+data, which TCP carries beside the stream. TLS has no place for it, so over
+TLS the bouncer looks for that byte where it always did: on the TCP
+connection, beneath the tunnel. A client that can reach its socket sends it
+there and is cancelled as in clear text. That byte is not protected by TLS:
+whoever can inject into the connection can cancel a request, as they could
+by resetting the connection. A client that cannot reach its socket, or that
+comes through something that ends the TCP connection on the way (a TLS
+terminator, a tunnel), cancels by disconnecting, which always works.
+
+## An address of its own for administration
+
+```toml
+listen = "0.0.0.0:5000"
+admin_listen = "127.0.0.1:5050"
+```
+
+With `admin_listen` set, the admin console, the report pages and `/metrics`
+are served there and nowhere else, and that address serves no pool. `listen`
+then takes pool clients only: the user `rfbouncer` is refused there like a
+wrong password, and every HTTP path but `/healthz` answers `404`.
+
+- `/healthz` is on both: a load balancer checks the port it sends clients
+  to, and a monitor may sit on the other side.
+- The admin address asks every IPC client for credentials, so the console is
+  there even when the one pool asks its clients for nothing.
+- `[tls]`, the lockout and `max_client_conn` apply to each address alike.
 
 ## Admin console
 

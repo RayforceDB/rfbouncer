@@ -5,8 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use bytes::BytesMut;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
 use crate::client::read_frame;
@@ -18,7 +17,11 @@ use crate::wire::value::{self, Column};
 /// No command is longer than this.
 const COMMAND_MAX: usize = 4096;
 
-pub async fn session(mut stream: TcpStream, version: u8, core: &Arc<Core>) {
+pub async fn session<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    version: u8,
+    core: &Arc<Core>,
+) {
     let mut buf = BytesMut::new();
     while let Ok(Some(request)) = read_frame(&mut stream, &mut buf, version, COMMAND_MAX).await {
         if request[7] != MSG_SYNC {
@@ -282,6 +285,28 @@ fn show_config(core: &Core) -> Vec<u8> {
             c.stats.rayforce.clone().unwrap_or_default(),
         ),
         ("stats.store_samples", c.stats.store_samples.to_string()),
+        (
+            "admin_listen",
+            c.admin_listen.map(|a| a.to_string()).unwrap_or_default(),
+        ),
+        (
+            "tls",
+            c.tls.as_ref().map_or_else(String::new, |t| {
+                format!(
+                    "cert={} require_for_http={} require_for_ipc={}",
+                    t.cert.display(),
+                    t.require_for_http,
+                    t.require_for_ipc
+                )
+            }),
+        ),
+        (
+            "auth_lockout",
+            format!(
+                "failures={} window={:?} period={:?}",
+                c.auth_lockout_failures, c.auth_lockout_window, c.auth_lockout_period
+            ),
+        ),
     ];
     for p in &c.pool {
         rows.push((

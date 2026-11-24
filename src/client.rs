@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -14,6 +14,7 @@ use tokio::time::timeout;
 use crate::admin;
 use crate::config::Target;
 use crate::core::{ClientInfo, Core};
+use crate::listener::Scope;
 use crate::pool::{Cmd, Job, Reply};
 use crate::wire::frame::{HEADER_LEN, Header, MSG_SYNC};
 use crate::wire::{greeting, oob};
@@ -26,8 +27,28 @@ const REFUSAL_DELAY: Duration = Duration::from_millis(500);
 /// stops reading would otherwise hold a replica for as long as it liked.
 const WRITE_STALL: Duration = Duration::from_secs(30);
 
-pub async fn serve(mut stream: TcpStream, peer: SocketAddr, core: Arc<Core>) {
-    let greeted = timeout(GREET_TIMEOUT, greet(&mut stream, &core)).await;
+/// A client's connection: TCP, or a TLS tunnel over it.
+pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send {
+    /// The TCP connection itself. A cancel is one byte of urgent data, which
+    /// TCP carries beside the stream and TLS has no place for, so it is
+    /// looked for here, beneath the tunnel.
+    fn tcp(&self) -> &TcpStream;
+}
+
+impl Transport for TcpStream {
+    fn tcp(&self) -> &TcpStream {
+        self
+    }
+}
+
+impl Transport for BufReader<tokio_rustls::server::TlsStream<TcpStream>> {
+    fn tcp(&self) -> &TcpStream {
+        self.get_ref().get_ref().0
+    }
+}
+
+pub async fn serve<S: Transport>(mut stream: S, peer: SocketAddr, scope: Scope, core: Arc<Core>) {
+    let greeted = timeout(GREET_TIMEOUT, greet(&mut stream, peer, scope, &core)).await;
     let Ok(Ok(Some((version, user, pool)))) = greeted else {
         return;
     };
@@ -43,8 +64,10 @@ pub async fn serve(mut stream: TcpStream, peer: SocketAddr, core: Arc<Core>) {
 
 /// The wire version, the user, and the pool the credentials name, or no pool
 /// for the admin console. `None` when the client was turned away.
-async fn greet(
-    stream: &mut TcpStream,
+async fn greet<S: Transport>(
+    stream: &mut S,
+    peer: SocketAddr,
+    scope: Scope,
     core: &Core,
 ) -> std::io::Result<Option<(u8, String, Option<String>)>> {
     let version = greeting::read_hello(stream).await?;
@@ -55,7 +78,9 @@ async fn greet(
         greeting::write_hello(stream, config.only_pool().wire_version, false).await?;
         return Ok(None);
     }
-    if !config.auth_required() {
+    // The admin's own address asks for credentials whatever the pools do:
+    // nothing there is for a client without them.
+    if !config.auth_required() && scope != Scope::Admin {
         greeting::write_hello(stream, version, false).await?;
         return Ok(Some((
             version,
@@ -65,19 +90,26 @@ async fn greet(
     }
     greeting::write_hello(stream, version, true).await?;
     let credentials = greeting::read_credentials(stream).await?;
+    if core.lockout.locked(peer.ip(), &config).is_some() {
+        // Not examined, so a locked-out address learns nothing more about
+        // a password, the right one included.
+        tracing::debug!(%peer, "login refused: the address is locked out");
+        greeting::write_verdict(stream, false).await?;
+        return Ok(None);
+    }
     let target = match config.resolve(&credentials.user, &credentials.password, version) {
-        Target::Admin => Some(None),
-        Target::Pool(pool) => Some(Some(pool.name.clone())),
-        Target::Rejected => None,
+        // With an address of its own, the admin console is nowhere else,
+        // and that address serves no pool.
+        Target::Admin if scope != Scope::Clients => Some(None),
+        Target::Pool(pool) if scope != Scope::Admin => Some(Some(pool.name.clone())),
+        _ => None,
     };
     if target.is_none() {
+        core.lockout.failed(peer.ip(), &config);
         // Said, counted, and answered late: guessing a password is then
         // neither silent nor fast.
         core.auth_failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let peer = stream
-            .peer_addr()
-            .map_or_else(|_| "?".to_owned(), |a| a.to_string());
         tracing::warn!(%peer, user = %credentials.user, "credentials refused");
         tokio::time::sleep(REFUSAL_DELAY).await;
     }
@@ -85,8 +117,8 @@ async fn greet(
     Ok(target.map(|pool| (version, credentials.user, pool)))
 }
 
-async fn proxy(
-    stream: TcpStream,
+async fn proxy<S: Transport>(
+    stream: S,
     peer: SocketAddr,
     version: u8,
     user: Arc<str>,
@@ -101,8 +133,8 @@ async fn proxy(
         requests: 0,
     });
     let mut shutdown = core.shutdown.subscribe();
-    let cancels = oob::Watch::new(&stream)?;
-    let (mut rd, mut wr) = stream.into_split();
+    let cancels = oob::Watch::new(stream.tcp())?;
+    let (mut rd, mut wr) = tokio::io::split(stream);
     let mut buf = BytesMut::new();
     loop {
         let config = core.config();
